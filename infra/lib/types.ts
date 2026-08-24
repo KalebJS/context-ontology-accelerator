@@ -129,6 +129,30 @@ export interface SsmConfig {
    *  Defaults to us.anthropic.claude-sonnet-5 at runtime when omitted. */
   readonly bedrockLlmModelId?: string;
 
+  /** Bedrock embedding model ID used by every embedding producer and consumer
+   *  (induction, doc-kg-build, metric matching, serve retrieval). All must use
+   *  the SAME model — vectors from different models are not comparable — so
+   *  this single key feeds them all. Changing it after data exists is a data
+   *  migration; set it at initial deploy. Accepts geo inference profiles
+   *  (us./eu.) and bare in-region IDs. Defaults to us.cohere.embed-v4:0. */
+  readonly bedrockEmbedModelId?: string;
+
+  /** Embedding vector dimension for the model above. Baked into the OpenSearch
+   *  index at creation (not changeable afterwards), so it must be settable at
+   *  initial deploy alongside the model ID. Defaults to 1024. */
+  readonly bedrockEmbedDimensions?: number;
+
+  /** Bedrock LLM model ID for ontology induction, grounding rerank, and
+   *  description generation (ontology-engine LLM_MODEL_ID /
+   *  DESCRIPTION_LLM_MODEL_ID). Defaults to us.anthropic.claude-sonnet-4-6. */
+  readonly bedrockInductionLlmModelId?: string;
+
+  /** Bedrock chat/completion model ID for source enrichment, constraint
+   *  inference, and document KG extraction (the shared BedrockClient default
+   *  and the doc-ingestion inference-profile ARN). Defaults to
+   *  us.anthropic.claude-haiku-4-5-20251001-v1:0. */
+  readonly bedrockChatModelId?: string;
+
   /** Model IDs allowed for per-request override via options.modelId.
    *  When omitted or empty, any valid model ID is accepted. */
   readonly allowedOverrideModels?: string[];

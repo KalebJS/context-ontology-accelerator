@@ -205,3 +205,79 @@ describe("groupByClass domain matching (word-boundary, not substring)", () => {
     expect(claimAmount.relationships.map((r) => r.subject)).toEqual([]);
   });
 });
+
+// ── Bug #910: ambiguous match (skos:relatedMatch) renders consistently ──
+describe("groupByClass ambiguous grounding (bug #910)", () => {
+  const ambiguousCls: TurtleEntity = {
+    subject: "FinancialInstrument",
+    fullSubject: "ind:FinancialInstrument",
+    kind: "owl:Class",
+    body:
+      `ind:FinancialInstrument a owl:Class ;\n` +
+      `    rdfs:label "Financial Instrument" ;\n` +
+      `    skos:relatedMatch <https://schema.org/FinancialProduct> .`,
+  };
+  const highConfidenceCls: TurtleEntity = {
+    subject: "Policy",
+    fullSubject: "ind:Policy",
+    kind: "owl:Class",
+    body:
+      `ind:Policy a owl:Class ;\n` +
+      `    rdfs:label "Policy" ;\n` +
+      `    skos:closeMatch <https://schema.org/InsurancePolicy> .`,
+  };
+  const novelCls: TurtleEntity = {
+    subject: "CustomEntity",
+    fullSubject: "ind:CustomEntity",
+    kind: "owl:Class",
+    body: `ind:CustomEntity a owl:Class ;\n    rdfs:label "Custom Entity" .`,
+  };
+  const { groups } = groupByClass([ambiguousCls, highConfidenceCls, novelCls]);
+  const ambiguous = groups.find(
+    (g) => g.classEntity.subject === "FinancialInstrument",
+  )!;
+  const grounded = groups.find((g) => g.classEntity.subject === "Policy")!;
+  const novel = groups.find((g) => g.classEntity.subject === "CustomEntity")!;
+
+  it("recognizes skos:relatedMatch as foundational grounding", () => {
+    expect(ambiguous.groundedTo).toBe("FinancialProduct");
+    expect(ambiguous.matchType).toBe("related");
+  });
+
+  it("distinguishes ambiguous from grounded and novel", () => {
+    expect(grounded.groundedTo).toBe("InsurancePolicy");
+    expect(grounded.matchType).toBe("close");
+    expect(novel.groundedTo).toBeNull();
+    expect(novel.matchType).toBeNull();
+  });
+});
+
+// A skos match to a SIBLING proposal class is a dedup relationship, not
+// foundational grounding: it must leave both groundedTo AND matchType null so
+// every origin surface renders "Novel". Otherwise the origin gates (which key
+// off matchType) render "Grounded"/"Ambiguous" with a blank target.
+describe("groupByClass sibling-only skos match is not grounding (bug #910 follow-up)", () => {
+  const siblingTarget: TurtleEntity = {
+    subject: "Party",
+    fullSubject: "ind:Party",
+    kind: "owl:Class",
+    body: `ind:Party a owl:Class ;\n    rdfs:label "Party" .`,
+  };
+  // Only match is closeMatch to the sibling ind:Party above (no foundational).
+  const dedupedCls: TurtleEntity = {
+    subject: "Customer",
+    fullSubject: "ind:Customer",
+    kind: "owl:Class",
+    body:
+      `ind:Customer a owl:Class ;\n` +
+      `    rdfs:label "Customer" ;\n` +
+      `    skos:closeMatch ind:Party .`,
+  };
+  const { groups } = groupByClass([dedupedCls, siblingTarget]);
+  const deduped = groups.find((g) => g.classEntity.subject === "Customer")!;
+
+  it("treats a sibling-only match as Novel (both signals null)", () => {
+    expect(deduped.groundedTo).toBeNull();
+    expect(deduped.matchType).toBeNull();
+  });
+});
