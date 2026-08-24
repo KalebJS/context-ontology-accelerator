@@ -10,14 +10,57 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_common.bedrock import (
+    DEFAULT_MODEL_ID,
+    FALLBACK_CHAT_MODEL_ID,
     BedrockClient,
     BedrockInvocationResult,
     GuardrailBlockedError,
     InputTooLargeError,
     extract_text_blocks,
+    resolve_chat_model_id,
 )
 
 pytestmark = pytest.mark.unit
+
+
+class TestDefaultModelIdResolution:
+    """The chat model default is resolved from the environment (#94).
+
+    Table enrichment and constraint inference construct ``BedrockClient``
+    without a ``model_id``, so before this the module constant was the only
+    input and an infrastructure change could not reach those paths — they
+    stayed on a ``us.`` inference profile that a non-US region cannot invoke.
+
+    Tests target ``resolve_chat_model_id`` rather than reloading the module:
+    ``DEFAULT_MODEL_ID`` is read once at import (matching a container's static
+    environment), and reloading swaps the module object out from under the rest
+    of this file's patches.
+    """
+
+    def test_env_var_wins(self, monkeypatch):
+        monkeypatch.setenv("BEDROCK_CHAT_MODEL_ID", "jp.anthropic.claude-haiku-4-5-20251001-v1:0")
+        assert resolve_chat_model_id() == "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+    def test_accepts_a_bare_in_region_model_id(self, monkeypatch):
+        # Some models publish geo profiles for only a subset of regions, so a
+        # bare in-region id must be usable too.
+        monkeypatch.setenv("BEDROCK_CHAT_MODEL_ID", "anthropic.claude-haiku-4-5")
+        assert resolve_chat_model_id() == "anthropic.claude-haiku-4-5"
+
+    def test_falls_back_to_the_shared_default(self, monkeypatch):
+        monkeypatch.delenv("BEDROCK_CHAT_MODEL_ID", raising=False)
+        assert resolve_chat_model_id() == FALLBACK_CHAT_MODEL_ID
+        assert FALLBACK_CHAT_MODEL_ID == "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+    def test_empty_env_var_falls_back(self, monkeypatch):
+        # An empty value is a misconfiguration, not a request for an empty model
+        # id — fall back rather than sending "" to Bedrock.
+        monkeypatch.setenv("BEDROCK_CHAT_MODEL_ID", "")
+        assert resolve_chat_model_id() == FALLBACK_CHAT_MODEL_ID
+
+    def test_module_default_uses_the_resolver(self):
+        # DEFAULT_MODEL_ID is what the BedrockClient constructor defaults to.
+        assert resolve_chat_model_id() == DEFAULT_MODEL_ID
 
 
 class TestExtractTextBlocks:

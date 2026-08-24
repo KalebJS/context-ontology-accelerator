@@ -126,27 +126,52 @@ beyond what the stacks grant by default.
 
 ##### Where the model IDs live
 
-Only the Serve query LLM is configurable without a code change (`bedrockLlmModelId` in the SSM deploy
-config, `/{prefix}/config`). Every other model ID is a hardcoded default and must be edited:
+Every model ID is configurable from the SSM deploy config (`/{prefix}/config`) — no source edits are
+required to deploy outside the US. Set the keys you need before deploying; each falls back to the
+built-in default when omitted, so a deployment that configures none of them behaves exactly as it
+does today.
 
-| What | Where |
-|------|-------|
-| Embedding model — single source of truth | `libs/common/.../constants.py` (`DEFAULT_EMBED_MODEL_ID`), `libs/ts-shared/src/constants.ts` (`DEFAULT_BEDROCK_MODEL_ID`) |
-| Induction / grounding / rerank LLMs (CDK env) | `infra/lib/stacks/services/ontology-stack.ts` (`LLM_MODEL_ID` + rerank/enrichment IDs) |
-| Document-ingestion trigger LLM | `infra/lib/stacks/services/sources-stack.ts` (`BEDROCK_MODEL_ARN`) |
-| Ontology-engine runtime fallbacks | `packages/ontology-engine/src/.../inducer/` (`services/llm.py`, `services/grounding.py`, `routers/`, `strategies/rigor_ontology.py`), `main.py` |
-| Serve runtime fallbacks | `packages/context-manager/src/.../config.py`, `clients/bedrock.py`, `lexical/baseline_retriever.py` |
-| Shared Bedrock client default | `libs/common/.../bedrock.py` (`DEFAULT_MODEL_ID`) |
+| Config key | Sets the model for | Default |
+|------------|--------------------|---------|
+| `bedrockLlmModelId` | Serve query LLM (NL-to-SPARQL, synthesis) | `us.anthropic.claude-sonnet-5` |
+| `bedrockEmbedModelId` | **All** embeddings — induction, doc-KG-build, metric matching, serve retrieval | `us.cohere.embed-v4:0` |
+| `bedrockEmbedDimensions` | Vector dimension for the embedding model above | `1024` |
+| `bedrockInductionLlmModelId` | Ontology induction, grounding rerank, description generation | `us.anthropic.claude-sonnet-5` |
+| `bedrockChatModelId` | Source enrichment, constraint inference, document-ingestion extraction | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
 
-Most runtime defaults are also overridable via environment variables (`BEDROCK_MODEL_ID`,
-`BEDROCK_EMBED_MODEL_ID`, `LLM_MODEL_ID`) if you would rather set them per stack than edit source.
-Cost attribution in `libs/common/.../bedrock_metrics.py` is keyed by model ID, so add the new IDs
-there too or per-model cost metrics will be missing.
+Both **geographic inference profiles** (`us.`, `eu.`, `apac.`, `jp.`, `global.`) and **bare in-region model
+IDs** (e.g. `cohere.embed-v4:0`) are accepted — bare IDs matter because some models publish geo
+profiles for only a subset of regions. The same resolved values also drive the Bedrock IAM grants and
+the CloudWatch dashboards' `ModelId` dimensions, so permissions and cost widgets follow your
+configuration automatically.
+
+Example `/{prefix}/config` for an `ap-northeast-1` deployment (a bare in-region ID for the embedding
+model because Cohere Embed v4 publishes no `jp.` profile):
+
+```json
+{
+  "initialAdminEmail": "admin@example.com",
+  "bedrockLlmModelId": "global.anthropic.claude-sonnet-5",
+  "bedrockEmbedModelId": "cohere.embed-v4:0",
+  "bedrockEmbedDimensions": 1024,
+  "bedrockInductionLlmModelId": "global.anthropic.claude-sonnet-5",
+  "bedrockChatModelId": "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
+}
+```
+
+Not every model publishes a profile for every geography, so check what your region offers before
+setting these: `aws bedrock list-inference-profiles` and `aws bedrock list-foundation-models`.
+
+!!! warning "`us.` profiles cannot be invoked outside the US"
+    Bedrock rejects a cross-geography inference profile with
+    `ValidationException: The provided model identifier is invalid.` Nothing validates model IDs at
+    synth time, so a deploy with unusable IDs still reaches `CREATE_COMPLETE` and fails at first
+    invocation. Check each model in your target region before deploying.
 
 !!! warning "Changing the embedding model is a data migration"
     All embeddings must use the same model — existing indexes were written with the previous one and
-    must be re-ingested, or retrieval degrades silently. See the note on `DEFAULT_EMBED_MODEL_ID` in
-    `libs/common/src/coa_common/constants.py`.
+    must be re-ingested, or retrieval degrades silently. `bedrockEmbedDimensions` is baked into the
+    OpenSearch index at creation and cannot be changed afterwards. Set both at **initial** deploy.
 
 !!! warning "Only `us-east-1` has been tested"
     `us-east-1` is the default and the only region this solution has been deployed and validated in.
@@ -176,6 +201,18 @@ If this is the first CDK deployment to the account/region:
 ```bash
 npx cdk bootstrap aws://<ACCOUNT_ID>/<REGION>
 ```
+
+!!! warning "Deploying outside `us-east-1` needs TWO bootstraps"
+    The `*-edge-waf` stack always deploys to `us-east-1` (CloudFront-scope WAF WebACLs and CloudFront
+    ACM certificates exist only there — see "Cross-region and AZ constraints" above), so that region
+    must be bootstrapped as well or the deploy fails partway through on that stack:
+
+    ```bash
+    npx cdk bootstrap aws://<ACCOUNT_ID>/<REGION>       # your deploy region
+    npx cdk bootstrap aws://<ACCOUNT_ID>/us-east-1      # always required — edge-waf stack
+    ```
+
+    Preflight checks both and fails fast if either is missing.
 
 
 ## Installation

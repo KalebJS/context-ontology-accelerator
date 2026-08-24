@@ -1789,3 +1789,86 @@ class TestGroundedTableConnectivity:
             queue.extend(adj.get(node, set()) - visited)
 
         assert visited == local_classes, f"Disconnected: only reached {visited}"
+
+
+# ── Dropped tables tracking ─────────────────────────────────────────────
+
+
+class TestDroppedTables:
+    """Tests for dropped_tables tracking in the RIGOR strategy."""
+
+    def test_gen_llm_empty_returns_dropped_table(self):
+        """When Gen-LLM returns empty, table is marked as dropped with reason."""
+        s = RigorOntologyStrategy()
+        pipeline = MagicMock()
+        pipeline.eg.model_id = "titan-v2"
+        pipeline.eg.embed_texts.side_effect = lambda texts: [[0.0] * 8 for _ in texts]
+        pipeline.oc.search_embeddings.return_value = []
+
+        # Mock LLM client that returns None
+        mock_client = MagicMock()
+        s._get_llm_client = MagicMock(return_value=mock_client)
+        s._call_llm = MagicMock(return_value=None)
+
+        table = CatalogTable(id="t", name="patients", fullyQualifiedName="db.patients")
+
+        _, _, _, dropped = s.induce(
+            tables=[table],
+            ontology_uri_prefix="http://ex.org/ind#",
+            config={},
+            pipeline=pipeline,
+        )
+
+        assert len(dropped) == 1
+        assert dropped[0]["table_name"] == "patients"
+        assert dropped[0]["reason"] == "gen_llm_empty"
+
+    def test_parse_failure_returns_dropped_table(self):
+        """When all parse attempts fail, table is marked as dropped."""
+        s = RigorOntologyStrategy()
+        pipeline = MagicMock()
+        pipeline.eg.model_id = "titan-v2"
+        pipeline.eg.embed_texts.side_effect = lambda texts: [[0.0] * 8 for _ in texts]
+        pipeline.oc.search_embeddings.return_value = []
+
+        # Mock LLM client that returns unparseable Turtle
+        mock_client = MagicMock()
+        s._get_llm_client = MagicMock(return_value=mock_client)
+        s._call_llm = MagicMock(return_value="this is not turtle at all!!!")
+
+        table = CatalogTable(id="t", name="orders", fullyQualifiedName="db.orders")
+
+        _, _, _, dropped = s.induce(
+            tables=[table],
+            ontology_uri_prefix="http://ex.org/ind#",
+            config={},
+            pipeline=pipeline,
+        )
+
+        assert len(dropped) == 1
+        assert dropped[0]["table_name"] == "orders"
+        assert dropped[0]["reason"] == "parse_failed"
+
+    def test_successful_tables_not_in_dropped(self):
+        """Successfully processed tables do not appear in dropped_tables."""
+        s = RigorOntologyStrategy()
+        pipeline = MagicMock()
+        pipeline.eg.model_id = "titan-v2"
+        pipeline.eg.embed_texts.side_effect = lambda texts: [[0.0] * 8 for _ in texts]
+        pipeline.oc.search_embeddings.return_value = []
+
+        # Mock LLM client that returns valid Turtle
+        mock_client = MagicMock()
+        s._get_llm_client = MagicMock(return_value=mock_client)
+        s._call_llm = MagicMock(return_value="ind:Patient a owl:Class .")
+
+        table = CatalogTable(id="t", name="patients", fullyQualifiedName="db.patients")
+
+        _, _, _, dropped = s.induce(
+            tables=[table],
+            ontology_uri_prefix="http://ex.org/ind#",
+            config={},
+            pipeline=pipeline,
+        )
+
+        assert dropped == []

@@ -24,6 +24,11 @@ class TestMCPConfig:
             "SCL_MCP_PORT",
             "SCL_AUTH_ENABLED",
             "SCL_USE_FUSEKI",
+            # aws_region now falls back to the runtime environment
+            # (resolve_region), so these must be cleared too or the test
+            # inherits the host machine's region.
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
         ):
             monkeypatch.delenv(var, raising=False)
         config = MCPConfig()
@@ -38,6 +43,29 @@ class TestMCPConfig:
     def test_aws_region_env_override(self, monkeypatch):
         monkeypatch.setenv("SCL_AWS_REGION", "eu-central-1")
         assert MCPConfig().aws_region == "eu-central-1"
+
+    def test_aws_region_follows_runtime_environment(self, monkeypatch):
+        # #92 regression: the MCP stack sets AWS_REGION (not SCL_AWS_REGION),
+        # so the config must resolve the deploy region from the runtime
+        # environment. Before the fix this returned the hardcoded us-east-1
+        # and every MCP tool failed in any other region.
+        monkeypatch.delenv("SCL_AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        assert MCPConfig().aws_region == "us-west-2"
+
+    def test_aws_region_falls_back_to_aws_default_region(self, monkeypatch):
+        monkeypatch.delenv("SCL_AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-northeast-1")
+        assert MCPConfig().aws_region == "ap-northeast-1"
+
+    def test_scl_aws_region_takes_precedence_over_runtime(self, monkeypatch):
+        # The SCL_ prefixed var stays an explicit operator override (the
+        # documented workaround for #92 keeps working after the fix).
+        monkeypatch.setenv("SCL_AWS_REGION", "eu-west-1")
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        assert MCPConfig().aws_region == "eu-west-1"
 
     def test_auth_enabled_env_override(self, monkeypatch):
         monkeypatch.setenv("SCL_AUTH_ENABLED", "false")

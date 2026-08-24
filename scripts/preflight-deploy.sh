@@ -228,7 +228,70 @@ else
   ok "Lambda reserved concurrency disabled (lambda_reserved_concurrency=0) — skipping headroom check"
 fi
 
-# ── 8. Stale cdk.context.json ────────────────────────────────────────────
+# ── 8. CDK bootstrap in every region the deploy touches ───────────────────
+# The *-edge-waf stack ALWAYS deploys to us-east-1 (CloudFront-scope WAF WebACLs
+# and CloudFront ACM certs exist only there), so a non-us-east-1 deploy needs
+# BOTH regions bootstrapped. Without this the deploy runs for a long while and
+# then fails on that one stack with a bootstrap error — the docs showed a single
+# `cdk bootstrap <REGION>` and never mentioned the second one.
+if command -v aws >/dev/null 2>&1 && aws sts get-caller-identity >/dev/null 2>&1; then
+  _bootstrap_regions="$REGION"
+  [ "$REGION" != "us-east-1" ] && _bootstrap_regions="$REGION us-east-1"
+  for _bsr in $_bootstrap_regions; do
+    if aws cloudformation describe-stacks --stack-name CDKToolkit --region "$_bsr" \
+        >/dev/null 2>&1; then
+      ok "CDK bootstrapped in $_bsr"
+    else
+      err "CDK is not bootstrapped in $_bsr."
+      if [ "$_bsr" = "us-east-1" ] && [ "$REGION" != "us-east-1" ]; then
+        err "us-east-1 is always required — the *-edge-waf stack deploys there regardless of your deploy region."
+      fi
+      err "Run: npx cdk bootstrap aws://\$(aws sts get-caller-identity --query Account --output text)/$_bsr"
+    fi
+  done
+else
+  warn "AWS credentials not available — skipping CDK bootstrap check"
+fi
+
+# ── 9. Configured Bedrock model IDs exist in the deploy region ────────────
+# Nothing validates model IDs at synth or deploy time, so an unusable ID (e.g. a
+# `us.` inference profile in a non-US region) still reaches CREATE_COMPLETE and
+# only fails at first invocation. Deliberately a WARNING, not an error: model
+# availability can be account-scoped and a bare in-region ID lives in a different
+# API than a geographic profile, so a hard failure here could block a valid
+# deploy. Needs jq (the config is JSON) — skipped without it.
+_CONFIG_PARAM="/${SCL_PREFIX:-coa}/config"
+if command -v aws >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 \
+    && aws sts get-caller-identity >/dev/null 2>&1; then
+  _cfg_json="$(aws ssm get-parameter --name "$_CONFIG_PARAM" --region "$REGION" \
+    --query 'Parameter.Value' --output text 2>/dev/null || echo "")"
+  if [ -n "$_cfg_json" ]; then
+    _model_ids="$(printf '%s' "$_cfg_json" | jq -r '
+      [.bedrockLlmModelId, .bedrockEmbedModelId, .bedrockInductionLlmModelId, .bedrockChatModelId]
+      | map(select(. != null and . != "")) | .[]' 2>/dev/null || echo "")"
+    if [ -n "$_model_ids" ]; then
+      _profiles="$(aws bedrock list-inference-profiles --region "$REGION" \
+        --query 'inferenceProfileSummaries[].inferenceProfileId' --output text 2>/dev/null || echo "")"
+      _models="$(aws bedrock list-foundation-models --region "$REGION" \
+        --query 'modelSummaries[].modelId' --output text 2>/dev/null || echo "")"
+      if [ -z "$_profiles" ] && [ -z "$_models" ]; then
+        warn "Could not list Bedrock models in $REGION — skipping model-ID check"
+      else
+        for _mid in $_model_ids; do
+          if printf '%s %s' "$_profiles" "$_models" | grep -qF "$_mid"; then
+            ok "Bedrock model available in $REGION: $_mid"
+          else
+            warn "Bedrock model '$_mid' not found in $REGION (from $_CONFIG_PARAM)."
+            warn "  A cross-geography profile (e.g. 'us.' outside the US) fails at first invocation with"
+            warn "  ValidationException. See 'Where the model IDs live' in external-docs/content/deploying.md."
+          fi
+        done
+      fi
+    fi
+  fi
+fi
+
+# ── 10. Stale cdk.context.json ───────────────────────────────────────────
 if [ -f "$REPO_ROOT/infra/cdk.context.json" ]; then
   warn "infra/cdk.context.json exists — cached lookups may be stale."
   warn "If deploy fails with 'resource not found', delete it: rm infra/cdk.context.json"
