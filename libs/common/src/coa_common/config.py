@@ -7,36 +7,8 @@ from __future__ import annotations
 
 import os
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
-
-
-class SCLConfig(BaseSettings):
-    """Base configuration for all services.
-
-    Values are loaded from environment variables with the ``SCL_`` prefix.
-    """
-
-    model_config = {"env_prefix": "SCL_"}
-
-    # General
-    project_name: str = "coa"
-    environment: str = "dev"
-    log_level: str = "INFO"
-
-    # AWS
-    aws_region: str = "us-east-1"
-
-    # DynamoDB
-    dynamodb_table_prefix: str = "coa"
-
-    # S3
-    s3_bucket_prefix: str = "coa"
-
-    # OpenSearch
-    opensearch_endpoint: str = ""
-
-    # Neptune / SPARQL
-    sparql_endpoint: str = ""
 
 
 def resolve_region(default: str = "us-east-1") -> str:
@@ -53,3 +25,36 @@ def resolve_region(default: str = "us-east-1") -> str:
     sites — import and use this helper instead.
     """
     return os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", default))
+
+
+class SCLConfig(BaseSettings):
+    """Base configuration for all services.
+
+    Values are loaded from environment variables with the ``SCL_`` prefix.
+    """
+
+    model_config = {"env_prefix": "SCL_"}
+
+    # General
+    project_name: str = "coa"
+    environment: str = "dev"
+    log_level: str = "INFO"
+
+    # AWS — SCL_AWS_REGION wins when set; otherwise resolve from the runtime
+    # environment (AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1).
+    # Nothing in infra/ sets SCL_AWS_REGION, so a hardcoded default here would
+    # silently pin any consumer to us-east-1 in every other region — the same
+    # mismatch that broke every MCP tool outside us-east-1 (#92).
+    aws_region: str = Field(default_factory=resolve_region)
+
+    # DynamoDB
+    dynamodb_table_prefix: str = "coa"
+
+    # S3
+    s3_bucket_prefix: str = "coa"
+
+    # OpenSearch
+    opensearch_endpoint: str = ""
+
+    # Neptune / SPARQL
+    sparql_endpoint: str = ""

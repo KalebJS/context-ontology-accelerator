@@ -101,6 +101,18 @@ string FilterPattern
 @length(min: 20, max: 2048)
 string SecretArn
 
+/// AWS Lambda function ARN, optionally qualified with a version number, an
+/// alias, or `$LATEST`. Format:
+/// arn:{partition}:lambda:{region}:{account-id}:function:{name}[:{qualifier}]
+///
+/// A full ARN is required: Lambda's partial-ARN
+/// (`{account-id}:function:{name}`) and name-only forms are deliberately
+/// rejected, because the connector runs in the customer's account and an
+/// unqualified name would resolve against this deployment's account instead.
+@pattern("^arn:aws[a-z-]*:lambda:[a-z0-9-]+:\\d{12}:function:[a-zA-Z0-9_-]+(:(\\$LATEST|[a-zA-Z0-9_-]+))?$")
+@length(min: 20, max: 2048)
+string LambdaFunctionArn
+
 /// Database engine type for JDBC connections.
 enum DatabaseEngine {
     /// PostgreSQL database engine.
@@ -242,6 +254,46 @@ structure GlueConfiguration {
     /// Redshift Serverless workgroup used to execute queries when
     /// `executionEngine` is REDSHIFT. Ignored (and unnecessary) for ATHENA.
     redshiftWorkgroup: RedshiftWorkgroupName
+}
+
+/// Custom Athena Query Federation connector configuration — the
+/// ATHENA_CONNECTOR sub-type. The connector is a Lambda the customer authors
+/// and deploys in their own account, which this service registers as a
+/// Lambda-backed Athena data catalog in its own account; both discovery and
+/// serve-time queries run through Athena against that catalog.
+///
+/// Unlike GlueConfiguration there is no Glue database behind the source, so
+/// there is no catalogId and no cross-account IAM role to assume: the customer
+/// grants access on the connector Lambda's own resource policy instead. There
+/// is also no region member — the connector must live in this deployment's
+/// region (see metadataFunctionArn).
+structure AthenaConfiguration {
+    /// ARN of the connector Lambda that handles metadata requests — and record
+    /// requests too when recordFunctionArn is omitted, i.e. a composite
+    /// handler. The ARN's region must equal this deployment's own region,
+    /// because Athena can only invoke a data-source connector co-located with
+    /// the query.
+    @required
+    metadataFunctionArn: LambdaFunctionArn
+
+    /// ARN of a separate record-handler Lambda, for a connector deployed as a
+    /// split metadata/record pair. Omit for the common composite connector, in
+    /// which case metadataFunctionArn serves both paths.
+    recordFunctionArn: LambdaFunctionArn
+
+    /// The single database inside the connector's catalog that this source
+    /// exposes. Exactly one database is resolved per source, so a connector
+    /// serving several databases is onboarded once per database.
+    @required
+    databaseName: DatabaseName
+
+    /// Include-filter applied to table names within databaseName. Omit to
+    /// discover every table.
+    tableFilter: FilterPattern
+
+    /// Exclude-filter applied to table names within databaseName, evaluated
+    /// after tableFilter.
+    tableExcludeFilter: FilterPattern
 }
 
 /// Execution engine choice for a Glue/Iceberg source. A deliberately narrow
@@ -562,6 +614,11 @@ enum SourceSubType {
     /// Structured: JDBC-connected relational database
     JDBC_DATABASE
 
+    /// Structured: customer-authored AWS Athena Query Federation SDK connector
+    /// (a Lambda in the customer's account), registered as a Lambda-backed
+    /// Athena data catalog and queried through Athena
+    ATHENA_CONNECTOR
+
     /// Unstructured: S3 bucket prefix
     S3
 
@@ -706,7 +763,8 @@ structure CreateSourceInput {
 }
 
 /// Database source creation fields.
-/// Exactly one of glueConfiguration or jdbcConfiguration must be provided.
+/// Exactly one of glueConfiguration, jdbcConfiguration or athenaConfiguration
+/// must be provided — it selects the sub-type.
 structure CreateDatabaseSourceInput {
     @required
     name: DisplayName
@@ -716,6 +774,10 @@ structure CreateDatabaseSourceInput {
 
     /// JDBC connection config. Required for JDBC_DATABASE sub-type.
     jdbcConfiguration: JdbcConfiguration
+
+    /// Custom Athena federation connector config. Required for the
+    /// ATHENA_CONNECTOR sub-type.
+    athenaConfiguration: AthenaConfiguration
 
     /// Enable AI-powered business metadata enrichment (descriptions,
     /// synonyms, glossary terms, tags). Defaults to true. When false the
@@ -806,6 +868,9 @@ structure DatabaseSourceDetail {
     glueConfiguration: GlueConfiguration
 
     jdbcConfiguration: JdbcConfiguration
+
+    /// Populated for the ATHENA_CONNECTOR sub-type; absent otherwise.
+    athenaConfiguration: AthenaConfiguration
 
     /// Whether AI-powered business metadata enrichment runs for this source.
     /// Set at creation time and persisted with the source record. When false
@@ -1056,6 +1121,8 @@ operation UpdateSourceMetadata {
         glueConfiguration: GlueConfiguration
 
         jdbcConfiguration: JdbcConfiguration
+
+        athenaConfiguration: AthenaConfiguration
 
         /// Whether AI-powered metadata enrichment runs for this source.
         metadataEnrichmentEnabled: Boolean
