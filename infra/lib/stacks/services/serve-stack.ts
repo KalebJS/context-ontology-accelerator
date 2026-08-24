@@ -64,6 +64,12 @@ export interface ServeStackProps extends cdk.StackProps {
    *  Defaults to us.anthropic.claude-sonnet-5 at runtime when omitted. */
   readonly bedrockLlmModelId?: string;
 
+  /** Bedrock embedding model ID for query embedding + the graphrag lexical
+   *  retriever. MUST match what doc-kg-build ingested with; resolved from the
+   *  SSM deploy config so a non-US deploy can set a region-appropriate model
+   *  (#94). Falls back to the shared default when omitted. */
+  readonly bedrockEmbedModelId?: string;
+
   /** Comma-separated list of model IDs allowed for per-request override.
    *  When omitted, any valid model ID is accepted (open by default). */
   readonly allowedOverrideModels?: string[];
@@ -544,8 +550,11 @@ export class ServeStack extends SCLStack {
             BEDROCK_MODEL_ID: props.bedrockLlmModelId,
           }),
           // Query embedding + graphrag lexical retriever MUST use the same model
-          // doc-kg-build ingested with. Single source of truth in ts-shared.
-          BEDROCK_EMBED_MODEL_ID: DEFAULT_BEDROCK_MODEL_ID,
+          // doc-kg-build ingested with. Config-resolved (#94) so a non-US deploy
+          // can set a region-appropriate model; shared ts-shared constant is the
+          // fallback, keeping producers and consumers on one value.
+          BEDROCK_EMBED_MODEL_ID:
+            props.bedrockEmbedModelId ?? DEFAULT_BEDROCK_MODEL_ID,
           ...(props.allowedOverrideModels?.length && {
             ALLOWED_OVERRIDE_MODELS: props.allowedOverrideModels.join(","),
           }),
