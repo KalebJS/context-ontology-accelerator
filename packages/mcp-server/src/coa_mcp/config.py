@@ -3,6 +3,8 @@
 
 """MCP Server configuration — extends shared SCLConfig."""
 
+from coa_common.config import resolve_region
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -11,9 +13,9 @@ class MCPConfig(BaseSettings):
 
     Values loaded from environment variables with ``SCL_`` prefix.
     Pydantic BaseSettings reads env vars automatically — for example,
-    ``aws_region`` defaults to "us-east-1" only when the ``SCL_AWS_REGION``
-    environment variable is not set. When the env var is present, its value
-    takes precedence over the default specified here.
+    ``aws_region`` is resolved from the runtime environment only when the
+    ``SCL_AWS_REGION`` environment variable is not set. When the env var is
+    present, its value takes precedence over the default.
     """
 
     model_config = {"env_prefix": "SCL_"}
@@ -22,8 +24,14 @@ class MCPConfig(BaseSettings):
     environment: str = "dev"
     log_level: str = "INFO"
 
-    # AWS — defaults to us-east-1 only when SCL_AWS_REGION env var is not set
-    aws_region: str = "us-east-1"
+    # AWS — SCL_AWS_REGION wins when set; otherwise resolve from the runtime
+    # environment (AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1).
+    # Nothing in infra/ sets SCL_AWS_REGION — the MCP stack sets AWS_REGION —
+    # so a hardcoded default here pinned every deployment's downstream calls
+    # (Lambda invokes, Context Manager endpoint) to us-east-1 and broke every
+    # MCP tool in any other region (#92). default_factory keeps the pydantic
+    # env lookup precedence intact while making the fallback region-aware.
+    aws_region: str = Field(default_factory=resolve_region)
 
     # Neptune (for discovery tools)
     neptune_endpoint: str = ""
