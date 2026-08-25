@@ -31,6 +31,7 @@ import {
   DEFAULT_GRAPH_URI_BASE,
 } from "../../constants";
 import { bundlePython } from "../../utils/python-bundling";
+import { bedrockModelArn } from "../../utils/bedrock-utils";
 
 export interface MetricServiceStackProps extends cdk.StackProps {
   /** VPC for Lambda placement. */
@@ -214,7 +215,9 @@ export class MetricServiceStack extends SCLStack {
       new iam.PolicyStatement({
         actions: ["bedrock:InvokeModel"],
         resources: [
-          `arn:aws:bedrock:*:${this.account}:inference-profile/${bedrockModelId}`,
+          bedrockModelArn(bedrockModelId, "*", this.account),
+          // Invoking an inference profile also requires permission on the
+          // underlying foundation model it routes to, hence the wildcard.
           `arn:aws:bedrock:*::foundation-model/*`,
         ],
       }),
@@ -407,7 +410,9 @@ export class MetricServiceStack extends SCLStack {
       new iam.PolicyStatement({
         actions: ["bedrock:InvokeModel"],
         resources: [
-          `arn:aws:bedrock:*:${this.account}:inference-profile/${bedrockModelId}`,
+          bedrockModelArn(bedrockModelId, "*", this.account),
+          // See the metric-api grant above: a profile also needs invoke on the
+          // underlying foundation model.
           `arn:aws:bedrock:*::foundation-model/*`,
         ],
       }),

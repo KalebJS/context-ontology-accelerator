@@ -150,6 +150,19 @@ Inbound queries are dispatched through a tiered resolution system:
 
 Routing is automatic based on complexity signals (compare, trend, top N, breakdown) and semantic matching scores. Use `tierOverride` in the request `options` field to force a specific tier (1, 2, 2.5, or 3). Tier-2.5-generated SQL passes through the same SQL firewall (terminal 403 on deny) and the same composite executor as Tiers 1 and 2.
 
+### Tier-2 strategy selection (`options.strategy`)
+
+A caller can pin how Tier 2 produces its query via the `strategy` field in request `options`. Setting it disables per-query pruning and honors the caller's intent:
+
+| `options.strategy` | Behavior |
+|--------------------|----------|
+| `best` | Run all applicable strategies in parallel, return the highest-confidence result |
+| `ontop` | Only NL→SPARQL (Ontop / VKG) |
+| `nl_to_sql` | Only single-shot NL→SQL |
+| `ontop_first` | Sequential: Ontop → NL→SQL fallback |
+| `nl_to_sql_first` (**default**) | Sequential: NL→SQL → Ontop fallback |
+| `agentic` | **Opt-in only.** A Strands tool-use agent ([`agents/sql_agent.py`](src/coa_serve/agents/sql_agent.py)) that starts from pre-fetched candidate tables and their schemas, discovers any others it needs (`search_tables` / `get_table_schema`), delegates SQL generation (`generate_sql`), then executes + self-corrects (`execute_sql`). It consumes the reusable Tier-2 tools ([`tier2/tools/`](src/coa_serve/tier2/tools/)) and the shared execute-with-authz primitive ([`sql_execution.py`](src/coa_serve/sql_execution.py)) — it has no raw-SQL execution path of its own: `generate_sql` returns a handle and only a generated statement can be executed. It is **never** part of an automatic or fallback chain — it runs solely when pinned explicitly. The loop is bounded by the request deadline and `SERVE_AGENTIC_EXEC_TIMEOUT_S`, not by a turn count. Tuning knobs: `SERVE_AGENTIC_PREFETCH_SCHEMAS`, `SERVE_AGENTIC_EXEC_TIMEOUT_S`, `SERVE_AGENTIC_INTENT_REVIEW` (see [Configuration](#configuration)). |
+
 See [docs/query-routing.md](docs/query-routing.md) for the full architecture, decision flow diagram, and threshold configuration.
 
 ### Tier-2 answerability filter (mapped classes only)
@@ -285,6 +298,10 @@ All executed queries are subject to a `max_rows` cap (default: 10,000):
 | `TIER3_VECTOR_TIMEOUT` | No | falls back to `TIER3_PER_SOURCE_TIMEOUT_S` | Per-source override (seconds) for the vector-search retrieval timeout. |
 | `TIER3_GRAPH_TIMEOUT` | No | falls back to `TIER3_PER_SOURCE_TIMEOUT_S` | Per-source override (seconds) for the graph-traversal retrieval timeout. |
 | `LEXICAL_RETRIEVER_TIMEOUT_S` | No | `45` | Standard-mode (non-agentic) Tier-3 lexical retriever per-query timeout (seconds). Raise for slow single-shot graphrag traversal strategies (e.g. `topic_beam`) that would otherwise be truncated by the retriever's built-in 15s default. Ignored on the agentic path, which passes its own per-tool budget. An invalid value logs a warning and keeps the 45s default. |
+| `SERVE_AGENTIC_EXEC_TIMEOUT_S` | No | `35` (min 5) | Per-query `execute_sql` execution timeout (seconds) inside the Tier-2 agentic loop (`options.strategy="agentic"`). Bounds each tool-driven SQL execution so one slow query can't consume the whole agent budget. Values below 5 are clamped to 5. |
+| `SERVE_AGENTIC_PREFETCH_SCHEMAS` | No | `3` (min 0) | Table schemas inlined into the agentic prompt before the first model turn (`options.strategy="agentic"`). One k-NN search on the question supplies the candidate list; the top N candidates' full schemas are inlined so the agent does not spend turns re-requesting them. `0` disables the prefetch and restores pure tool-driven discovery. |
+| `SERVE_AGENTIC_INTENT_REVIEW` | No | unset (disabled) | `1`/`true`/`on`/`yes` enables an extra interpretation-reconciliation turn in the agentic loop (the agent restates and reconciles query intent before finalizing SQL). Off by default. |
+| `SERVE_EVIDENCE_MAX_CHARS` | No | `500` | Caps the number of characters of caller-supplied evidence text injected into Tier-2 prompts (`capped_evidence()`); longer evidence is truncated to bound prompt size. |
 | `WS_MAX_MESSAGE_BYTES` | No | `131072` (128 KB) | Maximum WebSocket message size in bytes. Messages exceeding this close the connection with RFC 6455 code 1009. |
 | `WS_RATE_LIMIT_BURST` | No | `10` | Query rate limit: maximum burst tokens per connection. Each query consumes one token. |
 | `WS_RATE_LIMIT_REFILL_SECONDS` | No | `6.0` | Query rate limit: seconds to refill one token (~10 queries/min sustained). |

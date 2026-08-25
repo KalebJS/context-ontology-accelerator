@@ -52,6 +52,7 @@ from .session_metadata import SessionMetadataStore
 from .sse_emitter import SSEEmitter
 from .step_ids import StepId
 from .tier1.metric_resolver import MetricResolver
+from .tier2.nl_to_sql.agentic_strategy import AgenticStrategy
 from .tier2.nl_to_sql.sql_generator import SQLGenerator
 from .tier2.nl_to_sql.strategy import NLtoSQLStrategy
 from .tier2.ontop.nl_to_sparql import NLtoSPARQL
@@ -272,8 +273,20 @@ async def _ensure_initialized():
             query_executor=query_executor,
             oss_ontology_index=oss_ontology_index,
         )
+        # Bounded tool-use agent (iterative schema discovery → generate → execute →
+        # self-correct). OPT-IN only: it runs solely when a request pins
+        # options.strategy="agentic" — never as a fallback (see
+        # StructuredQueryTier._strategies_for) — so registering it here does not
+        # change the default nl_to_sql_first resolution path.
+        agentic_strategy = AgenticStrategy(
+            sql_generator=sql_generator,
+            firewall=firewall,
+            query_executor=query_executor,
+            vector_client=opensearch_client,
+            oss_ontology_index=oss_ontology_index,
+        )
         structured_query_tier = StructuredQueryTier(
-            strategies=[ontop_strategy, nl_to_sql_strategy],
+            strategies=[ontop_strategy, nl_to_sql_strategy, agentic_strategy],
         )
 
         # Agentic Tier 3 path. Built so a deployment default (TIER3_STRATEGY=agentic)

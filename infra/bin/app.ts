@@ -239,6 +239,7 @@ async function deploy(): Promise<void> {
       neptuneEndpoint: storage.neptuneClusterEndpoint,
       neptuneClusterArn: storage.neptuneClusterArn,
       allowedOrigin,
+      bedrockModelId: config.bedrockEmbedModelId,
       alarmAction,
     },
   );
@@ -365,6 +366,7 @@ async function deploy(): Promise<void> {
     vkgEndpoint: `http://vkg.${prefix}-${envName}-services.local:${vkg.containerPort}`,
     agentCoreAzNames,
     bedrockLlmModelId: config.bedrockLlmModelId,
+    bedrockEmbedModelId: config.bedrockEmbedModelId,
     allowedOverrideModels: config.allowedOverrideModels,
     alarmAction,
   });
@@ -375,6 +377,9 @@ async function deploy(): Promise<void> {
     network,
     storage,
     allowedOrigin,
+    bedrockChatModelId: config.bedrockChatModelId,
+    bedrockEmbedModelId: config.bedrockEmbedModelId,
+    bedrockEmbedDimensions: config.bedrockEmbedDimensions,
     alarmAction,
   });
   sources.addDependency(smusDomain); // needs SSM params from namespace stack
@@ -446,6 +451,10 @@ async function deploy(): Promise<void> {
     ontologyArtifactsBucket: storage.ontologyArtifactsBucket,
     smusDomainId: smusDomain.domainId,
     allowedOrigin,
+    bedrockEmbedModelId: config.bedrockEmbedModelId,
+    bedrockEmbedDimensions: config.bedrockEmbedDimensions,
+    bedrockInductionLlmModelId: config.bedrockInductionLlmModelId,
+    bedrockChatModelId: config.bedrockChatModelId,
     alarmAction,
   });
   ontology.addDependency(smusDomain); // /namespace/namespaces-table-name, /smus/dz-project-access-role-arn

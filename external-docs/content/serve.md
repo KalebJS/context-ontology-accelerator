@@ -167,7 +167,8 @@ this is automatic and requires no configuration:
   transpiled to the engine's own dialect first (e.g. `LIMIT`→`TOP` for SQL Server), and
   a root-level row cap is applied.
 - **Athena federation** — **cross-source** queries, and any source without a direct
-  path (Glue-catalog sources), execute through the Athena federated catalog
+  path (Glue-catalog sources, and the Oracle/Snowflake JDBC engines, which have no
+  direct-SQL driver), execute through the Athena federated catalog
   (~500–800 ms typical). This is the fallback whenever the direct path can't serve the
   query, so a request always resolves.
 

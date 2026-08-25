@@ -132,7 +132,7 @@ class RigorOntologyStrategy(InductionStrategy):
         grounding_ontology_ids: list[str] | None = None,
         grounding_mode: str = "ENHANCED",
         cost_tracker: CostTracker | None = None,
-    ) -> tuple[Graph, set[str], list[ConceptMatch]]:
+    ) -> tuple[Graph, set[str], list[ConceptMatch], list[dict]]:
         """Induce a Turtle ontology via iterative Gen-LLM + Judge-LLM with RAG context.
 
         Args:
@@ -151,8 +151,8 @@ class RigorOntologyStrategy(InductionStrategy):
             cost_tracker: Optional per-job Bedrock usage accumulator threaded into LLM calls.
 
         Returns:
-            A tuple of the proposal graph, the set of novel table names, and the
-            list of concept matches.
+            A tuple of the proposal graph, the set of novel table names, the
+            list of concept matches, and the list of dropped tables with failure reasons.
         """
         # rigor_ontology uses LLM Gen+Judge rather than embedding match, so
         # grounding_ontology_ids and grounding_mode have no effect on its
@@ -178,6 +178,9 @@ class RigorOntologyStrategy(InductionStrategy):
 
         # Track which table each RDF subject was generated from (provenance)
         uri_to_table: dict[str, str] = {}
+
+        # Track tables that failed to process
+        dropped_tables: list[dict] = []
 
         # Merged RDF graph
         merged_graph = self._new_graph(ontology_uri_prefix, "RIGOR Induced Ontology")
@@ -210,6 +213,7 @@ class RigorOntologyStrategy(InductionStrategy):
             delta_fragment = self._call_llm(llm_client, model_id, prompt, _SYSTEM_PROMPT)
             if not delta_fragment:
                 log.warning("RIGOR: Gen-LLM returned empty for table %s", table.name)
+                dropped_tables.append({"table_name": table.name, "reason": "gen_llm_empty"})
                 continue
 
             # Step 3: Judge-LLM refinement
@@ -265,6 +269,7 @@ class RigorOntologyStrategy(InductionStrategy):
                 core_ontology_fragments.append(refined_fragment)
             else:
                 log.error("RIGOR: failed to parse delta for table %s; dropping", table.name)
+                dropped_tables.append({"table_name": table.name, "reason": "parse_failed"})
 
         # Step 4b: Sanitize dual-typed properties (OWL 2 QL compliance)
         # LLM occasionally emits a property as both owl:ObjectProperty and
@@ -281,7 +286,16 @@ class RigorOntologyStrategy(InductionStrategy):
             confidence_threshold,
             uri_to_table,
         )
-        return novel_graph, novel_tables, matches
+
+        if dropped_tables:
+            log.warning(
+                "RIGOR: dropped %d/%d tables due to processing failures: %s",
+                len(dropped_tables),
+                len(ordered_tables),
+                ", ".join(f"{d['table_name']} ({d['reason']})" for d in dropped_tables),
+            )
+
+        return novel_graph, novel_tables, matches, dropped_tables
 
     # ── Graph helpers ────────────────────────────────────────────────
 

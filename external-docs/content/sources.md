@@ -40,6 +40,8 @@ flowchart LR
 | JDBC | `JDBC_DATABASE` | Redshift | Direct SQL or Athena federated |
 | JDBC | `JDBC_DATABASE` | MySQL | Direct SQL or Athena federated |
 | JDBC | `JDBC_DATABASE` | SQL Server | Direct SQL or Athena federated |
+| JDBC | `JDBC_DATABASE` | Oracle | Athena federated only |
+| JDBC | `JDBC_DATABASE` | Snowflake | Athena federated only |
 
 ### Direct SQL vs Athena federated
 
@@ -58,6 +60,13 @@ configure it:
 
 Both paths are read-only and go through the same SQL firewall. `queryEngine` is a
 system-set, read-only field — there is no API or configuration knob for it.
+
+!!! note "Oracle and Snowflake are federation-only"
+    Oracle and Snowflake have no direct-SQL driver on the serve path, so every
+    query against them — single-source or cross-source — runs through the Athena
+    federated catalog. Their `queryEngine` is always `ATHENA` (never `JDBC`), which
+    means they always require the federated catalog provisioned at onboarding and
+    do not benefit from the low-latency direct-SQL path.
 
 ## Registering a JDBC Data Source
 
@@ -79,6 +88,20 @@ aws secretsmanager create-secret \
 | Redshift | 5439 |
 | MySQL | 3306 |
 | SQL Server | 1433 |
+| Oracle | 1521 |
+| Snowflake | 443 (HTTPS) |
+
+!!! note "Snowflake is a SaaS endpoint, not a private database"
+    Snowflake is reached over the public internet on **port 443**, not on a
+    private VPC/RDS endpoint like the other engines. The connector security group
+    therefore allows egress on 443 (Snowflake wire protocol) **and port 80**, which
+    `snowflake-connector-python` uses for OCSP certificate-revocation checks — OCSP
+    is an HTTP-only protocol with no HTTPS variant, and the responses are
+    cryptographically signed. Both rules are egress-only. Deployments that onboard
+    no Snowflake source can drop the port-80 rule with the
+    `connector_ocsp_egress=false` CDK context key, and all connector egress can be
+    narrowed from `0.0.0.0/0` to fixed CIDRs with `connector_egress_cidrs`. See the
+    internal egress-controls reference for details.
 
 3. **Database user permissions** — The credential user needs `SELECT` on `information_schema` (or equivalent catalog views) for schema discovery.
 
@@ -107,9 +130,9 @@ and a `databaseSource.jdbcConfiguration` body — see **CreateSource** in the
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `engine` | Yes | `POSTGRESQL`, `REDSHIFT`, `MYSQL`, `SQLSERVER` |
-| `host` | Yes | Database hostname (RFC 1123, max 253 chars) |
-| `port` | Yes | Port number (1–65535) |
+| `engine` | Yes | `POSTGRESQL`, `REDSHIFT`, `MYSQL`, `SQLSERVER`, `ORACLE`, `SNOWFLAKE` |
+| `host` | Yes | Database hostname (RFC 1123, max 253 chars). For Snowflake, the account host `<account>.snowflakecomputing.com` |
+| `port` | Yes | Port number (1–65535). Snowflake uses `443` |
 | `databaseName` | Yes | Target database (alphanumeric + `_` `-`, max 128 chars) |
 | `credentialSecretArn` | Yes | Secrets Manager secret ARN with `username`/`password` |
 | `crossAccountRoleArn` | No | IAM role to assume for cross-account secret access. The web app's **Connect Source** form requires the role name to contain `{prefix}-datasource-access-` as a convention |
@@ -117,7 +140,18 @@ and a `databaseSource.jdbcConfiguration` body — see **CreateSource** in the
 | `schemaExcludeFilter` | No | Regex — schemas matching this are excluded (after include filter) |
 | `tableFilter` | No | Regex — only tables matching this are discovered |
 | `tableExcludeFilter` | No | Regex — tables matching this are excluded |
+| `warehouse` | Snowflake only | Virtual warehouse used to run `INFORMATION_SCHEMA` discovery queries and required by federation. **Required for Snowflake** — omitting it fails the scan (`SCAN_FAILED`) at federation time |
+| `role` | No (Snowflake only) | Optional Snowflake RBAC role name for the discovery session — a Snowflake construct, **not** an AWS IAM role. Honored during discovery only; federation runs as the secret user's `DEFAULT_ROLE`, so grant that role least-privilege read access |
 | `metadataEnrichmentEnabled` | No | `true` (default) or `false` — skip AI enrichment |
+
+!!! warning "Snowflake requires a warehouse and relies on the user's DEFAULT_ROLE"
+    Snowflake cannot execute queries without an active warehouse, and the managed
+    Glue federated connector enforces this at connection-creation time — so
+    `warehouse` is mandatory for Snowflake sources. The Glue connector also rejects
+    a per-connection `role`, so federation always runs as the credential user's
+    Snowflake `DEFAULT_ROLE`. Create that user with
+    `DEFAULT_ROLE = <least-privilege read-only role>` so both discovery and
+    federated queries stay scoped.
 
 ### Input Validation
 
@@ -393,6 +427,8 @@ LIMIT 100;
 | Bulk approve stuck in `APPROVING` | Worker Lambda timed out | Check worker CloudWatch logs; retry the POST |
 | Delete returns 500 | Federation teardown failed (LF admin missing) | Register the provisioner role as LF admin; retry |
 | `Unsupported database engine: <ENGINE>` on connect | The `engine` value is not one of the supported engines listed above | Use a supported engine, or register the database through the Glue Data Catalog instead |
+| Snowflake `SCAN_FAILED` right after discovery succeeds | No `warehouse` set — federation is rejected at connection creation (`WAREHOUSE are missing in the request object`) | Set `jdbcConfiguration.warehouse` to an active Snowflake virtual warehouse and re-scan |
+| Snowflake/Oracle scan succeeds but Athena queries return `TABLE_NOT_FOUND` on an empty catalog | Historical casing-filter bug (fixed) — the federated catalog resolved but exposed zero objects because Snowflake/Oracle fold unquoted identifiers to UPPERCASE | Fixed in current releases (the lowercase casing filter is no longer sent for Oracle/Snowflake). Delete and re-create the source if it was onboarded before the fix — the property is non-updatable |
 | `SCAN_FAILED` with `... exceeding the limit of N` | Source has more tables than `MAX_TABLES_PER_SOURCE` (default `10000`); discovery fails fast rather than hitting the Lambda timeout | Narrow the scan scope with `schemaFilter` / `schemaExcludeFilter` / `tableFilter` (e.g. exclude system schemas like `schemaExcludeFilter: "information_schema\|pg_catalog\|sys"`). If a larger source genuinely needs to be scanned in one pass, raise (or set `0` to disable) the `MAX_TABLES_PER_SOURCE` env var on the `sources-db-connector` Lambda. |
 | Scan times out on a very large Glue/Athena catalog | Enum sampling issues one Athena query per candidate column; the fan-out has to fit inside the scan Lambda timeout | Sampling queries run in parallel, capped by the `ATHENA_SAMPLING_CONCURRENCY` env var on the `sources-db-connector` Lambda (default `16`). Raise it if the account's Athena concurrent-DML quota allows more in-flight queries — that quota, not this setting, is the real ceiling. A non-numeric value falls back to `16`, and the effective concurrency is floored at `1`. |
 

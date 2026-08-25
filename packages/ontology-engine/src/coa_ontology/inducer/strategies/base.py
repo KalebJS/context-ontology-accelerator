@@ -559,8 +559,8 @@ class InductionStrategy(ABC):
         grounding_ontology_ids: list[str] | None = None,
         grounding_mode: str = "ENHANCED",
         cost_tracker: CostTracker | None = None,
-    ) -> tuple[Graph, set[str], list[ConceptMatch]]:
-        """Run induction and return (proposal_graph, novel_tables, matches).
+    ) -> tuple[Graph, set[str], list[ConceptMatch], list[dict]]:
+        """Run induction and return (proposal_graph, novel_tables, matches, dropped_tables).
 
         ``grounding_ontology_ids`` restricts the embedding search to a subset
         of the namespace's loaded ontologies (e.g. user-selected foundationals
@@ -574,6 +574,10 @@ class InductionStrategy(ABC):
         ``cost_tracker`` is an optional per-job Bedrock usage accumulator; when
         present the strategy threads it into every Bedrock seam (grounding
         rerank, LLM generate) so token/cost metrics are captured for the job.
+
+        ``dropped_tables`` is a list of dicts with ``table_name`` and ``reason``
+        for tables that could not be processed. Empty for strategies that don't
+        drop tables.
         """
         ...
 

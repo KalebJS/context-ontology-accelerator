@@ -262,3 +262,74 @@ class TestDecisionLogLine:
             "filter_type": "CONTENT",
             "latency_ms": 15.68,
         }
+
+
+@pytest.mark.unit
+class TestUnknownDecision:
+    """An unexplained suppression is not a confirmed block.
+
+    ``GuardrailBlocked`` is documented as "1 only when the guardrail intervened with
+    a block". Folding an unclassifiable intervention into it would make both numbers
+    unrecoverable, so ``UNKNOWN`` gets its own counter.
+    """
+
+    def test_explicit_decision_overrides_the_derived_one(self, capsys):
+        from coa_common.guardrail_metrics import DECISION_UNKNOWN, emit_guardrail_decision
+
+        emit_guardrail_decision(
+            component="serve",
+            blocked=False,
+            latency_ms=1.0,
+            transport="emf",
+            decision=DECISION_UNKNOWN,
+        )
+
+        out = capsys.readouterr().out
+        assert "UNKNOWN" in out
+        assert "GuardrailUnknown" in out
+        # Not a confirmed block, so the block counter stays untouched.
+        assert "GuardrailBlocked" not in out
+
+    def test_omitted_decision_still_derives_from_blocked(self, capsys):
+        """Back-compat: every pre-existing call site omits ``decision``."""
+        from coa_common.guardrail_metrics import emit_guardrail_decision
+
+        emit_guardrail_decision(component="serve", blocked=True, latency_ms=1.0, transport="emf")
+
+        out = capsys.readouterr().out
+        assert "BLOCK" in out
+        assert "GuardrailBlocked" in out
+        assert "GuardrailUnknown" not in out
+
+    def test_anonymized_decision_is_not_a_block(self, capsys):
+        from coa_common.guardrail_metrics import DECISION_ANONYMIZED, emit_guardrail_decision
+
+        emit_guardrail_decision(
+            component="serve",
+            blocked=False,
+            latency_ms=1.0,
+            transport="emf",
+            decision=DECISION_ANONYMIZED,
+        )
+
+        out = capsys.readouterr().out
+        assert "ANONYMIZED" in out
+        assert "GuardrailBlocked" not in out
+        assert "GuardrailUnknown" not in out
+
+    def test_put_transport_emits_unknown_metric(self):
+        from coa_common.guardrail_metrics import DECISION_UNKNOWN, emit_guardrail_decision
+
+        cw = MagicMock()
+        emit_guardrail_decision(
+            component="kg-build",
+            blocked=False,
+            latency_ms=2.0,
+            transport="put",
+            decision=DECISION_UNKNOWN,
+            cloudwatch_client=cw,
+        )
+
+        metric_names = {m["MetricName"] for m in cw.put_metric_data.call_args.kwargs["MetricData"]}
+        assert "GuardrailUnknown" in metric_names
+        assert "GuardrailBlocked" not in metric_names

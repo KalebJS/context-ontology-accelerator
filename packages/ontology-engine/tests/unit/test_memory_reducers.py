@@ -209,7 +209,7 @@ def test_induce_clears_vectors_after_match_without_affecting_output():
     ]
     fake = _FakePipeline(matches)
 
-    graph, novel_tables, out_matches = TableToOntologyStrategy().induce(
+    graph, novel_tables, out_matches, dropped = TableToOntologyStrategy().induce(
         tables=[table],
         ontology_uri_prefix="http://ex.org/induced#",
         config={},
@@ -222,6 +222,7 @@ def test_induce_clears_vectors_after_match_without_affecting_output():
 
     # Downstream output is unaffected.
     assert out_matches == matches
+    assert dropped == []  # table_to_ontology never drops tables
     assert "orders" in novel_tables
     orders_cls = next(graph.subjects(RDF.type, OWL.Class))
     assert orders_cls is not None
@@ -237,7 +238,7 @@ def test_induce_clears_vectors_on_all_novel_fallback():
     fake = _RaisingPipeline([])
     table = _make_table()
 
-    _graph, novel_tables, matches = TableToOntologyStrategy().induce(
+    _graph, novel_tables, matches, dropped = TableToOntologyStrategy().induce(
         tables=[table],
         ontology_uri_prefix="http://ex.org/induced#",
         config={},
@@ -248,6 +249,7 @@ def test_induce_clears_vectors_on_all_novel_fallback():
     assert "orders" in novel_tables
     assert fake.seen_concepts is not None
     assert all(c.vector == [] for c in fake.seen_concepts)
+    assert dropped == []
 
 
 # ── B3: table-batch streaming fusion ─────────────────────────────────────
@@ -363,12 +365,16 @@ class _BatchFakePipeline:
 
 
 def _induce(tables, pipeline):
-    return TableToOntologyStrategy().induce(
+    # induce() returns (graph, novel_tables, matches, dropped_tables); these
+    # tests assert only on the first three, so drop dropped_tables here rather
+    # than updating every call site to a 4-tuple.
+    graph, novel, matches, _dropped = TableToOntologyStrategy().induce(
         tables=tables,
         ontology_uri_prefix="http://ex.org/induced#",
         config={},
         pipeline=pipeline,
     )
+    return graph, novel, matches
 
 
 def test_batched_induce_peak_vectors_flat_in_table_count(monkeypatch):
