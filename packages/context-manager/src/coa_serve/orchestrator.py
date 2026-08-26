@@ -572,6 +572,7 @@ class Orchestrator:
             StrategyOption.NL_TO_SQL,
             StrategyOption.ONTOP_FIRST,
             StrategyOption.NL_TO_SQL_FIRST,
+            StrategyOption.AGENTIC,
         }
     )
 

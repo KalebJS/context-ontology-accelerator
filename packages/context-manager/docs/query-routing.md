@@ -94,7 +94,7 @@ Both fail **open** — any uncertainty runs the tier.
 | Option | Source | Description |
 |--------|--------|-------------|
 | `tierOverride` | Request `options` field | Force routing to a specific tier (1, 2, or 3); disables pruning |
-| `strategy` | Request `options` field | Pin a Tier-2 strategy (`best`/`ontop`/`nl_to_sql`/…); disables per-query pruning |
+| `strategy` | Request `options` field | Pin a Tier-2 strategy (`best`/`ontop`/`nl_to_sql`/`ontop_first`/`nl_to_sql_first` default/`agentic`); disables per-query pruning. `agentic` is opt-in only — a Strands tool-use agent, never part of an automatic or fallback chain. See the strategy table in [../README.md](../README.md#query-routing). |
 | `SERVE_TIER2_SKIP_MODE` | Environment variable | `aoss` (default, on for mixed namespaces) or `off` to disable unmapped-classes pruning |
 | `TIER3_STRATEGY` | Environment variable | Tier 3 retrieval strategy: `hand-rolled` (default) or `lexical-baseline` |
 | `LEXICAL_RETRIEVER_STRATEGY` | Environment variable | Deployment-default graphrag retriever strategy, applied only under `TIER3_STRATEGY=lexical-baseline`: `chunk_based_semantic` (default), `traversal`, or `topic-beam-chunk_only`. Invalid values log `invalid_lexical_retriever_strategy` and fall back to `chunk_based_semantic`. |

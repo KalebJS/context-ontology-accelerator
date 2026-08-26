@@ -32,6 +32,7 @@ import {
 } from "../../context";
 import { Paths, fromRoot } from "../../paths";
 import { bundlePython } from "../../utils/python-bundling";
+import { bedrockModelArn } from "../../utils/bedrock-utils";
 import { NetworkStack } from "../foundation/network-stack";
 import { StorageStack } from "../foundation/storage-stack";
 import { TABLE_NAMES } from "@coa/shared";
@@ -39,6 +40,7 @@ import {
   SourceStatus,
   DEFAULT_MAX_FILE_SIZE_MB,
   DEFAULT_BEDROCK_CHAT_MODEL_ID,
+  DEFAULT_BEDROCK_MODEL_ID,
 } from "../../constants";
 import type { IAlarmActionStrategy } from "cdk-monitoring-constructs/lib/common/alarm/action";
 
@@ -46,6 +48,15 @@ export interface SourcesStackProps extends cdk.StackProps {
   readonly network: NetworkStack;
   readonly storage: StorageStack;
   readonly allowedOrigin?: string;
+  /**
+   * Bedrock model IDs, resolved from the SSM deploy config (#94). Omitted →
+   * shared defaults, so a deployment configuring nothing is unchanged. Set for
+   * non-US deploys, where the default `us.` inference profiles are not
+   * invocable.
+   */
+  readonly bedrockChatModelId?: string;
+  readonly bedrockEmbedModelId?: string;
+  readonly bedrockEmbedDimensions?: number;
   /** Optional OE alarm action strategy (undefined in round one). */
   readonly alarmAction?: IAlarmActionStrategy;
 }
@@ -79,6 +90,16 @@ export class SourcesStack extends SCLStack {
 
     const { ssmPrefix } = resolveContext(this.node);
     const allowedOrigin = props.allowedOrigin ?? "*";
+
+    // ── Bedrock model IDs (#94) ────────────────────────────────────────
+    // Resolved once so the doc-ingestion inference-profile ARN, the KG-build
+    // container env, and the scan dashboard's ModelId dimension all derive from
+    // the same value. Config wins; shared defaults otherwise.
+    const chatModelId =
+      props.bedrockChatModelId ?? DEFAULT_BEDROCK_CHAT_MODEL_ID;
+    const embedModelId = props.bedrockEmbedModelId ?? DEFAULT_BEDROCK_MODEL_ID;
+    const embedDimensions = String(props.bedrockEmbedDimensions ?? 1024);
+
     const vpc = props.network.vpc;
     const lambdaSecurityGroup = props.network.lambdaSecurityGroup;
     const ecsSecurityGroup = props.network.ecsSecurityGroup;
@@ -898,6 +919,10 @@ export class SourcesStack extends SCLStack {
         // table_enricher._resolve_guardrail_id() reads this param name to look
         // up the guardrail id. Same param the ontology task reads (#111 AC5).
         GUARDRAIL_SSM_PARAM: `${ssmPrefix}/bedrock/guardrail-id`,
+        // Model for table enrichment. The container previously set NO model id,
+        // so the shared BedrockClient default (a `us.` profile) always won and
+        // enrichment was unreachable from a non-US deploy (#94).
+        BEDROCK_CHAT_MODEL_ID: chatModelId,
       },
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: "sources-db-enrichment",
@@ -1523,6 +1548,14 @@ export class SourcesStack extends SCLStack {
         // (screens nothing). Guardrail metrics would also land in us-east-1.
         AWS_DEFAULT_REGION: cdk.Aws.REGION,
         BEDROCK_REGION: cdk.Aws.REGION,
+        // Doc-KG-build embeds chunks. Without these the container fell back to
+        // the PYTHON constants (coa_common.constants.DEFAULT_EMBED_MODEL_ID /
+        // coa_common.bedrock.DEFAULT_MODEL_ID), so editing only the TypeScript
+        // side left this path on the US models (#94). Embedding model MUST match
+        // what serve queries with, hence the single resolved value.
+        BEDROCK_EMBED_MODEL_ID: embedModelId,
+        BEDROCK_EMBED_DIMENSIONS: embedDimensions,
+        BEDROCK_CHAT_MODEL_ID: chatModelId,
         // Content screening: retrieval guardrail for ingestion-time ApplyGuardrail
         // (SDO-188). Empty string disables screening gracefully.
         RETRIEVAL_GUARDRAIL_ID: ssm.StringParameter.valueForStringParameter(
@@ -2115,7 +2148,17 @@ export class SourcesStack extends SCLStack {
         }),
         environment: {
           STATE_MACHINE_ARN: docIngestionStateMachine.stateMachineArn,
-          BEDROCK_MODEL_ARN: `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0`,
+          // Built from the resolved chat model ID (#94) — an inlined `us.`
+          // profile assembled an ARN that does not exist outside the US, and the
+          // trigger hands this string to the KG-build container via Step
+          // Functions state, so the whole ingestion path inherited it. The helper
+          // picks the right ARN shape: a bare in-region model id is a
+          // foundation-model ARN, not an inference-profile one.
+          BEDROCK_MODEL_ARN: bedrockModelArn(
+            chatModelId,
+            this.region,
+            this.account,
+          ),
         },
         timeout: cdk.Duration.seconds(30),
         memorySize: 128,
@@ -2168,6 +2211,10 @@ export class SourcesStack extends SCLStack {
         SMUS_DOMAIN_ID: domainId,
         PROJECT_ACCESS_ROLE_ARN: projectAccessRoleArn,
         FEDERATION_PROVISIONER_ROLE_ARN: federationProvisionerFn.role!.roleArn,
+        // Feeds `_build_catalog_name`, which derives the per-source Athena
+        // data-catalog name registered at source create. Without it the handler
+        // falls back to its hard-coded `coa-dev-` default in every environment.
+        RESOURCE_PREFIX: this.prefixed(""),
       },
     });
 
@@ -2214,6 +2261,38 @@ export class SourcesStack extends SCLStack {
     // provisioner's Lake Formation admin role, which sources-api assumes (see
     // above). The sources-api role therefore needs no Glue/Lake Formation
     // catalog permissions of its own.
+
+    // Athena data-catalog lifecycle for custom-connector (ATHENA_CONNECTOR)
+    // sources: sources-api registers a `LAMBDA`-type catalog at source-create
+    // time and deletes it at teardown, so create and delete stay co-located on
+    // the control-plane role. `GetDataCatalog` is required because registration
+    // is made idempotent by a get-then-create check — `CreateDataCatalog`
+    // declares no `AlreadyExistsException`, so a duplicate name is a 400
+    // indistinguishable from a malformed request.
+    //
+    // This grant is deployed ahead of the registrar. When that handler lands it
+    // must derive the catalog name with
+    // `glue_connection_provisioner._build_catalog_name`
+    // (`{sanitizedPrefix}ds_{sha256(sourceId)[:16]}`) — the same derivation the
+    // federated-JDBC path uses — which is what lets `fedResourcePrefix` scope
+    // this to catalogs this deployment created rather than every catalog in the
+    // account. The coupling fails closed in both directions: any other
+    // derivation, or a `RESOURCE_PREFIX` that disagrees with `prefixed("")`,
+    // turns every `CreateDataCatalog` into an AccessDenied that reads as a
+    // policy defect rather than a naming one.
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "AthenaDataCatalogLifecycle",
+        actions: [
+          "athena:CreateDataCatalog",
+          "athena:DeleteDataCatalog",
+          "athena:GetDataCatalog",
+        ],
+        resources: [
+          `arn:aws:athena:${this.region}:${this.account}:datacatalog/${fedResourcePrefix}*`,
+        ],
+      }),
+    );
 
     // Explicit TransactWriteItems grant (grantReadWriteData covers it but be explicit for audit)
     sourcesApiFn.addToRolePolicy(
@@ -2309,13 +2388,12 @@ export class SourcesStack extends SCLStack {
         label,
       });
 
-    // ponytail: the model the enrichment task is ASSUMED to call. The container
-    // sets no model-id env var (see addContainer above), so this tracks the
-    // Python-side default rather than being stack-controlled — if that default
-    // moves, these widgets go dark until the shared constant is updated.
-    // DEFAULT_BEDROCK_CHAT_MODEL_ID, not DEFAULT_BEDROCK_MODEL_ID: the latter
-    // is the embedding model, which enrichment never calls.
-    const enrichmentModelId = DEFAULT_BEDROCK_CHAT_MODEL_ID;
+    // The model the enrichment task calls. Derived from the SAME resolved chat
+    // model ID the stack configures elsewhere (#94), so a configured model and
+    // these widgets cannot drift — previously this tracked the Python-side
+    // default independently and went dark on any non-default deploy.
+    // Chat, not embed: enrichment never calls the embedding model.
+    const enrichmentModelId = chatModelId;
 
     const scanDashboard = new cloudwatch.Dashboard(this, "ScanDashboard", {
       dashboardName: this.prefixed("sources-structured-scan"),

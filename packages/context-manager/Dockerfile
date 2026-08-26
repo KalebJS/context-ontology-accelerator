@@ -2,7 +2,7 @@
 #   docker build -f packages/context-manager/Dockerfile .
 # Pin to digest to prevent supply-chain attacks via tag mutation.
 # python:3.12-slim as of 2026-05-21 (linux/arm64)
-FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim@sha256:0568e6111802e74c03e8dda76565cdf4b88881d77de0d9b769846e9dfcb8d80a
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim@sha256:dcac2e6d9d25d7803f92b44bb556cedfdc5695ef94fd76f5ab7a5e4b00effb94
 
 WORKDIR /app
 RUN useradd --no-create-home --shell /bin/false appuser

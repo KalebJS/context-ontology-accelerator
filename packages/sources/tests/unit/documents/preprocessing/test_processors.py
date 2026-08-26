@@ -3,7 +3,9 @@
 
 """Tests for the preprocessing Lambda processors module."""
 
+import io
 import logging
+import pathlib
 import sys
 import time
 from types import ModuleType
@@ -12,7 +14,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 for _mod_name in (
-    "fitz",
     "unstructured",
     "unstructured.partition",
 ):
@@ -118,62 +119,97 @@ class TestProcessDocx:
 # ---------------------------------------------------------------------------
 
 
-def _make_fitz_doc(pages_text: list[str]) -> MagicMock:
-    """Build a mock fitz.Document with pages returning given text."""
-    doc = MagicMock()
-    doc.page_count = len(pages_text)
-    pages = []
-    for text in pages_text:
-        page = MagicMock()
-        page.get_text.return_value = text
-        pages.append(page)
-    doc.__iter__ = lambda self: iter(pages)
-    doc.__getitem__ = lambda self, i: pages[i]
-    doc.close = MagicMock()
-    return doc
+def _make_pdf(pages_text: list[str]) -> bytes:
+    """Build a minimal valid PDF (US-Letter, Helvetica 12pt, one text line per page).
+
+    Real bytes, parsed by the real PDF library — no mocks. pdfium extracts a
+    single-line ``Tj`` string verbatim, so char-count-sensitive tests (the
+    scanned-PDF threshold) are exact.
+    """
+    objects: list[bytes] = []
+    n_pages = len(pages_text)
+    page_obj_nums = [4 + 2 * i for i in range(n_pages)]
+    kids = " ".join(f"{n} 0 R" for n in page_obj_nums)
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")  # obj 1
+    objects.append(f"<< /Type /Pages /Kids [{kids}] /Count {n_pages} >>".encode())  # obj 2
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")  # obj 3
+    for i, text in enumerate(pages_text):
+        content_num = page_obj_nums[i] + 1
+        objects.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                f"/Resources << /Font << /F1 3 0 R >> >> /Contents {content_num} 0 R >>"
+            ).encode()
+        )
+        esc = text.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+        stream = f"BT /F1 12 Tf 72 720 Td ({esc}) Tj ET".encode()
+        objects.append(b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream")
+
+    out = io.BytesIO()
+    out.write(b"%PDF-1.4\n")
+    offsets = []
+    for num, body in enumerate(objects, start=1):
+        offsets.append(out.tell())
+        out.write(f"{num} 0 obj\n".encode() + body + b"\nendobj\n")
+    xref_pos = out.tell()
+    out.write(f"xref\n0 {len(objects) + 1}\n".encode())
+    out.write(b"0000000000 65535 f \n")
+    for off in offsets:
+        out.write(f"{off:010d} 00000 n \n".encode())
+    out.write(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF\n".encode())
+    return out.getvalue()
 
 
 @pytest.mark.unit
 class TestIsScannedPdf:
-    @patch("fitz.open")
-    def test_text_heavy_pdf_not_scanned(self, mock_fitz_open):
+    def test_text_heavy_pdf_not_scanned(self):
         from coa_sources.documents.preprocessing.processors import is_scanned_pdf
 
-        mock_fitz_open.return_value = _make_fitz_doc(["a" * 500, "b" * 600])
-        assert is_scanned_pdf(b"fake-pdf") is False
+        assert is_scanned_pdf(_make_pdf(["a" * 500, "b" * 600])) is False
 
-    @patch("fitz.open")
-    def test_image_only_pdf_is_scanned(self, mock_fitz_open):
+    def test_image_only_pdf_is_scanned(self):
         from coa_sources.documents.preprocessing.processors import is_scanned_pdf
 
-        mock_fitz_open.return_value = _make_fitz_doc(["", ""])
-        assert is_scanned_pdf(b"fake-pdf") is True
+        assert is_scanned_pdf(_make_pdf(["", ""])) is True
 
-    @patch("fitz.open")
-    def test_below_threshold_is_scanned(self, mock_fitz_open):
+    def test_below_threshold_is_scanned(self):
         from coa_sources.documents.preprocessing.processors import is_scanned_pdf
 
-        chars = "x" * (_SCANNED_PDF_THRESHOLD - 1)
-        mock_fitz_open.return_value = _make_fitz_doc([chars])
-        assert is_scanned_pdf(b"fake-pdf") is True
+        assert is_scanned_pdf(_make_pdf(["x" * (_SCANNED_PDF_THRESHOLD - 1)])) is True
 
-    @patch("fitz.open")
-    def test_at_threshold_not_scanned(self, mock_fitz_open):
+    def test_at_threshold_not_scanned(self):
         from coa_sources.documents.preprocessing.processors import is_scanned_pdf
 
-        chars = "x" * _SCANNED_PDF_THRESHOLD
-        mock_fitz_open.return_value = _make_fitz_doc([chars])
-        assert is_scanned_pdf(b"fake-pdf") is False
+        assert is_scanned_pdf(_make_pdf(["x" * _SCANNED_PDF_THRESHOLD])) is False
 
-    @patch("fitz.open")
-    def test_empty_pdf_zero_pages(self, mock_fitz_open):
+    def test_corrupt_pdf_treated_as_scanned(self):
+        """Unopenable bytes must not raise — report scanned and log the reason."""
         from coa_sources.documents.preprocessing.processors import is_scanned_pdf
 
-        doc = MagicMock()
-        doc.page_count = 0
-        doc.close = MagicMock()
-        mock_fitz_open.return_value = doc
-        assert is_scanned_pdf(b"fake-pdf") is True
+        assert is_scanned_pdf(b"%PDF-1.4\nnot actually a pdf") is True
+
+    def test_truncated_pdf_treated_as_scanned(self):
+        """The repo's truncated.pdf edge-case fixture must not raise."""
+        from coa_sources.documents.preprocessing.processors import is_scanned_pdf
+
+        fixture = (
+            pathlib.Path(__file__).parents[6] / "tests/cdk/scripts/preprocessing-fixtures/edge-cases/truncated.pdf"
+        )
+        if not fixture.is_file():  # fixture lives at repo root; skip if packaged alone
+            pytest.skip(f"fixture not present: {fixture}")
+        assert is_scanned_pdf(fixture.read_bytes()) is True
+
+    def test_empty_bytes_treated_as_scanned(self):
+        from coa_sources.documents.preprocessing.processors import is_scanned_pdf
+
+        assert is_scanned_pdf(b"") is True
+
+    def test_corrupt_pdf_logs_reason(self, caplog):
+        from coa_sources.documents.preprocessing.processors import is_scanned_pdf
+
+        with caplog.at_level(logging.WARNING):
+            is_scanned_pdf(b"garbage")
+        assert any("treating as scanned" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -183,19 +219,7 @@ class TestIsScannedPdf:
 
 @pytest.mark.unit
 class TestProcessPdfTextract:
-    @patch("fitz.open")
-    def test_single_page_calls_textract(self, mock_fitz_open):
-        page = MagicMock()
-        pix = MagicMock()
-        pix.tobytes.return_value = b"fake-png"
-        page.get_pixmap.return_value = pix
-
-        doc = MagicMock()
-        doc.page_count = 1
-        doc.__getitem__ = lambda _, i: page
-        doc.close = MagicMock()
-        mock_fitz_open.return_value = doc
-
+    def test_single_page_calls_textract_with_real_png(self):
         textract = MagicMock()
         textract.detect_document_text.return_value = {
             "Blocks": [
@@ -204,27 +228,37 @@ class TestProcessPdfTextract:
             ]
         }
 
-        result = process_pdf_textract(b"pdf-bytes", "scan.pdf", textract)
+        result = process_pdf_textract(_make_pdf(["hello"]), "scan.pdf", textract)
         assert result == "Hello from Textract"
         textract.detect_document_text.assert_called_once()
-        page.get_pixmap.assert_called_once_with(dpi=300)
 
-    @patch("fitz.open")
-    def test_multi_page_joins_with_double_newline(self, mock_fitz_open):
-        pages = []
-        for i in range(3):
-            page = MagicMock()
-            pix = MagicMock()
-            # Distinct bytes per page so the Textract stub can tell them apart.
-            pix.tobytes.return_value = f"png-{i}".encode()
-            page.get_pixmap.return_value = pix
-            pages.append(page)
+        # The bytes handed to Textract are a real PNG at 300 DPI:
+        # US-Letter 612x792 pt -> 2550x3300 px (pdfium may round up by 1px).
+        png_bytes = textract.detect_document_text.call_args.kwargs["Document"]["Bytes"]
+        assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+        from PIL import Image
 
-        doc = MagicMock()
-        doc.page_count = 3
-        doc.__getitem__ = lambda _, i: pages[i]
-        doc.close = MagicMock()
-        mock_fitz_open.return_value = doc
+        width, height = Image.open(io.BytesIO(png_bytes)).size
+        assert abs(width - 2550) <= 1 and abs(height - 3300) <= 1
+
+    def test_multi_page_joins_with_double_newline(self):
+        pdf_bytes = _make_pdf(["alpha", "beta", "gamma"])
+
+        # Pre-render each page with the same library/scale to build a
+        # bytes -> page-index map (rendering is deterministic), so the Textract
+        # stub can identify pages by content, not call order.
+        import pypdfium2 as pdfium
+
+        doc = pdfium.PdfDocument(pdf_bytes)
+        expected_pngs: dict[bytes, int] = {}
+        try:
+            for i in range(len(doc)):
+                buf = io.BytesIO()
+                doc[i].render(scale=300 / 72).to_pil().save(buf, format="PNG")
+                expected_pngs[buf.getvalue()] = i
+        finally:
+            doc.close()
+        assert len(expected_pngs) == 3, "pages must render to distinct PNGs"
 
         # process_pdf_textract OCRs pages concurrently, so the stub must key off
         # the page bytes, not call order: a side_effect *list* is consumed in the
@@ -234,35 +268,64 @@ class TestProcessPdfTextract:
         # assertion deterministically catches a reassembly that appends in
         # completion order instead of indexing by page.
         def _detect(Document):  # noqa: N803 - matches the boto3 kwarg name
-            idx = int(Document["Bytes"].decode().removeprefix("png-"))
+            idx = expected_pngs[Document["Bytes"]]
             time.sleep(0.05 * (3 - idx))
             return {"Blocks": [{"BlockType": "LINE", "Text": f"Page {idx + 1}"}]}
 
         textract = MagicMock()
         textract.detect_document_text.side_effect = _detect
 
-        result = process_pdf_textract(b"pdf", "multi.pdf", textract)
+        result = process_pdf_textract(pdf_bytes, "multi.pdf", textract)
         assert result == "Page 1\n\nPage 2\n\nPage 3"
         assert textract.detect_document_text.call_count == 3
 
-    @patch("fitz.open")
-    def test_empty_textract_response(self, mock_fitz_open):
-        page = MagicMock()
-        pix = MagicMock()
-        pix.tobytes.return_value = b"png"
-        page.get_pixmap.return_value = pix
-
-        doc = MagicMock()
-        doc.page_count = 1
-        doc.__getitem__ = lambda _, i: page
-        doc.close = MagicMock()
-        mock_fitz_open.return_value = doc
-
+    def test_empty_textract_response(self):
         textract = MagicMock()
         textract.detect_document_text.return_value = {"Blocks": []}
 
-        result = process_pdf_textract(b"pdf", "empty.pdf", textract)
+        result = process_pdf_textract(_make_pdf(["scan"]), "empty.pdf", textract)
         assert result == ""
+
+    def test_corrupt_pdf_returns_empty_without_calling_textract(self):
+        """An unopenable PDF must not raise a PDFium error nor bill Textract."""
+        textract = MagicMock()
+        assert process_pdf_textract(b"%PDF-1.4 garbage", "bad.pdf", textract) == ""
+        textract.detect_document_text.assert_not_called()
+
+    def test_page_count_limit_enforced_before_rendering(self):
+        """Over-long PDFs are rejected with a clear message, before any render."""
+        from coa_sources.documents.preprocessing import processors
+
+        textract = MagicMock()
+        with (
+            patch.object(processors, "_MAX_PDF_PAGES", 2),
+            pytest.raises(ValueError, match="exceeding the 2-page limit"),
+        ):
+            processors.process_pdf_textract(_make_pdf(["a", "b", "c"]), "long.pdf", textract)
+        textract.detect_document_text.assert_not_called()
+
+    def test_oversized_page_rejected_before_rendering(self):
+        """A page too large to rasterize safely is rejected, not rendered."""
+        from coa_sources.documents.preprocessing import processors
+
+        textract = MagicMock()
+        # US-Letter at 300 DPI is ~8.4 MP; a 1 MP cap rejects it without allocating.
+        with (
+            patch.object(processors, "_MAX_RENDER_MEGAPIXELS", 1),
+            pytest.raises(ValueError, match="exceeding the 1 MP per-page limit"),
+        ):
+            processors.process_pdf_textract(_make_pdf(["big"]), "big.pdf", textract)
+        textract.detect_document_text.assert_not_called()
+
+    def test_within_page_limit_still_processes(self):
+        """The cap must not reject documents at or under the limit."""
+        from coa_sources.documents.preprocessing import processors
+
+        textract = MagicMock()
+        textract.detect_document_text.return_value = {"Blocks": [{"BlockType": "LINE", "Text": "ok"}]}
+        with patch.object(processors, "_MAX_PDF_PAGES", 2):
+            result = processors.process_pdf_textract(_make_pdf(["a", "b"]), "two.pdf", textract)
+        assert result == "ok\n\nok"
 
 
 # ---------------------------------------------------------------------------
@@ -410,13 +473,15 @@ class TestElementsToMarkdown:
 
 @pytest.mark.unit
 class TestGetPageCount:
-    @patch("fitz.open")
-    def test_pdf_returns_count(self, mock_fitz_open):
-        doc = MagicMock()
-        doc.page_count = 5
-        doc.close = MagicMock()
-        mock_fitz_open.return_value = doc
-        assert get_page_count(b"pdf-bytes", ".pdf") == 5
+    def test_pdf_returns_count(self):
+        assert get_page_count(_make_pdf(["p1", "p2", "p3", "p4", "p5"]), ".pdf") == 5
+
+    def test_malformed_pdf_returns_zero(self):
+        """A malformed PDF reports 0 pages rather than raising a PDFium error."""
+        assert get_page_count(b"%PDF-1.4 not a pdf", ".pdf") == 0
+
+    def test_empty_bytes_returns_zero(self):
+        assert get_page_count(b"", ".pdf") == 0
 
     def test_txt_returns_zero(self):
         assert get_page_count(b"text", ".txt") == 0

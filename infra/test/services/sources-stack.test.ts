@@ -154,6 +154,56 @@ describe("SourcesStack", () => {
         },
       });
     });
+
+    it("Lambda has RESOURCE_PREFIX so derived Athena catalog names match the deployment", () => {
+      // `_build_catalog_name` falls back to a hard-coded `coa-dev-` when this is
+      // unset, which would collapse every environment onto one catalog prefix.
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-api$"),
+        Environment: {
+          Variables: Match.objectLike({
+            RESOURCE_PREFIX: "coa-dev-",
+          }),
+        },
+      });
+    });
+
+    it("grants the sources-api role prefix-scoped Athena data-catalog create/delete/get", () => {
+      // Custom-connector sources register a LAMBDA-type Athena data catalog at
+      // source-create and delete it at teardown. GetDataCatalog backs the
+      // get-then-create idempotency check — CreateDataCatalog declares no
+      // AlreadyExistsException, so a duplicate name is an opaque 400.
+      const apiFn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((fn: any) =>
+        String(fn.Properties?.FunctionName ?? "").endsWith("sources-api"),
+      );
+      expect(apiFn).toBeDefined();
+      const apiRoleId = (apiFn as any).Properties.Role["Fn::GetAtt"][0];
+
+      const statements = Object.values(
+        template.findResources("AWS::IAM::Policy"),
+      )
+        .filter((p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === apiRoleId),
+        )
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+
+      expect(
+        statements.find((s: any) => s.Sid === "AthenaDataCatalogLifecycle"),
+      ).toEqual({
+        Sid: "AthenaDataCatalogLifecycle",
+        Effect: "Allow",
+        Action: [
+          "athena:CreateDataCatalog",
+          "athena:DeleteDataCatalog",
+          "athena:GetDataCatalog",
+        ],
+        // Prefix-scoped, matching `_build_catalog_name`'s `{prefix}ds_{hash}`.
+        Resource:
+          "arn:aws:athena:us-east-1:123456789012:datacatalog/coadevds_*",
+      });
+    });
   });
 
   describe("Federation Provisioner (Option B isolation)", () => {
@@ -1010,6 +1060,103 @@ describe("SourcesStack", () => {
         }
       });
     }
+  });
+
+  describe("Bedrock model IDs from deploy config (#94)", () => {
+    const renderWithModels = (models: {
+      bedrockChatModelId?: string;
+      bedrockEmbedModelId?: string;
+      bedrockEmbedDimensions?: number;
+    }) => {
+      const app = new cdk.App({ context: TEST_CONTEXT });
+      const network = new NetworkStack(app, "MdlNetwork", { env: TEST_ENV });
+      const storage = new StorageStack(app, "MdlStorage", {
+        network,
+        env: TEST_ENV,
+      });
+      return Template.fromStack(
+        new SourcesStack(app, "MdlSources", {
+          network,
+          storage,
+          allowedOrigin: "https://test.example.com",
+          env: TEST_ENV,
+          ...models,
+        }),
+      );
+    };
+
+    const envOf = (t: Template, fnNamePattern: RegExp) => {
+      const fn = Object.values(t.findResources("AWS::Lambda::Function")).find(
+        (f) => fnNamePattern.test(String(f.Properties?.FunctionName ?? "")),
+      );
+      return (fn?.Properties?.Environment?.Variables ?? {}) as Record<
+        string,
+        string
+      >;
+    };
+
+    it("builds the doc-ingestion inference-profile ARN from the configured chat model", () => {
+      // An inlined `us.` profile assembled an ARN that does not exist outside
+      // the US, and the trigger passes this string on to the KG-build container.
+      const t = renderWithModels({
+        bedrockChatModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+      });
+      const env = envOf(t, /sources-doc-trigger|documents-trigger|doc.*trigger/i);
+      expect(JSON.stringify(env.BEDROCK_MODEL_ARN)).toContain(
+        "inference-profile/jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+      );
+    });
+
+    it("sets the embedding model on the KG-build container so it stops using the Python default", () => {
+      const t = renderWithModels({
+        bedrockEmbedModelId: "cohere.embed-v4:0",
+        bedrockEmbedDimensions: 512,
+      });
+      const taskDefs = Object.values(
+        t.findResources("AWS::ECS::TaskDefinition"),
+      );
+      const envs = taskDefs.flatMap((d) =>
+        (d.Properties?.ContainerDefinitions ?? []).map(
+          (c: { Environment?: Array<{ Name: string; Value: unknown }> }) =>
+            c.Environment ?? [],
+        ),
+      );
+      const kgEnv = envs.find((e) =>
+        e.some((v: { Name: string }) => v.Name === "BEDROCK_EMBED_MODEL_ID"),
+      );
+      expect(kgEnv).toBeDefined();
+      const byName = Object.fromEntries(
+        kgEnv!.map((v: { Name: string; Value: unknown }) => [v.Name, v.Value]),
+      );
+      expect(byName.BEDROCK_EMBED_MODEL_ID).toBe("cohere.embed-v4:0");
+      expect(byName.BEDROCK_EMBED_DIMENSIONS).toBe("512");
+    });
+
+    it("uses a foundation-model ARN (empty account) for a bare in-region model id", () => {
+      // Bare ids are explicitly supported (some models publish geo profiles for
+      // only a subset of regions). A foundation model is AWS-owned, so its ARN
+      // has NO account field — building an inference-profile ARN for it yields a
+      // resource that does not exist and fails at extraction time.
+      const t = renderWithModels({
+        bedrockChatModelId: "anthropic.claude-haiku-4-5-20251001-v1:0",
+      });
+      const env = envOf(t, /sources-doc-trigger|documents-trigger|doc.*trigger/i);
+      const arn = JSON.stringify(env.BEDROCK_MODEL_ARN);
+      expect(arn).toContain(
+        "foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+      );
+      expect(arn).not.toContain("inference-profile");
+      // Empty account segment: ...:bedrock:<region>::foundation-model/...
+      expect(arn).toContain("::foundation-model/");
+    });
+
+    it("defaults to the shared us. profile when no config is supplied", () => {
+      const t = renderWithModels({});
+      const env = envOf(t, /sources-doc-trigger|documents-trigger|doc.*trigger/i);
+      expect(JSON.stringify(env.BEDROCK_MODEL_ARN)).toContain(
+        "inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      );
+    });
   });
 
   describe("Preprocessing Lambda reserved concurrency (#48)", () => {

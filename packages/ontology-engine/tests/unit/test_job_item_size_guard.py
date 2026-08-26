@@ -83,7 +83,7 @@ def captured_writes():
         def induce(self, **kwargs):
             fake_graph = MagicMock()
             fake_graph.serialize.return_value = "@prefix : <#> ."
-            return fake_graph, set(_NOVEL_TABLES), matches
+            return fake_graph, set(_NOVEL_TABLES), matches, []
 
         def build_r2rml(self, **kwargs):
             fake_graph = MagicMock()

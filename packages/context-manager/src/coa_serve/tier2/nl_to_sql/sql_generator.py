@@ -196,6 +196,16 @@ class SQLGenerator:
         self._guardrail_id = guardrail_id
 
     @property
+    def llm(self) -> LLMClient:
+        """Return the LLM client backing generation and query embedding.
+
+        Exposed so a consumer that needs the SAME embedder this generator
+        retrieves with — e.g. the Tier-2 table tools — shares one client rather
+        than reaching into private state or being wired a second one.
+        """
+        return self._llm
+
+    @property
     def fk_adjacency(self) -> dict[str, set[str]]:
         """Return the bidirectional FK adjacency graph used for table expansion."""
         return self._fk_adjacency
@@ -368,6 +378,38 @@ class SQLGenerator:
             ddl_context=ddl_context,
         )
 
+    async def generate_from_context(
+        self,
+        question: str,
+        ddl_context: str,
+        *,
+        evidence: str = "",
+        model_id: str | None = None,
+        dialect: str | None = None,
+        feedback: str = "",
+    ) -> tuple[str, float]:
+        """Generate SQL from an ALREADY-ASSEMBLED schema context.
+
+        The public seam onto the SQL writer for callers that do their own table
+        selection — the Tier-2 tool layer, whose consumer chose the tables
+        explicitly — so retrieval is skipped but generation stays identical to
+        :meth:`generate`'s final step.
+
+        Args:
+            question: Natural language question.
+            ddl_context: Schema context for the chosen tables.
+            evidence: Optional domain hints.
+            model_id: Optional per-call LLM model override.
+            dialect: Optional per-call SQL dialect override.
+            feedback: Optional prior-attempt SQL + observation to revise from.
+
+        Returns:
+            Tuple of (sql_string, confidence_score).
+        """
+        return await self._generate_sql(
+            question, ddl_context, evidence, model_id=model_id, dialect=dialect, feedback=feedback
+        )
+
     async def correct(
         self,
         question: str,
@@ -447,6 +489,7 @@ class SQLGenerator:
         evidence: str,
         model_id: str | None = None,
         dialect: str | None = None,
+        feedback: str = "",
     ) -> tuple[str, float]:
         """Call LLM to generate SQL from question and DDL context.
 
@@ -456,6 +499,10 @@ class SQLGenerator:
             evidence: Optional domain hints.
             model_id: Optional per-call LLM model override.
             dialect: Optional per-call SQL dialect override.
+            feedback: Optional prior-attempt SQL + observation. When the agentic
+                strategy re-generates after a failed/empty run, this carries the
+                previous query and what executing it returned, so the writer
+                REVISES it instead of re-emitting byte-identical SQL at temp 0.
 
         Returns:
             Tuple of (sql_string, confidence_score).
@@ -466,6 +513,17 @@ class SQLGenerator:
                 f"<user_context>{evidence[:500]}</user_context>\n"
             )
             if evidence
+            else ""
+        )
+        feedback_block = (
+            (
+                f"\n## Prior attempt in this session (revise it)\n"
+                f"{feedback}\n"
+                "The prior query above did not correctly answer the question. "
+                "Diagnose why from the observation and return a CORRECTED query "
+                "— do not repeat the prior query unchanged.\n"
+            )
+            if feedback
             else ""
         )
         # Prompt-injection scoping via Bedrock guardContent (tier3 pattern):
@@ -480,7 +538,8 @@ class SQLGenerator:
         # guardrail can only score the guardContent copy.
         prompt = (
             f"## Database Schema (relevant tables)\n```sql\n{ddl_context}\n```\n"
-            f"{evidence_block}\n"
+            f"{evidence_block}"
+            f"{feedback_block}\n"
             "Return the SQL in a ```sql code block.\n"
             "After the query, rate your confidence (0.0-1.0) that this query "
             "correctly answers the question. Format: Confidence: X.X"
