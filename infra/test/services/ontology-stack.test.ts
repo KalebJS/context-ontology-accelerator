@@ -19,6 +19,111 @@ const TEST_CONTEXT = {
 
 const PREFIX = `${DEFAULT_RESOURCE_PREFIX}-${DEFAULT_ENV}`;
 
+/** Render an OntologyStack with the given model-ID props (#94). */
+function renderOntology(
+  props: {
+    bedrockEmbedModelId?: string;
+    bedrockEmbedDimensions?: number;
+    bedrockInductionLlmModelId?: string;
+    bedrockChatModelId?: string;
+  },
+  id: string,
+): Template {
+  const app = new cdk.App({ context: TEST_CONTEXT });
+  const network = new NetworkStack(app, `${id}Network`);
+  return Template.fromStack(
+    new OntologyStack(app, id, {
+      network,
+      serviceNamespace: network.serviceNamespace,
+      neptuneClusterArn:
+        "arn:aws:neptune-db:us-east-1:123456789012:cluster-abc123/*",
+      neptuneClusterEndpoint:
+        "test-neptune.cluster-abc.us-east-1.neptune.amazonaws.com",
+      ontologyArtifactsBucket: cdk.aws_s3.Bucket.fromBucketName(
+        network,
+        `${id}ArtifactsBucket`,
+        "coa-dev-ontology-artifacts-123456789012",
+      ),
+      smusDomainId: "dzd-test123",
+      allowedOrigin: "https://test.example.com",
+      ...props,
+    }),
+  );
+}
+
+/** Environment array of the ontology-engine container in a rendered template. */
+function containerEnv(t: Template): Array<{ Name: string; Value: unknown }> {
+  const taskDefs = t.findResources("AWS::ECS::TaskDefinition");
+  const def = Object.values(taskDefs).find((d) =>
+    d.Properties?.ContainerDefinitions?.some(
+      (c: { Environment?: unknown }) => c.Environment,
+    ),
+  );
+  const container = def!.Properties.ContainerDefinitions.find(
+    (c: { Environment?: unknown }) => c.Environment,
+  );
+  return container.Environment;
+}
+
+function envValue(t: Template, name: string): unknown {
+  return containerEnv(t).find((e) => e.Name === name)?.Value;
+}
+
+describe("OntologyStack model IDs from deploy config (#94)", () => {
+  test("configured model IDs reach the container environment", () => {
+    const t = renderOntology(
+      {
+        bedrockEmbedModelId: "cohere.embed-v4:0",
+        bedrockEmbedDimensions: 512,
+        bedrockInductionLlmModelId: "jp.anthropic.claude-sonnet-4-6",
+        bedrockChatModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+      },
+      "CfgOntology",
+    );
+    expect(envValue(t, "BEDROCK_EMBED_MODEL_ID")).toBe("cohere.embed-v4:0");
+    expect(envValue(t, "BEDROCK_EMBED_DIMENSIONS")).toBe("512");
+    // Dimension is also the OpenSearch index dimension — both must follow config.
+    expect(envValue(t, "OSS_DIMENSIONS")).toBe("512");
+    expect(envValue(t, "LLM_MODEL_ID")).toBe("jp.anthropic.claude-sonnet-4-6");
+    // Description generation has its own variable; it must not stay on a us. profile.
+    expect(envValue(t, "DESCRIPTION_LLM_MODEL_ID")).toBe(
+      "jp.anthropic.claude-sonnet-4-6",
+    );
+    expect(envValue(t, "BEDROCK_CHAT_MODEL_ID")).toBe(
+      "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+  });
+
+  test("omitting config keeps the previous defaults (backward compatibility)", () => {
+    const t = renderOntology({}, "DefaultOntology");
+    expect(envValue(t, "BEDROCK_EMBED_MODEL_ID")).toBe("us.cohere.embed-v4:0");
+    expect(envValue(t, "BEDROCK_EMBED_DIMENSIONS")).toBe("1024");
+    expect(envValue(t, "OSS_DIMENSIONS")).toBe("1024");
+    expect(envValue(t, "LLM_MODEL_ID")).toBe("us.anthropic.claude-sonnet-5");
+  });
+
+  test("dashboard ModelId dimensions follow the configured models", () => {
+    // The dashboard used to hold independent literal copies, so a configured
+    // model left the Bedrock widgets querying a dimension with no data.
+    const t = renderOntology(
+      {
+        bedrockEmbedModelId: "cohere.embed-v4:0",
+        bedrockInductionLlmModelId: "jp.anthropic.claude-sonnet-4-6",
+        bedrockChatModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+      },
+      "DashOntology",
+    );
+    const dashboards = t.findResources("AWS::CloudWatch::Dashboard");
+    const body = JSON.stringify(Object.values(dashboards));
+    expect(body).toContain("jp.anthropic.claude-sonnet-4-6");
+    expect(body).toContain("jp.anthropic.claude-haiku-4-5-20251001-v1:0");
+    expect(body).toContain("cohere.embed-v4:0");
+    // No stale us. literals left behind in the widgets.
+    expect(body).not.toContain("us.anthropic.claude-sonnet-4-6");
+    expect(body).not.toContain("us.cohere.embed-v4:0");
+  });
+});
+
 describe("OntologyStack", () => {
   let template: Template;
 

@@ -2,7 +2,7 @@
 #   docker build -f packages/sources/database/enrichment/Dockerfile .
 # Pin to digest to prevent supply-chain attacks via tag mutation.
 # python:3.12-slim built 2026-05-19 — includes glibc deb13u3, systemd/sed/libcap2 deb13u1 CVE fixes.
-FROM --platform=linux/amd64 public.ecr.aws/docker/library/python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+FROM --platform=linux/amd64 public.ecr.aws/docker/library/python:3.12-slim@sha256:7a8b475003c4fe15a2cd4e55e5cfc2f3560bdc9333d624f24cdd6d4340fd7a17
 
 WORKDIR /app
 

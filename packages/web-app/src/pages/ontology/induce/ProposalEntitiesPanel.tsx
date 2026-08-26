@@ -32,21 +32,26 @@ import {
 // ─── Helpers ────────────────────────────────────────────────────────
 
 /**
- * All ``skos:exactMatch``/``skos:closeMatch`` object tokens on a class body,
- * with the match strength. rdflib serializes each match as
- * ``skos:exactMatch <iri>`` or ``skos:closeMatch prefix:Local`` (comma lists
+ * All ``skos:exactMatch``/``skos:closeMatch``/``skos:relatedMatch`` object
+ * tokens on a class body, with the match strength. rdflib serializes each match
+ * as ``skos:exactMatch <iri>`` or ``skos:closeMatch prefix:Local`` (comma lists
  * possible), so scan globally rather than grabbing the first.
  */
 function extractSkosMatches(
   body: string,
-): { token: string; strength: "exact" | "close" }[] {
-  const out: { token: string; strength: "exact" | "close" }[] = [];
-  const re = /skos:(exactMatch|closeMatch)\s+(<[^>]+>|[^\s;,]+)/g;
+): { token: string; strength: "exact" | "close" | "related" }[] {
+  const out: { token: string; strength: "exact" | "close" | "related" }[] = [];
+  const re = /skos:(exactMatch|closeMatch|relatedMatch)\s+(<[^>]+>|[^\s;,]+)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(body)) !== null) {
     out.push({
       token: m[2],
-      strength: m[1] === "exactMatch" ? "exact" : "close",
+      strength:
+        m[1] === "exactMatch"
+          ? "exact"
+          : m[1] === "closeMatch"
+            ? "close"
+            : "related",
     });
   }
   return out;
@@ -104,8 +109,8 @@ interface ClassGroup {
   label: string;
   description: string | null;
   /** Foundational grounding target (local name), or null when novel. Derived
-   *  from skos:exactMatch/closeMatch whose target is NOT a sibling proposal
-   *  class (coa:groundedTo is retired — see Item 8 re-key). */
+   *  from skos:exactMatch/closeMatch/relatedMatch whose target is NOT a sibling
+   *  proposal class (coa:groundedTo is retired — see Item 8 re-key). */
   groundedTo: string | null;
   matchType: string | null;
   /** owl:hasKey columns (bare names). */
@@ -190,11 +195,12 @@ export function groupByClass(entities: TurtleEntity[]): GroupResult {
     );
     for (const p of [...rels, ...attrs]) claimed.add(p.fullSubject);
 
-    // Foundational grounding target: a skos:exactMatch/closeMatch whose
-    // target is NOT another proposal class. (coa:groundedTo is retired —
+    // Foundational grounding target: a skos:exactMatch/closeMatch/relatedMatch
+    // whose target is NOT another proposal class. (coa:groundedTo is retired —
     // Item 8.) A skos match to a SIBLING ind: class is a dedup/close-match
     // relationship surfaced separately via ``matches``, not grounding, so we
-    // exclude those to avoid false "Grounded" origins. Exact wins over close.
+    // exclude those to avoid false "Grounded" origins. Exact wins over close,
+    // close wins over related.
     const skosMatches = extractSkosMatches(cls.body);
     const foundational =
       skosMatches.find(
@@ -205,19 +211,22 @@ export function groupByClass(entities: TurtleEntity[]): GroupResult {
         (sm) =>
           sm.strength === "close" && !classByLocal.has(matchLocal(sm.token)),
       ) ??
+      skosMatches.find(
+        (sm) =>
+          sm.strength === "related" && !classByLocal.has(matchLocal(sm.token)),
+      ) ??
       null;
 
-    // Match strength for the badge: the foundational match's strength when we
-    // resolved one, otherwise fall back to whichever skos predicate the body
-    // carries (a sibling-only match still labels the origin exact/close).
-    let matchType: "exact" | "close" | null = null;
-    if (foundational) {
-      matchType = foundational.strength;
-    } else if (cls.body.includes("skos:exactMatch")) {
-      matchType = "exact";
-    } else if (cls.body.includes("skos:closeMatch")) {
-      matchType = "close";
-    }
+    // Match strength for the badge: ONLY the foundational match's strength, so
+    // matchType and groundedTo are set together and can never disagree. A
+    // sibling-only skos match (dedup relationship, no foundational target) is
+    // NOT grounding — it leaves both null so the origin renders "Novel". A prior
+    // body.includes(...) fallback set matchType here even with groundedTo null,
+    // which made the origin gates render "Grounded"/"Ambiguous" with a blank
+    // target for sibling-only classes (bug #910 follow-up).
+    const matchType: "exact" | "close" | "related" | null = foundational
+      ? foundational.strength
+      : null;
 
     return {
       classEntity: cls,
@@ -484,6 +493,10 @@ export function ProposalEntitiesPanel({
                         ontology, reusing standard vocabulary.
                       </Box>
                       <Box variant="p">
+                        <strong>Ambiguous</strong>: low-confidence match, review
+                        before accepting.
+                      </Box>
+                      <Box variant="p">
                         <strong>Novel</strong>: created fresh, no confident
                         match.
                       </Box>
@@ -495,12 +508,27 @@ export function ProposalEntitiesPanel({
                   </InfoPopover>
                 </SpaceBetween>
               ),
-              // Grounded sorts before Novel (0 vs 1).
-              sortingComparator: (a, b) =>
-                (a.groundedTo ? 0 : 1) - (b.groundedTo ? 0 : 1),
+              // Grounded sorts before Ambiguous, Ambiguous before Novel.
+              sortingComparator: (a, b) => {
+                const aScore =
+                  a.matchType === "exact" || a.matchType === "close"
+                    ? 0
+                    : a.matchType === "related"
+                      ? 1
+                      : 2;
+                const bScore =
+                  b.matchType === "exact" || b.matchType === "close"
+                    ? 0
+                    : b.matchType === "related"
+                      ? 1
+                      : 2;
+                return aScore - bScore;
+              },
               cell: (g) =>
-                g.groundedTo ? (
+                g.matchType === "exact" || g.matchType === "close" ? (
                   <Badge color="blue">Grounded</Badge>
+                ) : g.matchType === "related" ? (
+                  <Badge>Ambiguous</Badge>
                 ) : (
                   <Badge color="green">Novel</Badge>
                 ),

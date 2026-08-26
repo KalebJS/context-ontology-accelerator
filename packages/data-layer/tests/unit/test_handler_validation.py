@@ -58,22 +58,23 @@ class TestQueryValidation:
         assert "Missing required field: query" in result["body"]
 
     def test_empty_query_returns_400(self):
+        """A present-but-empty field reports blankness, not absence."""
         event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"query": ""})
         result = handler(event, None)
         assert result["statusCode"] == 400
-        assert "Missing required field: query" in result["body"]
+        assert "must not be blank" in result["body"]
 
     def test_whitespace_only_query_returns_400(self):
         event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"query": "   "})
         result = handler(event, None)
         assert result["statusCode"] == 400
-        assert "Missing required field: query" in result["body"]
+        assert "must not be blank" in result["body"]
 
     def test_tabs_newlines_only_query_returns_400(self):
         event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"query": "\t\n  "})
         result = handler(event, None)
         assert result["statusCode"] == 400
-        assert "Missing required field: query" in result["body"]
+        assert "must not be blank" in result["body"]
 
     def test_missing_namespace_returns_400(self):
         event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"query": "hello"})
@@ -91,7 +92,7 @@ class TestTranslateValidation:
         event = _api_event("POST", "/namespaces/{namespaceId}/translate", body={"query": "   "})
         result = handler(event, None)
         assert result["statusCode"] == 400
-        assert "Missing required field: query" in result["body"]
+        assert "must not be blank" in result["body"]
 
 
 @pytest.mark.unit
@@ -102,7 +103,29 @@ class TestKbSearchValidation:
         event = _api_event("POST", "/namespaces/{namespaceId}/kb/search", body={"query": "   "})
         result = handler(event, None)
         assert result["statusCode"] == 400
-        assert "Missing required field: query" in result["body"]
+        assert "must not be blank" in result["body"]
+
+
+@pytest.mark.unit
+class TestNaturalLanguageQueryBoundary:
+    """All query-bearing routes reject invalid input before AgentCore I/O."""
+
+    @pytest.mark.parametrize(
+        "resource",
+        [
+            "/namespaces/{namespaceId}/query",
+            "/namespaces/{namespaceId}/translate",
+            "/namespaces/{namespaceId}/kb/search",
+        ],
+    )
+    @pytest.mark.parametrize("query", [42, "   ", "x" * 4001])
+    def test_invalid_query_returns_400_without_backend_call(self, resource, query):
+        with patch.object(handler_module, "_invoke_context_manager") as invoke_context_manager:
+            event = _api_event("POST", resource, body={"query": query})
+            result = handler(event, None)
+
+        assert result["statusCode"] == 400
+        invoke_context_manager.assert_not_called()
 
 
 @pytest.mark.unit
@@ -763,3 +786,76 @@ class TestListMetrics:
             result = handler(event, None)
         body = json.loads(result["body"])
         assert set(body.keys()) == {"metrics", "nextToken"}
+
+
+@pytest.mark.unit
+class TestQueryLengthBoundReportsItsOwnReason:
+    """An over-long query must say so, not claim the field is missing.
+
+    ``validate_query_text`` bounds the query in CODE POINTS, which is the correct
+    unit for a multilingual API: a byte bound would give a CJK caller a third of
+    the Latin allowance for the same character count. The handler used to collapse
+    every ``ValueError`` from it into "Missing required field: query", so a caller
+    who sent a 5000-character query was told the field was absent and had nothing
+    to act on.
+    """
+
+    ROUTES = (
+        "/namespaces/{namespaceId}/query",
+        "/namespaces/{namespaceId}/translate",
+        "/namespaces/{namespaceId}/kb/search",
+    )
+
+    @staticmethod
+    def _limit() -> int:
+        from coa_common.constants import MAX_QUERY_CODEPOINTS
+
+        return MAX_QUERY_CODEPOINTS
+
+    @pytest.mark.parametrize("route", ROUTES)
+    @pytest.mark.parametrize(
+        ("label", "char"),
+        [("latin", "a"), ("cjk", "あ"), ("astral", "𠮷")],
+    )
+    def test_over_limit_query_reports_the_length_bound(self, route, label, char):
+        event = _api_event("POST", route, body={"query": char * (self._limit() + 1)})
+        result = handler(event, None)
+        assert result["statusCode"] == 400
+        assert "Missing required field" not in result["body"], (
+            f"{label} over-limit query on {route} still reports the field as missing"
+        )
+        assert str(self._limit()) in result["body"], (
+            "the message should name the limit so the caller knows what to trim to"
+        )
+
+    @pytest.mark.parametrize(
+        ("label", "char"),
+        [("latin", "a"), ("cjk", "あ"), ("astral", "𠮷")],
+    )
+    def test_at_the_limit_is_accepted_in_every_script(self, label, char):
+        """The bound is code points, so the limit is reached at the same COUNT.
+
+        Astral characters are one code point each in this count even though Python
+        stores them as one character and UTF-8 spends four bytes on them, which is
+        the property that keeps the allowance script-independent.
+        """
+        query = char * self._limit()
+        event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"query": query})
+        with patch.object(handler_module, "_invoke_context_manager") as invoke:
+            invoke.return_value = {"result": {}, "requestId": "r", "sessionId": "s"}
+            result = handler(event, None)
+        assert result["statusCode"] == 200, f"{label} query of exactly {self._limit()} code points was rejected"
+        assert invoke.call_args.args[0]["query"] == query
+
+    def test_non_string_query_reports_the_type(self):
+        event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"query": 42})
+        result = handler(event, None)
+        assert result["statusCode"] == 400
+        assert "must be a string" in result["body"]
+
+    def test_absent_field_still_reports_absence(self):
+        """The original message must survive for the case it actually describes."""
+        event = _api_event("POST", "/namespaces/{namespaceId}/query", body={"tierOverride": 2})
+        result = handler(event, None)
+        assert result["statusCode"] == 400
+        assert "Missing required field: query" in result["body"]

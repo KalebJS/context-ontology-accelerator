@@ -221,6 +221,20 @@ list StringList {
     member: String
 }
 
+/// A bounded, non-empty natural-language question or search query.
+///
+/// The bound is code points, so it does not shrink for non-Latin scripts. The
+/// request BODY carrying it is separately capped at 8,192 bytes by the API's WAF
+/// (`AWSManagedRulesCommonRuleSet` / `SizeRestrictions_BODY`), which runs ahead of
+/// the service and answers `403 Forbidden` without explanation. A client should
+/// therefore treat the practical ceiling as encoding-dependent — roughly 4000
+/// code points for ASCII, 2725 for CJK, 2045 for astral-plane characters — and
+/// keep the whole serialized body under 8 KB. Natural-language questions are far
+/// below any of these; see `MAX_QUERY_CODEPOINTS` in `coa_common.constants` for
+/// the measurements and why the WAF limit is left as it is.
+@length(min: 1, max: 4000)
+string NaturalLanguageQuery
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Shared Shapes — Result Rows (Tier 1/2 tabular data)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -512,7 +526,7 @@ operation Query {
 
         /// Natural-language question to answer.
         @required
-        query: String
+        query: NaturalLanguageQuery
 
         /// Whether to execute the generated query (versus translate only).
         execute: Boolean
@@ -575,7 +589,7 @@ operation TranslateSPARQL {
 
         /// Natural-language question to translate into SPARQL.
         @required
-        query: String
+        query: NaturalLanguageQuery
     }
 
     output := {
@@ -614,7 +628,7 @@ operation KBSearch {
 
         /// Natural-language search query.
         @required
-        query: String
+        query: NaturalLanguageQuery
 
         /// Maximum number of chunks to return.
         topK: Integer

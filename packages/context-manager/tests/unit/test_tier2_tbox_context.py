@@ -115,10 +115,12 @@ class TestTBoxContextBuilder:
         context = await builder.build([], "demo", query="How many policies exist?")
 
         assert len(context.classes) >= 1
-        # count query + entity fallback (OP skipped: 1 class; aiContext skipped: no
-        # URIs). The isMapped bridge probe uses the separate .ask method, so it
-        # does not add to .query's count.
-        assert client.query.call_count == 2
+        # count query + entity fallback, which is now TWO queries (matched classes,
+        # then their datatype properties) so property-row volume can no longer evict
+        # a matched class. OP skipped: 1 class; aiContext skipped: no URIs. The
+        # isMapped bridge probe uses the separate .ask method, so it does not add to
+        # .query's count.
+        assert client.query.call_count == 3
 
     async def test_build_empty_result_from_neptune(self):
         client = _make_graph_client([])

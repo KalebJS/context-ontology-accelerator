@@ -296,8 +296,16 @@ class TestGuardrailDecisionMetrics:
 
     async def test_block_with_no_text_still_emits_before_raising(self):
         # A hard block is both the decision most worth counting and the case
-        # most likely to come back with no text blocks at all.
-        client = self._client({"output": {"message": {"content": []}}, "stopReason": "guardrail_intervened"})
+        # most likely to come back with no text blocks at all. The trace is
+        # required for this to BE a confirmed block: without one the outcome is
+        # UNKNOWN by design (see test_traceless_no_text_emits_unknown).
+        client = self._client(
+            {
+                "output": {"message": {"content": []}},
+                "stopReason": "guardrail_intervened",
+                "trace": self._BLOCK_TRACE,
+            }
+        )
 
         with (
             patch("coa_serve.clients.bedrock.emit_guardrail_decision") as emit,
@@ -306,6 +314,21 @@ class TestGuardrailDecisionMetrics:
             await client.converse("test", guardrail_id="gr-1")
 
         assert emit.call_args.kwargs["blocked"] is True
+
+    async def test_traceless_no_text_emits_unknown_not_block(self):
+        # The old code treated any traceless intervention as a confirmed block,
+        # which is what inflated GuardrailBlocked and discarded 71 masked answers.
+        client = self._client({"output": {"message": {"content": []}}, "stopReason": "guardrail_intervened"})
+
+        with (
+            patch("coa_serve.clients.bedrock.emit_guardrail_decision") as emit,
+            pytest.raises(ValueError, match="No text content"),
+        ):
+            await client.converse("test", guardrail_id="gr-1")
+
+        kwargs = emit.call_args.kwargs
+        assert kwargs["decision"] == "UNKNOWN"
+        assert kwargs["blocked"] is False
 
     async def test_decision_log_line_carries_required_keys(self):
         from coa_common import guardrail_metrics
@@ -894,3 +917,717 @@ class TestModelIdValidation:
             model_validation.validate_model_id("any.model.name-here")
         finally:
             model_validation._ALLOWED_OVERRIDE_MODELS = orig
+
+
+def _trace(side: str, policy: str, items_key: str, items: list[dict]) -> dict:
+    """Build a guardrail trace with one assessment on ``side``."""
+    return {"guardrail": {side: {"0": {policy: {items_key: items}}}}}
+
+
+_ANON_NAME = [{"type": "NAME", "action": "ANONYMIZED", "match": "Fidel Castro"}]
+_BLOCK_VIOLENCE = [{"type": "VIOLENCE", "action": "BLOCKED", "confidence": "HIGH"}]
+
+
+def _converse_client(response: dict):
+    from coa_serve.clients.bedrock import BedrockLLMClient
+
+    mock_client = MagicMock()
+    mock_client.converse.return_value = response
+    client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+    client._client = mock_client
+    return client
+
+
+def _intervened(trace: dict | None, text: str = "Eight U.S. presidents served during {NAME}'s rule.") -> dict:
+    response: dict = {
+        "output": {"message": {"content": [{"text": text}]}},
+        "stopReason": "guardrail_intervened",
+    }
+    if trace is not None:
+        response["trace"] = trace
+    return response
+
+
+@pytest.mark.unit
+class TestGuardrailOutcomeClassification:
+    """A masked answer must survive; only a confirmed block may be suppressed.
+
+    Serve discarded 71 masked answers because ``stopReason=guardrail_intervened``
+    fires for masking as well as blocking, the trace that distinguishes them was
+    never requested, and a missing trace was read as a block.
+    """
+
+    async def test_guardrail_config_requests_the_trace(self):
+        # Without this the outcome is unclassifiable, so it is the regression guard
+        # that matters most: every other assertion here is reachable only if the
+        # request actually asks Bedrock for the trace.
+        client = _converse_client({"output": {"message": {"content": [{"text": "ok"}]}}, "stopReason": "end_turn"})
+
+        await client.converse("test", guardrail_id="gr-1")
+
+        cfg = client._client.converse.call_args.kwargs["guardrailConfig"]
+        assert cfg["trace"] == "enabled"
+
+    async def test_no_guardrail_id_sends_no_guardrail_config(self):
+        client = _converse_client({"output": {"message": {"content": [{"text": "ok"}]}}, "stopReason": "end_turn"})
+
+        await client.converse("test")
+
+        assert "guardrailConfig" not in client._client.converse.call_args.kwargs
+
+    async def test_anonymized_output_keeps_text(self):
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(_trace("outputAssessment", "sensitiveInformationPolicy", "piiEntities", _ANON_NAME))
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.ANONYMIZED
+        assert result.guardrail_blocked is False
+        assert "{NAME}" in result.text
+
+    async def test_anonymized_on_input_assessment_only_keeps_text(self):
+        """The live-reproduced case: PII NAME is reported on the INPUT side.
+
+        Reading only ``outputAssessment`` made this look like a block, which is why
+        person-name questions came back empty.
+        """
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(_trace("inputAssessment", "sensitiveInformationPolicy", "piiEntities", _ANON_NAME))
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.ANONYMIZED
+        assert result.guardrail_blocked is False
+        assert result.text.startswith("Eight U.S. presidents")
+
+    async def test_blocked_on_output_assessment(self):
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                _trace("outputAssessment", "contentPolicy", "filters", _BLOCK_VIOLENCE),
+                text="Response blocked by content filter.",
+            )
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.BLOCKED
+        assert result.guardrail_blocked is True
+
+    async def test_blocked_on_input_assessment_only(self):
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                _trace("inputAssessment", "contentPolicy", "filters", _BLOCK_VIOLENCE),
+                text="Request blocked by content filter.",
+            )
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.BLOCKED
+
+    async def test_block_wins_over_anonymize(self):
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "inputAssessment": {"0": {"sensitiveInformationPolicy": {"piiEntities": _ANON_NAME}}},
+                        "outputAssessment": {"0": {"contentPolicy": {"filters": _BLOCK_VIOLENCE}}},
+                    }
+                }
+            )
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.BLOCKED
+
+    async def test_missing_trace_is_unknown_and_empties_text(self):
+        """The production path: intervened, no trace.
+
+        Fails closed — but as UNKNOWN, not as a confirmed block — and the text is
+        emptied because it may be real model output we could not classify.
+        """
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(_intervened(None))
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.UNKNOWN
+        assert result.guardrail_blocked is True
+        assert result.text == ""
+
+    async def test_empty_trace_is_unknown_not_none(self):
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(_intervened({"guardrail": {}}))
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.UNKNOWN
+
+    async def test_anonymized_plus_unrecognized_policy_is_unknown(self):
+        """MIXED trace: recognized masking alongside a shape we cannot read.
+
+        The unreadable shape might have been a block, so reporting "just masked"
+        would fail OPEN. An earlier version of the classifier ordered ANONYMIZED
+        ahead of the unparsed-shape check and did exactly that.
+        """
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "inputAssessment": {"0": {"sensitiveInformationPolicy": {"piiEntities": _ANON_NAME}}},
+                        "outputAssessment": {
+                            "0": {"contextualGroundingPolicy": {"filters": [{"action": "SOMETHING"}]}}
+                        },
+                    }
+                }
+            )
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.UNKNOWN
+        assert result.guardrail_blocked is True
+        assert result.text == ""
+
+    async def test_anonymized_beside_a_malformed_side_is_unknown(self):
+        """A readable ANONYMIZED next to an UNREADABLE sibling must not pass.
+
+        Regression: the unparsed-shape check originally walked
+        ``assessments_from_trace``, which silently drops non-dict sides. The
+        malformed side was therefore invisible and the response was classified as
+        plain masking — failing OPEN on input that might have carried a block.
+        """
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "inputAssessment": {"0": {"sensitiveInformationPolicy": {"piiEntities": _ANON_NAME}}},
+                        "outputAssessment": "unparseable-string-that-might-have-been-a-block",
+                    }
+                }
+            )
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.UNKNOWN
+        assert result.text == ""
+
+    async def test_anonymized_beside_a_malformed_entry_is_unknown(self):
+        """Same hole, one level deeper: a non-dict entry inside a valid side."""
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "inputAssessment": {"0": {"sensitiveInformationPolicy": {"piiEntities": _ANON_NAME}}},
+                        "outputAssessment": {"0": "not-a-dict"},
+                    }
+                }
+            )
+        )
+
+        assert (await client.converse("test", guardrail_id="gr-1")).outcome is GuardrailOutcome.UNKNOWN
+
+    async def test_non_list_policy_items_is_unknown(self):
+        """A policy whose items are not a list is unreadable, not empty."""
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {"guardrail": {"outputAssessment": {"0": {"sensitiveInformationPolicy": {"piiEntities": "x"}}}}}
+            )
+        )
+
+        assert (await client.converse("test", guardrail_id="gr-1")).outcome is GuardrailOutcome.UNKNOWN
+
+    async def test_non_assessment_metadata_does_not_force_unknown(self):
+        """Trace metadata carries no action, so it must not suppress a good answer.
+
+        Guards the opposite failure: over-triggering UNKNOWN would blank every
+        guarded response.
+        """
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "inputAssessment": {"0": {"sensitiveInformationPolicy": {"piiEntities": _ANON_NAME}}},
+                        "actionReason": "PII masked",
+                    }
+                }
+            )
+        )
+
+        assert (await client.converse("test", guardrail_id="gr-1")).outcome is GuardrailOutcome.ANONYMIZED
+
+    async def test_anonymized_plus_unknown_action_value_is_unknown(self):
+        """A known policy carrying an action outside the known set is unparsed."""
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "outputAssessment": {
+                            "0": {
+                                "sensitiveInformationPolicy": {
+                                    "piiEntities": [
+                                        {"type": "NAME", "action": "ANONYMIZED"},
+                                        {"type": "EMAIL", "action": "FUTURE_ACTION"},
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            )
+        )
+
+        assert (await client.converse("test", guardrail_id="gr-1")).outcome is GuardrailOutcome.UNKNOWN
+
+    async def test_blocked_still_wins_over_an_unrecognized_shape(self):
+        """An explicit block is definite, so it outranks the unparsed check."""
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "outputAssessment": {"0": {"contentPolicy": {"filters": _BLOCK_VIOLENCE}}},
+                        "inputAssessment": {"0": {"contextualGroundingPolicy": {"filters": [{"action": "X"}]}}},
+                    }
+                }
+            )
+        )
+
+        assert (await client.converse("test", guardrail_id="gr-1")).outcome is GuardrailOutcome.BLOCKED
+
+    async def test_invocation_metrics_alone_is_not_unparsed(self):
+        """``invocationMetrics`` is metadata, not a policy — it must not force UNKNOWN."""
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "outputAssessment": {
+                            "0": {
+                                "sensitiveInformationPolicy": {"piiEntities": _ANON_NAME},
+                                "invocationMetrics": {"guardrailProcessingLatency": 42},
+                            }
+                        }
+                    }
+                }
+            )
+        )
+
+        assert (await client.converse("test", guardrail_id="gr-1")).outcome is GuardrailOutcome.ANONYMIZED
+
+    async def test_real_trace_with_applied_guardrail_details_is_anonymized(self):
+        """Regression for the live shape: a real Bedrock trace attaches
+        ``appliedGuardrailDetails`` and ``invocationMetrics`` to every assessment.
+
+        The earlier name-allowlist only knew ``invocationMetrics``, so the
+        unlisted ``appliedGuardrailDetails`` forced UNKNOWN — and benign name
+        questions (e.g. "Fidel Castro") came back blocked and empty even though the
+        guardrail had only masked. Neither key carries an action, so both must be
+        ignored and the answer classified as ANONYMIZED.
+        """
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "modelOutput": ["Eight U.S. presidents served during {NAME}'s rule."],
+                        "inputAssessment": {
+                            "gr-1": {
+                                "sensitiveInformationPolicy": {
+                                    "piiEntities": [
+                                        {
+                                            "match": "Fidel Castro",
+                                            "type": "NAME",
+                                            "action": "ANONYMIZED",
+                                            "detected": True,
+                                        }
+                                    ]
+                                },
+                                "invocationMetrics": {"guardrailProcessingLatency": 87},
+                                "appliedGuardrailDetails": {
+                                    "guardrailId": "gr-1",
+                                    "guardrailVersion": "1",
+                                    "guardrailArn": "arn:aws:bedrock:us-east-1:123456789012:guardrail/gr-1",
+                                },
+                            }
+                        },
+                        "outputAssessments": None,
+                        "actionReason": "Guardrail masked PII.",
+                    }
+                }
+            )
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.ANONYMIZED
+        assert result.guardrail_blocked is False
+        assert "{NAME}" in result.text
+
+    async def test_plural_output_assessments_list_is_parsed(self):
+        """``outputAssessments`` (plural) nests the assessment inside a LIST.
+
+        The side value is ``{guardrailId: [assessment, ...]}`` rather than a single
+        assessment dict. The unparsed-shape walk must descend into that list — an
+        earlier version saw the list itself as a non-dict entry and forced UNKNOWN,
+        blanking every response that carried a plural output side.
+        """
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {
+                    "guardrail": {
+                        "outputAssessments": {
+                            "gr-1": [
+                                {
+                                    "sensitiveInformationPolicy": {"piiEntities": _ANON_NAME},
+                                    "appliedGuardrailDetails": {"guardrailId": "gr-1", "guardrailVersion": "1"},
+                                }
+                            ]
+                        }
+                    }
+                }
+            )
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.ANONYMIZED
+        assert "{NAME}" in result.text
+
+    async def test_unrecognized_policy_shape_is_unknown_not_none(self):
+        """A policy type absent from the known paths must not read as 'allowed'.
+
+        ``_GUARDRAIL_POLICY_PATHS`` is a fixed list of six, so a new Bedrock policy
+        would otherwise silently fail open.
+        """
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client(
+            _intervened(
+                {"guardrail": {"outputAssessment": {"0": {"futurePolicy": {"widgets": [{"action": "BLOCKED"}]}}}}}
+            )
+        )
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.UNKNOWN
+
+    async def test_no_intervention_is_none(self):
+        from coa_serve.clients.base import GuardrailOutcome
+
+        client = _converse_client({"output": {"message": {"content": [{"text": "ok"}]}}, "stopReason": "end_turn"})
+
+        result = await client.converse("test", guardrail_id="gr-1")
+
+        assert result.outcome is GuardrailOutcome.NONE
+        assert result.guardrail_blocked is False
+        assert result.text == "ok"
+
+    async def test_content_filtered_raises_typed_error(self):
+        from coa_serve.clients.base import ContentFilteredError
+
+        client = _converse_client({"output": {"message": {"content": []}}, "stopReason": "content_filtered"})
+
+        with pytest.raises(ContentFilteredError) as exc:
+            await client.converse("test", guardrail_id="gr-1")
+
+        assert exc.value.stop_reason == "content_filtered"
+        # Still a ValueError, so anything catching the previous bare error keeps working.
+        assert isinstance(exc.value, ValueError)
+
+    async def test_content_filtered_is_not_reported_as_allow(self):
+        from coa_serve.clients.base import ContentFilteredError
+
+        client = _converse_client({"output": {"message": {"content": []}}, "stopReason": "content_filtered"})
+
+        with (
+            patch("coa_serve.clients.bedrock.emit_guardrail_decision") as emit,
+            pytest.raises(ContentFilteredError),
+        ):
+            await client.converse("test", guardrail_id="gr-1")
+
+        kwargs = emit.call_args.kwargs
+        assert kwargs["decision"] == "MODEL_FILTERED"
+        assert kwargs["blocked"] is False
+
+
+@pytest.mark.unit
+class TestGuardrailDecisionLabels:
+    """Each outcome reports its own decision, and only a real block counts as one."""
+
+    async def _decision_for(self, response: dict) -> dict:
+        client = _converse_client(response)
+        with patch("coa_serve.clients.bedrock.emit_guardrail_decision") as emit:
+            await client.converse("test", guardrail_id="gr-1")
+        return emit.call_args.kwargs
+
+    async def test_anonymized_reports_anonymized_and_not_blocked(self):
+        kwargs = await self._decision_for(
+            _intervened(_trace("inputAssessment", "sensitiveInformationPolicy", "piiEntities", _ANON_NAME))
+        )
+
+        assert kwargs["decision"] == "ANONYMIZED"
+        assert kwargs["blocked"] is False
+
+    async def test_unknown_reports_unknown_and_not_blocked(self):
+        # GuardrailBlocked must stay a count of CONFIRMED blocks; an unexplained
+        # suppression gets its own decision so it can be alarmed on separately.
+        kwargs = await self._decision_for(_intervened(None))
+
+        assert kwargs["decision"] == "UNKNOWN"
+        assert kwargs["blocked"] is False
+
+    async def test_blocked_reports_block(self):
+        kwargs = await self._decision_for(
+            _intervened(_trace("outputAssessment", "contentPolicy", "filters", _BLOCK_VIOLENCE))
+        )
+
+        assert kwargs["decision"] == "BLOCK"
+        assert kwargs["blocked"] is True
+
+    async def test_no_intervention_reports_allow(self):
+        kwargs = await self._decision_for(
+            {"output": {"message": {"content": [{"text": "ok"}]}}, "stopReason": "end_turn"}
+        )
+
+        assert kwargs["decision"] == "ALLOW"
+        assert kwargs["blocked"] is False
+
+
+@pytest.mark.unit
+class TestGuardrailTraceLogRedaction:
+    """The trace carries raw matched PII, so it must never be logged verbatim."""
+
+    async def test_log_omits_matched_values_and_raw_trace(self, capsys):
+        client = _converse_client(
+            _intervened(_trace("inputAssessment", "sensitiveInformationPolicy", "piiEntities", _ANON_NAME))
+        )
+
+        await client.converse("test", guardrail_id="gr-1")
+
+        out = capsys.readouterr().out
+        assert "guardrail_trace" in out
+        # The matched value is a real person's name; it must not reach the log.
+        assert "Fidel Castro" not in out
+        # Derived, non-sensitive labels are what we keep.
+        assert "NAME=ANONYMIZED" in out
+
+
+@pytest.mark.unit
+class TestConverseResultCompatibility:
+    """Existing callers construct and read ``guardrail_blocked`` directly."""
+
+    def test_legacy_blocked_kwarg_derives_outcome(self):
+        from coa_serve.clients.base import ConverseResult, GuardrailOutcome
+
+        result = ConverseResult(text="x", guardrail_blocked=True)
+
+        assert result.outcome is GuardrailOutcome.BLOCKED
+        assert result.guardrail_blocked is True
+
+    def test_legacy_default_is_none_outcome(self):
+        from coa_serve.clients.base import ConverseResult, GuardrailOutcome
+
+        result = ConverseResult(text="x")
+
+        assert result.outcome is GuardrailOutcome.NONE
+        assert result.guardrail_blocked is False
+
+    def test_outcome_drives_blocked_flag(self):
+        from coa_serve.clients.base import ConverseResult, GuardrailOutcome
+
+        assert ConverseResult(text="x", outcome=GuardrailOutcome.ANONYMIZED).guardrail_blocked is False
+        assert ConverseResult(text="x", outcome=GuardrailOutcome.BLOCKED).guardrail_blocked is True
+        # UNKNOWN is suppressed like a block even though it is not a confirmed one.
+        assert ConverseResult(text="x", outcome=GuardrailOutcome.UNKNOWN).guardrail_blocked is True
+
+
+def _stream_client(events: list[dict]):
+    from coa_serve.clients.bedrock import BedrockLLMClient
+
+    mock_client = MagicMock()
+    mock_client.converse_stream.return_value = {"stream": iter(events)}
+    client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+    client._client = mock_client
+    return client
+
+
+@pytest.mark.unit
+class TestStreamGuardrailOutcome:
+    """Streaming shares the classifier, and now reports and raises consistently."""
+
+    async def test_stream_requests_the_trace(self):
+        client = _stream_client([{"contentBlockDelta": {"delta": {"text": "hi"}}}])
+
+        async for _ in client.converse_stream("test", guardrail_id="gr-1"):
+            pass
+
+        cfg = client._client.converse_stream.call_args.kwargs["guardrailConfig"]
+        assert cfg["trace"] == "enabled"
+
+    async def test_traceless_intervention_now_raises(self):
+        """Previously this raised NOTHING, so a genuine block passed through.
+
+        The old code required both ``guardrail_intervened`` AND a trace-derived
+        block; since the trace was never requested, the second condition was never
+        met and real blocks were silently allowed.
+        """
+        from coa_serve.clients.base import GuardrailBlockedError
+
+        client = _stream_client(
+            [
+                {"contentBlockDelta": {"delta": {"text": "partial"}}},
+                {"messageStop": {"stopReason": "guardrail_intervened"}},
+            ]
+        )
+
+        with pytest.raises(GuardrailBlockedError, match="unknown"):
+            async for _ in client.converse_stream("test", guardrail_id="gr-1"):
+                pass
+
+    async def test_anonymized_stream_does_not_raise(self):
+        client = _stream_client(
+            [
+                {"contentBlockDelta": {"delta": {"text": "Eight presidents under {NAME}"}}},
+                {"messageStop": {"stopReason": "guardrail_intervened"}},
+                {
+                    "metadata": {
+                        "trace": {
+                            "guardrail": {
+                                "inputAssessment": {"0": {"sensitiveInformationPolicy": {"piiEntities": _ANON_NAME}}}
+                            }
+                        }
+                    }
+                },
+            ]
+        )
+
+        chunks = [c async for c in client.converse_stream("test", guardrail_id="gr-1")]
+
+        assert "".join(chunks) == "Eight presidents under {NAME}"
+
+    async def test_stream_emits_one_decision_metric(self):
+        # This path emitted no guardrail metrics at all before, so a streamed block
+        # was invisible on the dashboard whose whole purpose is counting blocks.
+        client = _stream_client(
+            [
+                {"contentBlockDelta": {"delta": {"text": "x"}}},
+                {"messageStop": {"stopReason": "guardrail_intervened"}},
+                {
+                    "metadata": {
+                        "trace": {
+                            "guardrail": {"outputAssessment": {"0": {"contentPolicy": {"filters": _BLOCK_VIOLENCE}}}}
+                        }
+                    }
+                },
+            ]
+        )
+
+        from coa_serve.clients.base import GuardrailBlockedError
+
+        with (
+            patch("coa_serve.clients.bedrock.emit_guardrail_decision") as emit,
+            pytest.raises(GuardrailBlockedError),
+        ):
+            async for _ in client.converse_stream("test", guardrail_id="gr-1"):
+                pass
+
+        assert emit.call_count == 1
+        kwargs = emit.call_args.kwargs
+        assert kwargs["decision"] == "BLOCK"
+        assert kwargs["blocked"] is True
+
+    async def test_stream_unknown_reports_unknown_not_block(self):
+        from coa_serve.clients.base import GuardrailBlockedError
+
+        client = _stream_client(
+            [
+                {"contentBlockDelta": {"delta": {"text": "x"}}},
+                {"messageStop": {"stopReason": "guardrail_intervened"}},
+            ]
+        )
+
+        with (
+            patch("coa_serve.clients.bedrock.emit_guardrail_decision") as emit,
+            pytest.raises(GuardrailBlockedError),
+        ):
+            async for _ in client.converse_stream("test", guardrail_id="gr-1"):
+                pass
+
+        kwargs = emit.call_args.kwargs
+        assert kwargs["decision"] == "UNKNOWN"
+        assert kwargs["blocked"] is False
+
+    async def test_unguarded_stream_emits_no_metric(self):
+        client = _stream_client([{"contentBlockDelta": {"delta": {"text": "x"}}}])
+
+        with patch("coa_serve.clients.bedrock.emit_guardrail_decision") as emit:
+            async for _ in client.converse_stream("test"):
+                pass
+
+        emit.assert_not_called()
+
+    async def test_tokens_before_a_block_are_still_delivered(self):
+        """Pins the KNOWN LIMITATION rather than pretending it does not exist.
+
+        Tokens are yielded as they arrive, so by the time the guardrail outcome is
+        known some content has already reached the caller and cannot be recalled.
+        Pre-emptive suppression would require buffering and giving up streaming.
+        Asserted so that changing it is a deliberate decision, not an accident.
+        """
+        from coa_serve.clients.base import GuardrailBlockedError
+
+        client = _stream_client(
+            [
+                {"contentBlockDelta": {"delta": {"text": "leaked "}}},
+                {"contentBlockDelta": {"delta": {"text": "prefix"}}},
+                {"messageStop": {"stopReason": "guardrail_intervened"}},
+                {
+                    "metadata": {
+                        "trace": {
+                            "guardrail": {"outputAssessment": {"0": {"contentPolicy": {"filters": _BLOCK_VIOLENCE}}}}
+                        }
+                    }
+                },
+            ]
+        )
+
+        received: list[str] = []
+        with pytest.raises(GuardrailBlockedError):
+            async for chunk in client.converse_stream("test", guardrail_id="gr-1"):
+                received.append(chunk)
+
+        assert "".join(received) == "leaked prefix"

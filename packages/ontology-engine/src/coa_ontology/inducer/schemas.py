@@ -69,6 +69,13 @@ class MatchCandidate(BaseModel):
     definition: str | None = None  # class definition from foundational ontology
 
 
+class DroppedTable(BaseModel):
+    """A table that could not be processed during induction."""
+
+    table_name: str
+    reason: str  # short failure category: "parse_failed" | "gen_llm_empty" | etc.
+
+
 class InductionReport(BaseModel):
     """Summary of a completed induction run: counts, matches, and the stored ontology."""
 
@@ -81,6 +88,7 @@ class InductionReport(BaseModel):
     grounding_ontologies_used: list[str]
     induced_ontology_id: str | None = None  # ID in ontology-catalog once stored
     induced_ontology_uri: str | None = None
+    dropped_tables: list[DroppedTable] = []  # tables excluded due to processing failures
 
 
 class JobResponse(BaseModel):

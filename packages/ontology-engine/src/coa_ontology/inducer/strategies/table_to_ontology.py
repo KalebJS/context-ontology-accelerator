@@ -95,7 +95,7 @@ class TableToOntologyStrategy(InductionStrategy):
         grounding_ontology_ids: list[str] | None = None,
         grounding_mode: str = "ENHANCED",
         cost_tracker: CostTracker | None = None,
-    ) -> tuple[Graph, set[str], list[ConceptMatch]]:
+    ) -> tuple[Graph, set[str], list[ConceptMatch], list[dict]]:
         """Induce an ontology by embedding table/column names and matching by similarity.
 
         Args:
@@ -263,7 +263,8 @@ class TableToOntologyStrategy(InductionStrategy):
             tables,
             all_matches,
         )
-        return proposal_graph, novel_tables, all_matches
+        # table_to_ontology never drops tables (all tables are processable)
+        return proposal_graph, novel_tables, all_matches, []
 
     def _build_proposal_ontology(
         self,

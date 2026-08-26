@@ -1,6 +1,6 @@
 # Pin to digest to prevent supply-chain attacks via tag mutation.
 # public.ecr.aws/lambda/python:3.12 as of 2026-05-13
-FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12@sha256:5fda6fa581d6876d9382c51fe7ed3ce1ecd0569bc1672be217082cf5c35e1242
+FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12@sha256:526186b9c1c311888082c3ab95631fe110423bed06e7b0f218ad5243046b4278
 
 # System deps: poppler for PDF text extraction, file-libs for libmagic (file type detection)
 RUN dnf install -y poppler-utils file-libs && dnf clean all

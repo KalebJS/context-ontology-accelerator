@@ -43,6 +43,7 @@ from coa_serve.tier3.agentic.tools import (
     ToolRegistry,
     build_graph_tool,
 )
+from coa_serve.tier3.agentic.tools.graph_tool import normalize_graphrag_search_text
 
 GRAPH_STORE_URI = "neptune-db://fake-host:8182"
 
@@ -131,10 +132,120 @@ class TestKeywordMode:
         # ...but the search terms are passed as a parameter, not interpolated.
         assert "claims" not in cypher
         assert "claims" in params["terms"]
+        assert params["containers"] == []
+        assert params["probes"] == params["terms"]
         assert len(out.entities) == 1
         assert out.entities[0].label == "Claim"
         assert out.items and out.items[0]["type"] == "entity"
         assert "Claim" in out.produced_directions
+
+    async def test_unicode_candidates_match_the_persisted_search_string_contract(self):
+        tool, store = _tool([])
+        await tool.invoke(
+            namespace="global",
+            mode="keyword",
+            query="İstanbul कर्मचारी เครื่องปรับอากาศ",
+        )
+
+        cypher, params = store.calls[0]
+        assert params["terms"] == ["i̇stanbul", "कर मच र", "เคร องปร บอากาศ"]
+        # ``İstanbul`` is Latin script, so it bounds a region rather than appearing
+        # inside one, and each non-Latin word is its own reverse haystack.
+        assert params["containers"] == [
+            normalize_graphrag_search_text("कर्मचारी"),
+            normalize_graphrag_search_text("เครื่องปรับอากาศ"),
+        ]
+        assert params["probes"] == params["terms"]
+        assert all(probe not in cypher for probe in params["probes"])
+        assert "$containers" in cypher
+        assert "probe CONTAINS e.search_str" in cypher
+        assert "size(replace(e.search_str, ' ', '')) >= 2" in cypher
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "เครื่องปรับอากาศ",
+            "कर्मचारी",
+            "cafe\u0301",
+            "İstanbul",
+            "order-id",
+            "order_id",
+        ],
+    )
+    def test_local_search_string_normalizer_matches_locked_toolkit(self, value):
+        # Test-only import: production graph_tool must retain its lazy toolkit
+        # boundary and therefore carries a tiny compatible implementation.
+        from coa_serve.tier3.agentic.tools.graph_tool import _GRAPHRAG_SEARCH_STRING_PATTERN
+        from graphrag_toolkit.lexical_graph.storage.graph.graph_utils import (
+            SEARCH_STRING_PATTERN,
+            search_string_from,
+        )
+
+        assert normalize_graphrag_search_text(value) == search_string_from(value)
+        # Pin the contract itself, not only these samples.
+        assert _GRAPHRAG_SEARCH_STRING_PATTERN.pattern == SEARCH_STRING_PATTERN.pattern
+
+    async def test_no_space_thai_container_can_contain_the_normalized_stored_label(self):
+        tool, store = _tool([])
+        await tool.invoke(
+            namespace="global",
+            mode="keyword",
+            query="เครื่องปรับอากาศรุ่นอะไร",
+        )
+
+        _, params = store.calls[0]
+        assert normalize_graphrag_search_text("เครื่องปรับอากาศ") in params["containers"][0]
+
+    async def test_a_long_no_space_thai_query_still_produces_a_container_probe(self):
+        tool, store = _tool([])
+        thai = "ขอทราบรายละเอียดของเครื่องปรับอากาศทั้งหมดในอาคารนี้รวมถึงผู้ผลิตรุ่นและวันที่ติดตั้ง"
+        await tool.invoke(namespace="global", mode="keyword", query=thai)
+
+        _, params = store.calls[0]
+        assert params["terms"] == []
+        assert params["containers"] == [normalize_graphrag_search_text(thai)]
+        assert params["probes"] == params["containers"]
+
+    async def test_korean_particle_suffixed_query_gets_a_container_probe(self):
+        tool, store = _tool([])
+        korean = "이 시설에 설치된 엘리베이터의 제조사와 모델명을 알려줘"
+        await tool.invoke(namespace="global", mode="keyword", query=korean)
+
+        _, params = store.calls[0]
+        assert "제조사와" in params["terms"]
+        assert "제조사와" in params["containers"]
+
+    async def test_a_latin_query_ships_no_reverse_arm_at_all(self):
+        # The reverse arm is a separate template so ``size()`` — the only use of it
+        # here — never reaches Neptune for a query that cannot use the arm.
+        tool, store = _tool([])
+        await tool.invoke(namespace="global", mode="keyword", query="show me the elevator model")
+
+        cypher, params = store.calls[0]
+        assert params["containers"] == []
+        assert params["probes"] == params["terms"]
+        assert "size(" not in cypher
+        assert "$containers" not in cypher
+
+    async def test_a_latin_query_gets_no_container_probe(self):
+        tool, store = _tool([])
+        await tool.invoke(namespace="global", mode="keyword", query="show me the elevator model")
+
+        _, params = store.calls[0]
+        assert params["containers"] == []
+        assert params["probes"] == params["terms"]
+
+    async def test_japanese_budget_keeps_late_concepts_in_terms_and_containers(self):
+        tool, store = _tool([])
+        await tool.invoke(
+            namespace="global",
+            mode="keyword",
+            query="この施設に設置されているエレベーターのメーカーと型番を教えて",
+        )
+
+        _, params = store.calls[0]
+        assert params["terms"] == ["施設", "設置", "エレベーター", "メーカー", "型番"]
+        assert params["containers"][0].endswith("型番を教えて")
 
     async def test_keyword_is_default_mode(self):
         tool, store = _tool([])

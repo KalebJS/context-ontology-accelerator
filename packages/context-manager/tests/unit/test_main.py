@@ -3,6 +3,8 @@
 
 "Unit tests for Context Manager entrypoint logic."
 
+from __future__ import annotations
+
 import importlib.util
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -292,6 +294,29 @@ class TestInvokeFunction:
         assert result["message"] == "Invalid request payload"
         assert "details" in result
         assert "requestId" in result
+
+    @pytest.mark.parametrize("action", [None, "translate", "kbSearch"])
+    @pytest.mark.parametrize("query", [42, "x" * 4001])
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_query_boundary_rejects_before_namespace_or_action_backend(
+        self, mock_init, action, query, stub_orchestrator
+    ):
+        mock_init.return_value = None
+        import coa_serve.main as main_mod
+
+        registry = MagicMock()
+        registry.namespace_exists = AsyncMock(return_value=True)
+        main_mod._sources_registry = registry
+        payload = {"query": query, "namespace": "demo"}
+        if action is not None:
+            payload["action"] = action
+
+        result = await _invoke_collect(payload)
+
+        assert result["statusCode"] == 400
+        assert result["error"] == "ValidationError"
+        registry.namespace_exists.assert_not_called()
+        stub_orchestrator.resolve.assert_not_called()
 
     @patch("coa_serve.main._ensure_initialized")
     async def test_invoke_malformed_namespace_rejected_before_existence_lookup(self, mock_init, config):
@@ -754,6 +779,18 @@ class TestHandleTranslate:
             mock_nl_to_sparql.translate.assert_called_once_with("Show all entities", "test-ns")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("query", [42, "x" * 4001])
+    async def test_handle_translate_rejects_invalid_query_before_translation(self, query):
+        from coa_serve.main import _handle_translate
+
+        mock_nl_to_sparql = AsyncMock()
+        with patch("coa_serve.main._nl_to_sparql", mock_nl_to_sparql):
+            result = await _handle_translate({"query": query, "namespace": "test-ns"}, "req-invalid")
+
+        assert result["statusCode"] == 400
+        mock_nl_to_sparql.translate.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_handle_translate_none_raises_clean_error(self):
         """Test that uninitialized _nl_to_sparql returns error, not AttributeError."""
         from coa_serve.exceptions import QueryTranslationError
@@ -767,3 +804,21 @@ class TestHandleTranslate:
                 {"query": "test query", "namespace": "test-ns"},
                 "req-456",
             )
+
+
+@pytest.mark.unit
+class TestHandleKbSearch:
+    """Test defensive query validation on the isolated KB search handler."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("query", [42, "x" * 4001])
+    async def test_handle_kb_search_rejects_invalid_query_before_embedding(self, query):
+        from coa_serve.main import _handle_kb_search
+
+        mock_orchestrator = MagicMock()
+        mock_orchestrator._bedrock_client = AsyncMock()
+        with patch("coa_serve.main._orchestrator", mock_orchestrator):
+            result = await _handle_kb_search({"query": query, "namespace": "test-ns"}, "req-invalid")
+
+        assert result["statusCode"] == 400
+        mock_orchestrator._bedrock_client.embed.assert_not_called()
