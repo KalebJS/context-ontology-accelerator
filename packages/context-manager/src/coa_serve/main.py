@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from coa_common.constants import validate_query_text
 from coa_common.logging import setup_logging
 from pydantic import ValidationError
 
@@ -52,6 +53,7 @@ from .session_metadata import SessionMetadataStore
 from .sse_emitter import SSEEmitter
 from .step_ids import StepId
 from .tier1.metric_resolver import MetricResolver
+from .tier2.nl_to_sql.agentic_strategy import AgenticStrategy
 from .tier2.nl_to_sql.sql_generator import SQLGenerator
 from .tier2.nl_to_sql.strategy import NLtoSQLStrategy
 from .tier2.ontop.nl_to_sparql import NLtoSPARQL
@@ -271,9 +273,28 @@ async def _ensure_initialized():
             firewall=firewall,
             query_executor=query_executor,
             oss_ontology_index=oss_ontology_index,
+            # Backs the opt-in ontology-graph expansion of the retrieved tables
+            # (SERVE_NL2SQL_GRAPH_EXPAND deployment-wide, options.flatGraphExpand per
+            # request); with both off the client is simply never used.
+            graph_client=neptune_client,
+        )
+        # Bounded tool-use agent (iterative schema discovery → generate → execute →
+        # self-correct). OPT-IN only: it runs solely when a request pins
+        # options.strategy="agentic" — never as a fallback (see
+        # StructuredQueryTier._strategies_for) — so registering it here does not
+        # change the default nl_to_sql_first resolution path.
+        agentic_strategy = AgenticStrategy(
+            sql_generator=sql_generator,
+            firewall=firewall,
+            query_executor=query_executor,
+            vector_client=opensearch_client,
+            oss_ontology_index=oss_ontology_index,
+            # Backs the opt-in explore_graph tool (SERVE_AGENTIC_GRAPH_TRAVERSAL);
+            # with the flag off the client is simply never used.
+            graph_client=neptune_client,
         )
         structured_query_tier = StructuredQueryTier(
-            strategies=[ontop_strategy, nl_to_sql_strategy],
+            strategies=[ontop_strategy, nl_to_sql_strategy, agentic_strategy],
         )
 
         # Agentic Tier 3 path. Built so a deployment default (TIER3_STRATEGY=agentic)
@@ -373,10 +394,13 @@ def _error(status_code: int, message: str, request_id: str) -> dict:
 
 async def _handle_translate(payload: dict, request_id: str) -> dict:
     """NL-to-SPARQL translation only (no VKG execution)."""
-    query = payload.get("query", "").strip()
     namespace = payload.get("namespace", "")
-    if not query or not namespace:
-        return _error(400, "query and namespace required", request_id)
+    try:
+        query = validate_query_text(payload.get("query"))
+    except ValueError:
+        return _error(400, "invalid query", request_id)
+    if not namespace:
+        return _error(400, "namespace required", request_id)
 
     trace = TraceCollector()
     try:
@@ -409,11 +433,14 @@ async def _handle_translate(payload: dict, request_id: str) -> dict:
 
 async def _handle_kb_search(payload: dict, request_id: str) -> dict:
     """Vector search in OpenSearch — returns matching document chunks."""
-    query = payload.get("query", "").strip()
     namespace = payload.get("namespace", "")
     options = payload.get("options", {})
-    if not query or not namespace:
-        return _error(400, "query and namespace required", request_id)
+    try:
+        query = validate_query_text(payload.get("query"))
+    except ValueError:
+        return _error(400, "invalid query", request_id)
+    if not namespace:
+        return _error(400, "namespace required", request_id)
 
     top_k = min(options.get("topK", 10), 100)
     vector_retriever = _orchestrator._knowledge_retriever._vector
@@ -831,6 +858,23 @@ async def invoke(payload: dict, context=None):
     payload.setdefault("profile", {})
     for reserved in ("globalRoles", "resourceRoles", "sub", "tableAllowlist", "columnDenylist", "allowedMetrics"):
         payload["profile"].pop(reserved, None)
+
+    # Query-bearing actions are validated before namespace lookup or any other
+    # backend call. The full query path validates again through InvokeRequest;
+    # this early gate protects isolated actions and prevents oversized input from
+    # reaching synchronous Unicode segmentation.
+    if action in (None, "translate", "kbSearch"):
+        try:
+            payload["query"] = validate_query_text(payload.get("query"))
+        except ValueError:
+            yield {
+                "error": "ValidationError",
+                "message": "Invalid request payload",
+                "details": [{"field": "query", "type": "value_error"}],
+                "requestId": request_id,
+                "statusCode": 400,
+            }
+            return
 
     # ── Namespace format validation ────────────────────────────────────────
     # Reject malformed namespaces (path traversal, spaces, special chars) with a

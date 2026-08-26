@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -23,7 +24,30 @@ from coa_common.guardrail_metrics import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+# Chat/completion model used when a caller constructs BedrockClient without an
+# explicit model_id (table enrichment, constraint inference). Resolved from the
+# BEDROCK_CHAT_MODEL_ID environment variable so a deployment can point these
+# paths at a region-appropriate model (#94) — the `us.` inference profile
+# fallback is only invocable from US regions. Deliberately NOT BEDROCK_MODEL_ID:
+# that name is already taken by the serve query LLM (context-manager) and the
+# metric-service embed fallback chain, and reusing it here would cross-wire
+# those models into this client. Must stay in step with the TypeScript
+# DEFAULT_BEDROCK_CHAT_MODEL_ID (libs/ts-shared/src/constants.ts).
+FALLBACK_CHAT_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+
+def resolve_chat_model_id(default: str = FALLBACK_CHAT_MODEL_ID) -> str:
+    """Resolve the default chat/completion model id from the environment.
+
+    Reads ``BEDROCK_CHAT_MODEL_ID``, falling back to ``default``. Accepts both
+    geographic inference profiles (``us.``/``eu.``/``jp.``/``global.``) and bare
+    in-region model ids, since some models publish geo profiles for only a
+    subset of regions.
+    """
+    return os.environ.get("BEDROCK_CHAT_MODEL_ID") or default
+
+
+DEFAULT_MODEL_ID = resolve_chat_model_id()
 _DEFAULT_READ_TIMEOUT = 90
 _DEFAULT_GUARDRAIL_VERSION = "DRAFT"
 

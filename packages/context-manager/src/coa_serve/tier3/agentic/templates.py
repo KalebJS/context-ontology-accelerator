@@ -144,14 +144,42 @@ ENTITY_EDGE_TYPES: str = (
 )
 
 
-# ``keyword`` mode: find entities whose normalized search string contains any of
-# the supplied terms. ``$terms`` is a parameter list of already-lowercased terms;
-# UNWIND is used instead of the ``any()`` list predicate, which Neptune openCypher
-# does not support.
+# ``keyword`` mode: match entities by their persisted ``search_str``. ``$terms``
+# are per-word forward candidates (``search_str CONTAINS term``); ``$containers``
+# are the query's non-Latin script runs for the reverse direction (``container
+# CONTAINS search_str``), which is how a stored label is found inside a Chinese,
+# Japanese, Thai or Korean clause the serve layer cannot segment. ``$probes`` is the
+# union in source order, because Neptune openCypher supports neither the ``any()``
+# list predicate nor two UNWIND arms in one WHERE. All three values are parameters,
+# never interpolated.
 KEYWORD_ENTITY_SEARCH: str = (
-    "UNWIND $terms AS term\n"
+    "UNWIND $probes AS probe\n"
     "MATCH (e:{entity_label})\n"
-    "WHERE e.search_str CONTAINS term\n"
+    "WHERE probe IN $terms AND e.search_str CONTAINS probe\n"
+    "RETURN DISTINCT id(e) AS uri, e.value AS label, e.class AS class\n"
+    "LIMIT {limit}"
+)
+
+
+# The reverse arm is a SEPARATE template so a query with no containers never ships
+# it. ``size()`` on a string is supported by Neptune ("this overloaded method
+# currently only works for pattern expressions, lists, and strings" — openCypher
+# specification compliance), but it is the only use of it here, and a rejected
+# construct would degrade keyword mode for EVERY language rather than only the
+# scripts that need the reverse direction.
+#
+# The floor is counted over the search string WITHOUT spaces, unlike the SPARQL
+# sinks' ``STRLEN(STR(?label)) >= 2``. The toolkit's ``search_str`` normalizer
+# replaces every combining mark with a space, so a Thai or Indic label arrives
+# shredded (``รุ่น`` -> ``ร น``); counting raw length would admit one-character
+# fragments that appear inside almost any container of the same script.
+KEYWORD_ENTITY_SEARCH_WITH_CONTAINERS: str = (
+    "UNWIND $probes AS probe\n"
+    "MATCH (e:{entity_label})\n"
+    "WHERE (probe IN $terms AND e.search_str CONTAINS probe)\n"
+    "   OR (probe IN $containers AND e.search_str IS NOT NULL\n"
+    "       AND size(replace(e.search_str, ' ', '')) >= 2\n"
+    "       AND probe CONTAINS e.search_str)\n"
     "RETURN DISTINCT id(e) AS uri, e.value AS label, e.class AS class\n"
     "LIMIT {limit}"
 )

@@ -213,7 +213,9 @@ class SQLFirewall:
             if func_name in _DANGEROUS_FUNCTIONS:
                 raise UnsafeSQLError(f"Function not allowed: {func_name}")
 
-    def evaluate(self, sql: str, profile: dict[str, Any] | None = None, namespace: str = "") -> FirewallResult:
+    def evaluate(
+        self, sql: str, profile: dict[str, Any] | None = None, namespace: str = "", dialect: str = "trino"
+    ) -> FirewallResult:
         """Validate safety, then enforce table/column authorization.
 
         Evaluates each referenced table against the caller's grant profile:
@@ -232,6 +234,10 @@ class SQLFirewall:
                 ``tableAllowlist`` (list[str]) and ``columnDenylist``
                 (dict[str, list[str]]).
             namespace: Namespace evaluated by the Cedar policy gate.
+            dialect: sqlglot read-dialect used to parse ``sql`` for the safety
+                checks. Defaults to ``"trino"`` (the canonical generation dialect);
+                the direct-JDBC path passes the engine's own dialect so an
+                already-transpiled statement isn't rejected as unparseable.
 
         Returns:
             FirewallResult indicating whether the query is allowed.
@@ -239,7 +245,7 @@ class SQLFirewall:
         Raises:
             UnsafeSQLError: If SQL fails safety validation (incl. parse errors).
         """
-        self.validate(sql)
+        self.validate(sql, dialect=dialect)
 
         profile = profile or {}
         allowlist_raw = profile.get(_TABLE_ALLOWLIST_KEY)

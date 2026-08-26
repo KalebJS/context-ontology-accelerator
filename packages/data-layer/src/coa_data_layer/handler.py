@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Any
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -27,6 +28,7 @@ from coa_common.constants import (
     LIST_METRICS_RESOURCE,
     METRIC_SERVICE_LAMBDA_ARN_ENV,
     ONTOLOGY_PROXY_LAMBDA_ARN_ENV,
+    validate_query_text,
 )
 from coa_common.smithy_shapes import normalize_dimensions
 
@@ -136,6 +138,28 @@ def _parse_body(event: dict) -> dict | None:
         return None
 
 
+def _parse_query(body: dict) -> str:
+    """Return a bounded, non-blank query, or raise ``ValueError`` explaining why not.
+
+    The ``ValueError`` message reaches the client rather than being collapsed into
+    one string, because there are four distinct client mistakes here and they call
+    for different corrections: the field is absent (detected below), or
+    ``validate_query_text`` rejects it as a non-string, blank after stripping, or
+    longer than :data:`~coa_common.constants.MAX_QUERY_CODEPOINTS`. Reporting all
+    of them as "Missing required field: query" tells a caller whose field IS
+    present to look in the wrong place.
+
+    The length bound is the one a non-Latin caller is most likely to hit, since a
+    CJK query of the same character count says considerably more than a Latin one.
+    All four messages describe the caller's own input, so propagating them
+    discloses nothing about the service.
+    """
+    raw = body.get("query")
+    if raw is None:
+        raise ValueError("Missing required field: query")
+    return validate_query_text(raw)
+
+
 def _split_csv(value: str) -> list[str]:
     """Split a comma-separated string, stripping whitespace and filtering empty segments."""
     return [s.strip() for s in value.split(",") if s.strip()] if value else []
@@ -168,14 +192,13 @@ def _get_bearer_token(event: dict) -> str:
 
 
 def _handle_query(namespace: str, event: dict) -> dict:
-    body = _parse_body(event)
-    if not body or not body.get("query"):
-        return _error_response(400, "Missing required field: query")
-    query = body["query"].strip()
-    if not query:
-        return _error_response(400, "Missing required field: query")
+    body = _parse_body(event) or {}
+    try:
+        query = _parse_query(body)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
 
-    payload = {
+    payload: dict[str, Any] = {
         "query": query,
         "namespace": namespace,
         "profile": _get_caller_profile(event),
@@ -224,12 +247,11 @@ def _handle_query(namespace: str, event: dict) -> dict:
 
 
 def _handle_translate(namespace: str, event: dict) -> dict:
-    body = _parse_body(event)
-    if not body or not body.get("query"):
-        return _error_response(400, "Missing required field: query")
-    query = body["query"].strip()
-    if not query:
-        return _error_response(400, "Missing required field: query")
+    body = _parse_body(event) or {}
+    try:
+        query = _parse_query(body)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
 
     payload = {
         "action": "translate",
@@ -256,12 +278,11 @@ def _handle_translate(namespace: str, event: dict) -> dict:
 
 
 def _handle_kb_search(namespace: str, event: dict) -> dict:
-    body = _parse_body(event)
-    if not body or not body.get("query"):
-        return _error_response(400, "Missing required field: query")
-    query = body["query"].strip()
-    if not query:
-        return _error_response(400, "Missing required field: query")
+    body = _parse_body(event) or {}
+    try:
+        query = _parse_query(body)
+    except ValueError as exc:
+        return _error_response(400, str(exc))
 
     payload = {
         "action": "kbSearch",

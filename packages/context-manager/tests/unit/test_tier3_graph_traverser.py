@@ -78,11 +78,12 @@ class TestGraphTraverserKeyword:
     async def test_sanitizes_external_entities(self, mock_neptune):
         mock_neptune.query.return_value = []
         traverser = GraphTraverser(mock_neptune, graph_uri_template="https://ontology-workbench.local/{namespace}")
-        await traverser.traverse("claims", "insurance", entities=['foo"bar', "valid"])
-        if mock_neptune.query.await_count > 0:
-            query_arg = mock_neptune.query.call_args[0][0]
-            assert "valid" in query_arg
-            assert 'foo"bar' not in query_arg
+        await traverser.traverse("claims", "insurance", entities=['foo"bar', "valid", "___"])
+
+        query_arg = mock_neptune.query.call_args[0][0]
+        assert r'CONTAINS(LCASE(?label), "foo\"bar")' in query_arg
+        assert 'CONTAINS(LCASE(?label), "valid")' in query_arg
+        assert "___" not in query_arg
 
     async def test_skips_empty_uri(self, mock_neptune):
         mock_neptune.query.return_value = [

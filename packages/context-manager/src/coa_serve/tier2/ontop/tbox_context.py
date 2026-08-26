@@ -20,9 +20,12 @@ from coa_common.constants import URN_PREFIX, VOCAB_URI
 from ...clients.base import GraphClient
 from ...query_utils import (
     DEFAULT_GRAPH_URI_TEMPLATE,
-    extract_query_entities,
+    build_query_search_plan,
+    escape_sparql_string_literal,
     get_graph_uri_template,
     namespace_graph_prefix,
+    normalize_label_match_text,
+    object_properties_sparql,
     validate_namespace,
 )
 from .types import VectorHit
@@ -41,6 +44,9 @@ _MAX_DISTINCT_VALUES_IN_PROMPT = 12
 _MAX_SPARQL_VALUES_URIS = 50
 # Maximum results per SPARQL query
 _SPARQL_RESULT_LIMIT = 2000
+# Cap on FK join paths folded into the prompt. Lower than _SPARQL_RESULT_LIMIT
+# because these are rendered as prose for the LLM, not walked programmatically.
+_OBJECT_PROPERTY_LIMIT = 200
 # Namespace class count threshold for full-context fetch (bypass vector search)
 _FULL_CONTEXT_CLASS_THRESHOLD = 200
 
@@ -159,22 +165,6 @@ _TOKENS_PER_CLASS = 20
 _TOKENS_PER_PROPERTY = 30
 _TOKENS_PER_OBJECT_PROPERTY = 25
 _TOKENS_PER_METRIC = 40
-
-
-def _sparql_escape_string(s: str) -> str:
-    """Escape a string for safe use inside SPARQL double-quoted literals.
-
-    Also strips non-alphanumeric characters (except spaces/hyphens/underscores)
-    and truncates to 100 chars to prevent injection via crafted entity names.
-    """
-    sanitized = re.sub(r"[^\w\s\-]", "", s)[:100]
-    return (
-        sanitized.replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-    )
 
 
 _SAFE_URI_RE = re.compile(r"^https?://[^\s<>\"{}|\\^`]+$")
@@ -574,31 +564,19 @@ class TBoxContextBuilder:
         # material. In the legacy fallback (``mapped`` False, no markers exist)
         # both end-gates are dropped so all join paths surface, matching the
         # pre-filter behavior.
-        # BRIDGE: these two ``domain_gate``/``range_gate`` locals are NEW (added by
-        # the bridge). PRE-BRIDGE there were no locals — the gate was inlined
-        # directly in the SPARQL below as ``?domain <isMapped> true .`` and
-        # ``?range <isMapped> true .``. To remove the bridge: drop the ``if mapped
-        # else ""`` so each local is unconditional, OR delete the locals and
-        # re-inline the two triple patterns where ``{domain_gate}``/``{range_gate}``
-        # appear. Either yields the pre-bridge query (both ends mapped-gated).
-        domain_gate = f"?domain <{_IS_MAPPED_IRI}> true ." if mapped else ""
-        range_gate = f"?range <{_IS_MAPPED_IRI}> true ." if mapped else ""
-        sparql = f"""
-        SELECT ?op ?opLabel ?domain ?domainLabel ?range ?rangeLabel
-        WHERE {{
-          GRAPH ?g {{
-            ?op a owl:ObjectProperty .
-            ?op rdfs:domain ?domain .
-            {domain_gate}
-            ?domain rdfs:label ?domainLabel .
-            ?op rdfs:range ?range .
-            {range_gate}
-            ?range rdfs:label ?rangeLabel .
-            OPTIONAL {{ ?op rdfs:label ?opLabel . }}
-          }}
-          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
-        }} LIMIT 200
-        """
+        # BRIDGE: passing ``mapped_gate_iri=None`` is the legacy fallback described
+        # above. To remove the bridge, pass ``_IS_MAPPED_IRI`` unconditionally —
+        # that yields the pre-bridge query (both ends mapped-gated).
+        #
+        # The query text itself lives in ``query_utils.object_properties_sparql``
+        # because the Tier-2 FK-traversal tool reads the same edges; keeping one
+        # definition means a fix there (label handling, scoping, performance)
+        # reaches both callers instead of one.
+        sparql = object_properties_sparql(
+            graph_uri_prefix,
+            limit=_OBJECT_PROPERTY_LIMIT,
+            mapped_gate_iri=_IS_MAPPED_IRI if mapped else None,
+        )
         try:
             results = await self._graph.query(sparql)
             obj_props = []
@@ -728,16 +706,33 @@ class TBoxContextBuilder:
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Fallback: fetch ontology context by matching NL query entities against class labels."""
         validate_namespace(namespace)
-        entities = extract_query_entities(query, max_count=5)
+        search_plan = build_query_search_plan(query, max_count=5)
 
-        if not entities:
+        if not search_plan.terms and not search_plan.containers:
+            logger.info("tbox_entity_fetch_no_search_candidates", namespace=namespace, query_length=len(query))
             return [], []
 
         if not self._graph_uri_template:
             logger.warning("tbox_missing_graph_uri_template")
             return [], []
 
-        filters = " || ".join(f'CONTAINS(LCASE(?label), "{_sparql_escape_string(e)}")' for e in entities)
+        forward_filters = [
+            f'CONTAINS(LCASE(?label), "{escape_sparql_string_literal(normalize_label_match_text(term))}")'
+            for term in search_plan.terms
+        ]
+        # ``STR()`` is required on the reverse arm and not on the forward one:
+        # SPARQL argument compatibility accepts CONTAINS(lang-tagged, simple) but
+        # rejects CONTAINS(simple, lang-tagged) as a type error, which FILTER then
+        # swallows as false. Without STR() every ``@ja``/``@th`` label would be
+        # invisible to reverse containment. STRLEN keeps one-character labels from
+        # matching any query that happens to contain that character.
+        reverse_filters = [
+            "(STRLEN(STR(?label)) >= 2 && "
+            f'CONTAINS("{escape_sparql_string_literal(normalize_label_match_text(container))}", '
+            "LCASE(STR(?label))))"
+            for container in search_plan.containers
+        ]
+        filters = " || ".join(forward_filters + reverse_filters)
         graph_uri_prefix = namespace_graph_prefix(self._graph_uri_template, namespace)
         if not _is_safe_sparql_uri(graph_uri_prefix):
             logger.warning("tbox_unsafe_graph_uri_prefix", prefix=graph_uri_prefix)
@@ -746,8 +741,19 @@ class TBoxContextBuilder:
         # BRIDGE: PRE-BRIDGE, ``{_class_gate(mapped)}`` was ``{_IS_MAPPED_PATTERN}``
         # and ``{_parent_pattern(mapped)}`` was ``{_MAPPED_PARENT_PATTERN}`` (both
         # unconditional).
-        sparql = f"""
-        SELECT ?class ?property ?range ?label ?propLabel ?parentClass ?distinctValue
+        #
+        # Split into a class query and a property query for the same reason
+        # ``_try_full_namespace_context`` is split: joined against the datatype
+        # OPTIONAL, one class fans out to (properties x distinct values x parents x
+        # labels) rows, and with no ORDER BY a class whose rows all land past
+        # ``_SPARQL_RESULT_LIMIT`` vanishes entirely from the parsed result — a
+        # matched class silently missing from the structured prompt. Reverse
+        # containment made that reachable: it matches far more classes than a
+        # handful of short forward terms did, and a multilingual namespace carries
+        # one label per language per class. DISTINCT plus the bounded class list
+        # keeps the class query one row per (class, label, parent).
+        classes_sparql = f"""
+        SELECT DISTINCT ?class ?label ?parentClass
         WHERE {{
           GRAPH ?g {{
             ?class a owl:Class .
@@ -755,19 +761,93 @@ class TBoxContextBuilder:
             ?class rdfs:label ?label .
             FILTER({filters})
             {_parent_pattern(mapped)}
-            {_DATATYPE_PROPS_OPTIONAL}
           }}
           FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
         }} LIMIT {_SPARQL_RESULT_LIMIT}
         """
 
         try:
-            results = await self._graph.query(sparql)
+            class_results = await self._graph.query(classes_sparql)
         except Exception as e:
             logger.error("tbox_entity_fetch_failed", namespace=namespace, error=str(e))
             return [], []
 
-        return self._parse_results(results)
+        if not class_results:
+            return [], []
+
+        if len(class_results) >= _SPARQL_RESULT_LIMIT:
+            # The class query is one row per (class, label, parent) and is not
+            # ordered, so past the cap it is Neptune's row order that decides which
+            # matched classes reach the prompt. Reachable on a large multilingual
+            # namespace, and silent until now.
+            logger.warning(
+                "tbox_entity_classes_truncated",
+                namespace=namespace,
+                limit=_SPARQL_RESULT_LIMIT,
+                detail="matched-class rows hit the row cap; some matched classes may be missing from the prompt",
+            )
+
+        # De-duplicate before the VALUES cap. The class query is DISTINCT over
+        # (?class, ?label, ?parentClass), so a class carrying several language
+        # labels — exactly the namespaces this MR serves — contributes one row per
+        # label. Capping the raw rows let 50 VALUES entries cover far fewer distinct
+        # classes and left the rest with no column hints, and the duplicates
+        # multiplied the property rows as well.
+        matched_uris = list(
+            dict.fromkeys(
+                row["class"] for row in class_results if row.get("class") and _is_safe_sparql_uri(row["class"])
+            )
+        )
+        if not matched_uris:
+            return self._parse_results(class_results)
+
+        if len(matched_uris) > _MAX_SPARQL_VALUES_URIS:
+            logger.info(
+                "tbox_entity_property_uris_truncated",
+                namespace=namespace,
+                matched=len(matched_uris),
+                limit=_MAX_SPARQL_VALUES_URIS,
+                detail="column hints fetched for the first N matched classes; all matched classes still surface",
+            )
+
+        # Properties are fetched for the classes the label match already selected,
+        # so this query cannot introduce a class the gate above rejected. Bounded
+        # by the same VALUES cap the vector-hit path uses.
+        class_values = " ".join(f"(<{uri}>)" for uri in matched_uris[:_MAX_SPARQL_VALUES_URIS])
+        props_sparql = f"""
+        SELECT ?class ?property ?range ?propLabel ?distinctValue
+        WHERE {{
+          GRAPH ?g {{
+            VALUES (?class) {{ {class_values} }}
+            ?property a owl:DatatypeProperty .
+            ?property rdfs:domain ?class .
+            ?property rdfs:label ?propLabel .
+            ?property rdfs:range ?range .
+            OPTIONAL {{ ?property <{_SCL_DISTINCT_VALUES}> ?distinctValue . }}
+          }}
+          FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
+        }} LIMIT {_SPARQL_RESULT_LIMIT}
+        """
+
+        try:
+            prop_results = await self._graph.query(props_sparql)
+        except Exception as e:
+            # A property-list failure only costs column hints; the matched classes
+            # are already answerable, so degrade rather than drop them.
+            logger.warning("tbox_entity_property_fetch_failed", namespace=namespace, error=str(e))
+            prop_results = []
+
+        if len(prop_results) >= _SPARQL_RESULT_LIMIT:
+            logger.warning(
+                "tbox_entity_properties_truncated",
+                namespace=namespace,
+                limit=_SPARQL_RESULT_LIMIT,
+                detail="datatype-property list hit the row cap; some column hints omitted (classes unaffected)",
+            )
+
+        # Class rows FIRST so every matched class is registered with its label and
+        # parent before property rows (which carry no label) are folded in.
+        return self._parse_results(class_results + prop_results)
 
     async def _fetch_ai_context(self, vector_hits: list[VectorHit], namespace: str) -> list[AiContextTerm]:
         """Fetch :aiContext JSON literals from Neptune for the hit nodes.

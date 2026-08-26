@@ -97,6 +97,40 @@ _UPLOAD_URL_EXPIRY_SECONDS = 900
 _BY_NAMESPACE_GSI = "ByNamespace"
 _BY_SOURCE_TYPE_GSI = "BySourceType"
 
+# Which DatabaseSourceDetail member carries a sub-type's configuration.
+#
+# The sources-table stores the config blob in one untyped `configuration`
+# column, so sourceSubType is the only thing that says which shape it holds —
+# and the shapes are not interchangeable. GlueConfiguration requires catalogId
+# (12-digit account form) and region, which an ATHENA_CONNECTOR config has
+# neither of, so reporting one as Glue fails GetSourceOutput validation and
+# turns GET into a 500 rather than a cosmetic mislabel.
+#
+# Keep one entry per DATABASE sub-type: a sub-type added to the response shape
+# but not to this map is caught by test_sources_handler.py rather than silently
+# read as Glue.
+_DETAIL_CONFIG_KEYS: dict[str, str] = {
+    SourceSubType.GLUE_DATABASE.value: "glueConfiguration",
+    SourceSubType.JDBC_DATABASE.value: "jdbcConfiguration",
+    SourceSubType.ATHENA_CONNECTOR.value: "athenaConfiguration",
+}
+
+# How a row this map does not cover is read: as Glue, which is how every
+# non-JDBC row was read before the map existed.
+#
+# A row whose sourceSubType is absent or not a SourceSubType value never gets
+# this far in a way the caller can see: sourceSubType is @required on both
+# GetSourceOutput and SourceSummary, so such a row already fails response
+# validation on that member alone, on GET and LIST alike, whichever member the
+# blob lands under. What does reach here is a value the enum accepts but this
+# map has no entry for — a DOCUMENTS sub-type on a row mis-stored as
+# sourceType=DATABASE, or a DATABASE sub-type added to the enum ahead of its
+# mapping. Both then read as Glue and 500 on GlueConfiguration's required
+# members, so the fallback is logged rather than silent: the pydantic error
+# names catalogId, which says nothing about the missing mapping that caused it.
+# Raising here instead would buy nothing — the GET path catches neither.
+_FALLBACK_CONFIG_KEY = "glueConfiguration"
+
 # ---------------------------------------------------------------------------
 # Lazy clients
 # ---------------------------------------------------------------------------
@@ -198,18 +232,25 @@ def _item_to_summary(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_database_detail(item: dict[str, Any]) -> dict[str, Any] | None:
-    """Build a DatabaseSourceDetail dict from a sources-table item."""
+    """Build a DatabaseSourceDetail dict from a sources-table item.
+
+    The stored `configuration` blob is surfaced under the member the row's
+    sourceSubType selects (see _DETAIL_CONFIG_KEYS).
+    """
     db: dict[str, Any] = {}
     if item.get("configuration"):
         with contextlib.suppress(json.JSONDecodeError, ValueError):
             parsed = json.loads(item["configuration"])
-            # Determine which config key to use based on sub-type
-            sub_type = item.get("sourceSubType", "")
-            if sub_type == SourceSubType.JDBC_DATABASE:
-                db["jdbcConfiguration"] = parsed
-            else:
-                db["glueConfiguration"] = parsed
-    for field in ("glueConfiguration", "jdbcConfiguration"):
+            # Type the blob from the sub-type. SourceSubType mixes in str, so it
+            # hashes and compares as its value — the lookup accepts a raw DDB
+            # string or a SourceSubType alike.
+            sub_type: Any = item.get("sourceSubType") or ""
+            config_key = _DETAIL_CONFIG_KEYS.get(sub_type)
+            if config_key is None:
+                logger.warning("source_sub_type_unmapped", sub_type=sub_type or None, read_as=_FALLBACK_CONFIG_KEY)
+                config_key = _FALLBACK_CONFIG_KEY
+            db[config_key] = parsed
+    for field in _DETAIL_CONFIG_KEYS.values():
         if field in item and item[field] is not None:
             val = item[field]
             db[field] = json.loads(val) if isinstance(val, str) else val

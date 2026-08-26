@@ -702,25 +702,22 @@ class TestObjectPropertyContext:
         client = AsyncMock()
         client.query.side_effect = [
             [{"cnt": "500"}],  # count (skip full context)
-            # _fetch_by_entities (entity fallback) — 2 classes to trigger OP fetch
+            # _fetch_by_entities class query — 2 classes to trigger OP fetch
             [
                 {
                     "class": "http://ex.org/ont#X",
                     "label": "X",
                     "parentClass": None,
-                    "property": None,
-                    "propLabel": None,
-                    "range": None,
                 },
                 {
                     "class": "http://ex.org/ont#Y",
                     "label": "Y",
                     "parentClass": None,
-                    "property": None,
-                    "propLabel": None,
-                    "range": None,
                 },
             ],
+            # _fetch_by_entities datatype-property query (split out so property-row
+            # volume cannot evict a matched class)
+            [],
             # Object properties
             [
                 {
