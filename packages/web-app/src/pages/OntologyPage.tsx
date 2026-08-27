@@ -40,6 +40,7 @@ import {
   loadFoundationalOntology,
   type FoundationalOntology,
   type OntologyRecord,
+  type ListedOntology,
   type Proposal,
 } from "../services/ontology-engine";
 import {
@@ -48,6 +49,11 @@ import {
   ApiError,
 } from "@components/ApiClientProvider";
 import { SortableTable } from "@components/SortableTable";
+import { OntologyDeleteWarning } from "@components/ontology/OntologyDeleteWarning";
+import {
+  ontologyTypeDisplay,
+  ontologyTypeGroup,
+} from "@utils/ontology-display";
 import { InductionStages } from "./ontology/induce/InductionStages";
 import Badge from "@cloudscape-design/components/badge";
 import SegmentedControl from "@cloudscape-design/components/segmented-control";
@@ -186,9 +192,7 @@ export function OntologyPage() {
     setFoundationalError(null);
     Promise.all([
       listFoundationalOntologies(apiClient, namespaceId),
-      listOntologies(apiClient, namespaceId).catch(
-        () => [] as OntologyRecord[],
-      ),
+      listOntologies(apiClient, namespaceId).catch((): ListedOntology[] => []),
     ])
       .then(([catalogResp, allLoaded]) => {
         if (cancelled) return;
@@ -211,10 +215,10 @@ export function OntologyPage() {
           loaded
             .filter(
               (r) =>
-                r.ontology_type === "induced" &&
+                r.ontologyType === "induced" &&
                 ontologyIngestState(r) === "ready",
             )
-            .map((r) => r.uri),
+            .map((r) => r.uri ?? ""),
         );
       })
       .catch((e: Error) => {
@@ -628,7 +632,7 @@ export function OntologyPage() {
                   <Link variant="info">Info</Link>
                 </Popover>
               }
-              description="Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip). Load foundational/uploaded ontologies from the Ontologies tab first."
+              description="Pick the ontologies to ground against for this run. Accepted induced ontologies are pre-selected (deselect to skip). Load foundational/uploaded ontologies from the Reference ontologies tab first."
               constraintText="Ontologies still embedding or failed to ingest are shown but not selectable."
             >
               {foundationalError && (
@@ -683,11 +687,11 @@ export function OntologyPage() {
                         : undefined;
                   return {
                     value: rec.uri,
-                    label: rec.title || rec.ontology_id,
+                    label: rec.title || rec.ontologyId,
                     labelTag:
-                      rec.ontology_type === "induced"
+                      rec.ontologyType === "induced"
                         ? "Induced"
-                        : rec.ontology_type === "foundational"
+                        : rec.ontologyType === "foundational"
                           ? "Foundational"
                           : "Uploaded",
                     description: statusLabel ?? rec.uri,
@@ -806,34 +810,6 @@ export function OntologyPage() {
  *  foundational ones are curated public ontologies loaded/uploaded into
  *  the namespace; user_created/user_uploaded are custom uploads. Anything
  *  unmapped falls back to its raw type string with a neutral badge. */
-const ONTOLOGY_TYPE_DISPLAY: Record<
-  string,
-  { label: string; color: "blue" | "green" | "grey" }
-> = {
-  induced: { label: "Induced", color: "grey" },
-  foundational: { label: "Foundational", color: "green" },
-  user_created: { label: "Uploaded", color: "blue" },
-  user_uploaded: { label: "Uploaded", color: "blue" },
-};
-
-export function ontologyTypeDisplay(type?: string | null): {
-  label: string;
-  color: "blue" | "green" | "grey";
-} {
-  if (!type) return { label: "Unknown", color: "grey" };
-  return ONTOLOGY_TYPE_DISPLAY[type] ?? { label: type, color: "grey" };
-}
-
-/** Which segment of the type filter a given ontology_type belongs to. */
-export function ontologyTypeGroup(
-  type?: string | null,
-): "induced" | "foundational" | "uploaded" | "other" {
-  if (type === "induced") return "induced";
-  if (type === "foundational") return "foundational";
-  if (type === "user_created" || type === "user_uploaded") return "uploaded";
-  return "other";
-}
-
 /**
  * Ingest lifecycle of a registered (loaded) reference ontology, derived from
  * its ``parse_status`` (async parse/embed worker) with a legacy fallback for
@@ -864,9 +840,9 @@ export const ONTOLOGY_INGEST_STATUS: Record<
  *  poll terminate. So: positive embeddings → ready first; then parse_status;
  *  then default to ingesting for a freshly-registered row with nothing yet. */
 export function ontologyIngestState(row: OntologyRecord): OntologyIngestState {
-  if (row.parse_status === "parse_error") return "failed";
-  if ((row.embedding_count ?? 0) > 0) return "ready";
-  if (row.parse_status === "ok") return "ready";
+  if (row.parseStatus === "parse_error") return "failed";
+  if ((row.embeddingCount ?? 0) > 0) return "ready";
+  if (row.parseStatus === "ok") return "ready";
   return "ingesting";
 }
 
@@ -942,23 +918,20 @@ export function resolveCompletedInductionAction(
  * namespace are surfaced as placeholder rows with `_available: true` so the
  * table can offer a "Load" action for them.
  */
-type OntologyRow = OntologyRecord & { _available?: boolean };
+type OntologyRow = ListedOntology & { _available?: boolean };
 
-/** Copy for the delete-confirm modal, keyed on ontology type.
- *
- *  Foundational ontologies are curated references that can be re-loaded from the
- *  catalog, so their removal is framed as reversible ("remove"). User-uploaded
- *  and induced ontologies are the user's own content — permanent once deleted.
- *  Exported as a pure function so the type-aware wording is unit-tested directly
- *  (driving the Cloudscape Modal open in jsdom is flaky). */
-export function deleteOntologyCopy(ontologyType: string): {
-  header: string;
-  reloadable: boolean;
-} {
-  if (ontologyTypeGroup(ontologyType) === "foundational") {
-    return { header: "Remove this foundational ontology?", reloadable: true };
-  }
-  return { header: "This action cannot be undone", reloadable: false };
+/** Columns the ontologies table sorts on; every one is an `OntologyRecord` field. */
+const ONTOLOGY_SORT_FIELDS: ReadonlySet<string> = new Set([
+  "title",
+  "ontologyType",
+  "classCount",
+  "propertyCount",
+  "createdAt",
+]);
+
+/** Narrows a Cloudscape `sortingField` to a real record key. */
+function isOntologySortField(field?: string): field is keyof OntologyRecord {
+  return !!field && ONTOLOGY_SORT_FIELDS.has(field);
 }
 
 function OntologiesTab({
@@ -974,7 +947,7 @@ function OntologiesTab({
   const [refreshKey, setRefreshKey] = useState(0);
   const [typeFilter, setTypeFilter] = useState("all");
   const [sortingColumn, setSortingColumn] = useState<
-    { sortingField: string } | undefined
+    { sortingField: keyof OntologyRecord } | undefined
   >({ sortingField: "title" });
   const [isDescending, setIsDescending] = useState(false);
   // Upload modal state
@@ -1015,7 +988,7 @@ function OntologiesTab({
     setDeleteBusy(true);
     setDeleteError(null);
     try {
-      await deleteOntology(apiClient, namespace, ontologyToDelete.ontology_id);
+      await deleteOntology(apiClient, namespace, ontologyToDelete.ontologyId);
       closeDeleteModal();
       setRefreshKey((k) => k + 1);
     } catch (e) {
@@ -1050,19 +1023,19 @@ function OntologiesTab({
         const placeholders: OntologyRow[] = catalog
           .filter((c) => !loadedUris.has(c.uri))
           .map((c) => ({
-            ontology_id: c.uri,
+            ontologyId: c.uri,
             uri: c.uri,
             title: c.title,
             description: c.description,
-            ontology_type: "foundational",
+            ontologyType: "foundational",
             format: c.format,
-            domain_tags: c.domain_tags,
-            class_count: 0,
-            property_count: 0,
-            axiom_count: 0,
-            embedding_count: 0,
-            created_at: "",
-            updated_at: "",
+            domainTags: c.domain_tags,
+            classCount: 0,
+            propertyCount: 0,
+            axiomCount: 0,
+            embeddingCount: 0,
+            createdAt: "",
+            updatedAt: "",
             _available: true,
           }));
         setItems([...registered, ...placeholders]);
@@ -1102,27 +1075,27 @@ function OntologiesTab({
   // Induced ontologies are surfaced as top-level cards above the list;
   // the list below shows only uploaded + foundational ontologies.
   const inducedOntologies = items.filter(
-    (e) => ontologyTypeGroup(e.ontology_type) === "induced",
+    (e) => ontologyTypeGroup(e.ontologyType) === "induced",
   );
   const nonInducedItems = items.filter(
-    (e) => ontologyTypeGroup(e.ontology_type) !== "induced",
+    (e) => ontologyTypeGroup(e.ontologyType) !== "induced",
   );
   const foundationalCount = nonInducedItems.filter(
-    (e) => ontologyTypeGroup(e.ontology_type) === "foundational",
+    (e) => ontologyTypeGroup(e.ontologyType) === "foundational",
   ).length;
   const uploadedCount = nonInducedItems.filter(
-    (e) => ontologyTypeGroup(e.ontology_type) === "uploaded",
+    (e) => ontologyTypeGroup(e.ontologyType) === "uploaded",
   ).length;
   const filteredItems =
     typeFilter === "all"
       ? nonInducedItems
       : nonInducedItems.filter(
-          (e) => ontologyTypeGroup(e.ontology_type) === typeFilter,
+          (e) => ontologyTypeGroup(e.ontologyType) === typeFilter,
         );
 
   const sortedItems = [...filteredItems].sort((a, b) => {
     if (!sortingColumn) return 0;
-    const field = sortingColumn.sortingField as keyof OntologyRecord;
+    const field = sortingColumn.sortingField;
     const av = a[field] ?? "";
     const bv = b[field] ?? "";
     const cmp =
@@ -1206,13 +1179,12 @@ function OntologiesTab({
       )}
       {ontologyToDelete &&
         (() => {
-          const deleteCopy = deleteOntologyCopy(ontologyToDelete.ontology_type);
           return (
             <Modal
               visible
               onDismiss={closeDeleteModal}
               header={`Delete ontology "${
-                ontologyToDelete.title || ontologyToDelete.ontology_id
+                ontologyToDelete.title || ontologyToDelete.ontologyId
               }"?`}
               footer={
                 <Box float="right">
@@ -1233,28 +1205,10 @@ function OntologiesTab({
               }
             >
               <SpaceBetween size="m">
-                {deleteCopy.reloadable ? (
-                  <Alert type="warning" header={deleteCopy.header}>
-                    Removing{" "}
-                    <b>
-                      {ontologyToDelete.title || ontologyToDelete.ontology_id}
-                    </b>{" "}
-                    deletes its graph triples and vector embeddings from this
-                    namespace, so it will no longer be available for grounding.
-                    It's a curated reference, so you can re-load it from the
-                    catalog afterward if needed.
-                  </Alert>
-                ) : (
-                  <Alert type="warning" header={deleteCopy.header}>
-                    Deleting{" "}
-                    <b>
-                      {ontologyToDelete.title || ontologyToDelete.ontology_id}
-                    </b>{" "}
-                    permanently removes its graph triples, vector embeddings,
-                    and registry entry from this namespace. This is your own
-                    content and cannot be recovered.
-                  </Alert>
-                )}
+                <OntologyDeleteWarning
+                  ontologyType={ontologyToDelete.ontologyType ?? ""}
+                  name={ontologyToDelete.title || ontologyToDelete.ontologyId}
+                />
                 {deleteError && (
                   <Alert type="error" header="Delete failed">
                     {deleteError}
@@ -1280,7 +1234,12 @@ function OntologiesTab({
         sortingColumn={sortingColumn}
         sortingDescending={isDescending}
         onSortingChange={({ detail }) => {
-          setSortingColumn(detail.sortingColumn as { sortingField: string });
+          // Cloudscape types `sortingField` as an optional plain string, so it
+          // is narrowed rather than asserted; an unrecognised field would sort
+          // on `undefined` for every row (see table-trackby.test.ts).
+          const field = detail.sortingColumn?.sortingField;
+          if (isOntologySortField(field))
+            setSortingColumn({ sortingField: field });
           setIsDescending(detail.isDescending ?? false);
         }}
         columnDefinitions={[
@@ -1290,7 +1249,7 @@ function OntologiesTab({
             sortingField: "title",
             cell: (e) => (
               <SpaceBetween size="xxxs">
-                <Box>{e.title || e.ontology_id}</Box>
+                <Box>{e.title || e.ontologyId}</Box>
                 <Box variant="small" color="text-status-inactive">
                   {e.uri}
                 </Box>
@@ -1300,33 +1259,33 @@ function OntologiesTab({
           {
             id: "type",
             header: "Type",
-            sortingField: "ontology_type",
+            sortingField: "ontologyType",
             cell: (e) => {
               const isAvailable = e._available;
               if (isAvailable) {
                 return <Badge color="green">Foundational</Badge>;
               }
-              const { label, color } = ontologyTypeDisplay(e.ontology_type);
+              const { label, color } = ontologyTypeDisplay(e.ontologyType);
               return <Badge color={color}>{label}</Badge>;
             },
           },
           {
             id: "classes",
             header: "Classes",
-            sortingField: "class_count",
-            cell: (e) => e.class_count,
+            sortingField: "classCount",
+            cell: (e) => e.classCount,
           },
           {
             id: "properties",
             header: "Properties",
-            sortingField: "property_count",
-            cell: (e) => e.property_count,
+            sortingField: "propertyCount",
+            cell: (e) => e.propertyCount,
           },
           {
             id: "created",
             header: "Created",
-            sortingField: "created_at",
-            cell: (e) => formatTimestamp(e.created_at),
+            sortingField: "createdAt",
+            cell: (e) => formatTimestamp(e.createdAt),
           },
           {
             id: "actions",
@@ -1337,15 +1296,15 @@ function OntologiesTab({
               // Status column). A row can't be both — _available is set only on
               // placeholder catalog entries that have no registry row.
               if (e._available) {
-                const entry = catalogByUri.get(e.uri);
+                const entry = catalogByUri.get(e.uri ?? "");
                 if (!entry) return null;
                 return (
                   <Button
                     variant="inline-link"
-                    loading={loadingUris.has(e.uri)}
+                    loading={loadingUris.has(e.uri ?? "")}
                     onClick={async () => {
                       if (!namespace) return;
-                      setLoadingUris((s) => new Set(s).add(e.uri));
+                      setLoadingUris((s) => new Set(s).add(e.uri ?? ""));
                       try {
                         // POST returns 202 after synchronously creating an
                         // `ingesting` registry row (the ECS task fetches + embeds
@@ -1370,7 +1329,7 @@ function OntologiesTab({
                       } finally {
                         setLoadingUris((s) => {
                           const next = new Set(s);
-                          next.delete(e.uri);
+                          next.delete(e.uri ?? "");
                           return next;
                         });
                         setRefreshKey((k) => k + 1);
@@ -1400,9 +1359,11 @@ function OntologiesTab({
               // while induced ontologies exist (they're grounded against it, so it
               // would leave them dangling — the API returns 409). Disable Delete
               // proactively + explain why, instead of letting the user click into
-              // a guaranteed error. Induced ontologies delete from their own card.
+              // a guaranteed error. Induced ontologies aren't listed here at all
+              // (this table is non-induced only) — they delete from their detail
+              // page, reached via Explorer → Ontologies.
               const blockedByInduced =
-                ontologyTypeGroup(e.ontology_type) !== "induced" &&
+                ontologyTypeGroup(e.ontologyType) !== "induced" &&
                 inducedOntologies.length > 0;
               const deleteButton = (
                 <Button
@@ -1427,7 +1388,7 @@ function OntologiesTab({
                       dismissButton={false}
                       position="top"
                       triggerType="custom"
-                      content="Delete the induced ontology first — it's grounded against this reference, so this can't be removed while it exists."
+                      content="Delete the induced ontology first — it's grounded against this reference, so this can't be removed while it exists. Open it from Explorer → Ontologies and use Delete ontology there."
                     >
                       {deleteButton}
                     </Popover>
