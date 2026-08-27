@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
@@ -41,6 +42,7 @@ class StrategyOption(StrEnum):
     NL_TO_SQL = "nl_to_sql"  # Only NL→SQL / identifies nl_to_sql strategy
     ONTOP_FIRST = "ontop_first"  # Sequential: Ontop → NL→SQL fallback
     NL_TO_SQL_FIRST = "nl_to_sql_first"  # Sequential: NL→SQL → Ontop fallback
+    AGENTIC = "agentic"  # Only the bounded tool-use agent (opt-in; never a fallback)
 
 
 DEFAULT_STRATEGY = StrategyOption.NL_TO_SQL_FIRST
@@ -127,6 +129,21 @@ def capped_max_rows(options: dict[str, Any]) -> int:
     return min(options.get("maxResults", MAX_RESULT_ROWS), MAX_RESULT_ROWS)
 
 
+# Upper bound on user-provided evidence/hint text folded into a generation prompt.
+# Keeps token spend + prompt-injection surface bounded regardless of what the
+# caller passes. Overridable via SERVE_EVIDENCE_MAX_CHARS for hard datasets.
+_DEFAULT_EVIDENCE_MAX_CHARS = 500
+
+
+def capped_evidence(evidence: str) -> str:
+    """Truncate user-provided evidence to the configured character cap."""
+    try:
+        limit = max(0, int(os.environ.get("SERVE_EVIDENCE_MAX_CHARS", str(_DEFAULT_EVIDENCE_MAX_CHARS))))
+    except (TypeError, ValueError):
+        limit = _DEFAULT_EVIDENCE_MAX_CHARS
+    return (evidence or "")[:limit]
+
+
 # Empirically-ordered strategy precedence for parallel ("best") selection.
 # LOWER number wins. Ordered by measured reliability on the 22-query TPC-H
 # benchmark, NOT by architectural authority:
@@ -209,19 +226,26 @@ class StructuredQueryTier:
 
     def _strategies_for(self, option: str) -> list[StructuredQueryStrategy]:
         """Select and order strategies based on the option."""
+        if option == StrategyOption.AGENTIC:
+            # Opt-in only: the agent runs solely when explicitly pinned, never as a
+            # fallback in any of the sequential/parallel paths below.
+            return [s for s in self._strategies if s.name == StrategyOption.AGENTIC]
         if option == StrategyOption.ONTOP:
             return [s for s in self._strategies if s.name == StrategyOption.ONTOP]
         if option == StrategyOption.NL_TO_SQL:
             return [s for s in self._strategies if s.name == StrategyOption.NL_TO_SQL]
+        # AGENTIC is never part of a fallback chain — it is an expensive tool-use
+        # loop that must not fire implicitly when a cheaper strategy misses.
+        fallback = [s for s in self._strategies if s.name != StrategyOption.AGENTIC]
         if option == StrategyOption.ONTOP_FIRST:
             # Stable sort: matching strategy moves to front; others keep insertion order.
-            return sorted(self._strategies, key=lambda s: s.name != StrategyOption.ONTOP)
+            return sorted(fallback, key=lambda s: s.name != StrategyOption.ONTOP)
         if option == StrategyOption.NL_TO_SQL_FIRST:
-            return sorted(self._strategies, key=lambda s: s.name != StrategyOption.NL_TO_SQL)
+            return sorted(fallback, key=lambda s: s.name != StrategyOption.NL_TO_SQL)
         # "best" or unrecognized — use all in configured order
         if option != StrategyOption.BEST:
             logger.debug("strategy_option_passthrough", option=option)
-        return list(self._strategies)
+        return fallback
 
     async def _resolve_sequential(
         self, query: str, namespace: str, context: StrategyContext, strategies: list[StructuredQueryStrategy]

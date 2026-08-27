@@ -118,7 +118,7 @@ def test_all_table_matches_reach_s3_no_truncation() -> None:
         def induce(self, **kwargs):
             fake_graph = MagicMock()
             fake_graph.serialize.return_value = "@prefix : <#> ."
-            return fake_graph, {f"t{i}" for i in range(75)}, matches
+            return fake_graph, {f"t{i}" for i in range(75)}, matches, []
 
         def build_r2rml(self, **kwargs):
             fake_graph = MagicMock()
@@ -247,7 +247,7 @@ def test_all_column_level_matches_yields_empty_table_matches() -> None:
         def induce(self, **kwargs):
             fake_graph = MagicMock()
             fake_graph.serialize.return_value = "@prefix : <#> ."
-            return fake_graph, {"t0"}, matches
+            return fake_graph, {"t0"}, matches, []
 
         def build_r2rml(self, **kwargs):
             fake_graph = MagicMock()

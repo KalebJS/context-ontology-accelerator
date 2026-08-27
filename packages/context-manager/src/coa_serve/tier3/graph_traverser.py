@@ -18,15 +18,40 @@ import structlog
 
 from ..clients.base import GraphClient
 from ..query_utils import (
-    extract_query_entities,
+    MAX_QUERY_CODEPOINTS,
+    MAX_SEARCH_TOKEN_CODEPOINTS,
+    build_query_search_plan,
+    escape_sparql_string_literal,
     get_graph_uri_template,
+    is_semantic_search_token,
     namespace_graph_prefix,
+    normalize_label_match_text,
     validate_namespace,
 )
 
 logger = structlog.get_logger(__name__)
 
-_SAFE_ENTITY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+# Safety gate for a keyword before it is interpolated into a SPARQL string
+# literal (``CONTAINS(LCASE(?label), "…")`` in _build_label_query).
+#
+# Defined by what is DANGEROUS rather than by an ASCII allowlist. The previous
+# ``^[a-z0-9][a-z0-9_-]{0,63}$`` rejected every keyword in a non-Latin script and
+# every accented Latin one, so a Japanese or German query reached this stage with
+# tokens and left it with none — Tier-3's keyword hop then returned nothing, for
+# the languages the feature exists to serve.
+#
+# What the gate has to stop is escaping the literal. ``_build_label_query``
+# already escapes backslash and double-quote, which covers the direct break-out;
+# what escaping does NOT handle is a raw line terminator, because a SPARQL short
+# string literal (''STRING_LITERAL2'') may not contain one — so a newline would
+# end the literal and put the rest of the token into query position. Control
+# characters are rejected here for that reason, and because no legitimate keyword
+# contains one.
+#
+# The length bound stays: it is a cost guard on the generated query, not a
+# character-class judgement. Counted in characters, so a CJK keyword is not
+# penalised for encoding to more bytes.
+_UNSAFE_ENTITY_RE = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 # URI safety gate for SPARQL <uri> interpolation. Permits the '#' fragment
 # separator — ontology class/property URIs are of the form
 # "https://.../pcinsurance#Claim", and '#' is a legal URI character that is
@@ -81,17 +106,36 @@ class GraphTraverser:
             return []
 
         if not entities:
-            entities = extract_query_entities(query, max_count=5)
-        if not entities:
+            search_plan = build_query_search_plan(query, max_count=5)
+            safe_entities = self._sanitize_entities(list(search_plan.terms))
+            safe_containers = self._sanitize_containers(list(search_plan.containers))
+        else:
+            safe_entities = self._sanitize_entities(entities)
+            safe_containers = []
+        if not safe_entities and not safe_containers:
+            logger.info(
+                "graph_traverse_no_search_candidates",
+                namespace=namespace,
+                query_length=len(query),
+                explicit_entity_count=len(entities or []),
+            )
             return []
 
-        safe_entities = self._sanitize_entities(entities)
-        if not safe_entities:
-            return []
-
-        sparql = self._build_label_query(namespace, safe_entities)
+        sparql = self._build_label_query(namespace, safe_entities, safe_containers)
         results = await asyncio.wait_for(self._graph.query(sparql), timeout=_GRAPH_QUERY_TIMEOUT_S)
-        return self._parse_results(results)
+        parsed = self._parse_results(results)
+        if len(results) >= _MAX_TRAVERSAL_RESULTS:
+            # The row cap was reached, so Neptune's row order decided which matches
+            # survived. Mirrors the count logging traverse_from_uris already does.
+            logger.info(
+                "graph_traverse_results_truncated",
+                namespace=namespace,
+                limit=_MAX_TRAVERSAL_RESULTS,
+                term_count=len(safe_entities),
+                container_count=len(safe_containers),
+                entity_count=len(parsed),
+            )
+        return parsed
 
     async def traverse_from_uris(self, uris: list[str], namespace: str, max_hops: int = 2) -> list[GraphEntity]:
         """URI-based hop traversal: 1-2 hops outward from known entity URIs."""
@@ -120,7 +164,49 @@ class GraphTraverser:
 
     @staticmethod
     def _sanitize_entities(entities: list[str]) -> list[str]:
-        return [e.lower() for e in entities if _SAFE_ENTITY_RE.match(e.lower())]
+        """Keep bounded semantic keywords that are safe in a SPARQL literal.
+
+        Rejects on danger (control characters, line separators, over-length)
+        rather than on an ASCII allowlist. A candidate must also contain an
+        actual letter or number so punctuation-, emoji-, underscore-, or
+        extender-only values cannot consume query budget. Quote and backslash
+        remain valid inside a semantic term and are escaped by
+        :meth:`_build_label_query`.
+
+        Normalization is shared with :func:`extract_query_entities` and mirrors
+        the stored-label comparison, ``LCASE(?label)``. In particular, this is
+        ``lower()``, not ``casefold()`` or a query-only NFC/NFKC transform.
+        """
+        out: list[str] = []
+        for entity in entities:
+            folded = normalize_label_match_text(entity)
+            if not folded or len(folded) > MAX_SEARCH_TOKEN_CODEPOINTS:
+                continue
+            if _UNSAFE_ENTITY_RE.search(folded) or not is_semantic_search_token(folded):
+                continue
+            out.append(folded)
+        return out
+
+    @staticmethod
+    def _sanitize_containers(containers: list[str]) -> list[str]:
+        """Keep reverse-containment haystacks that are safe in a SPARQL literal.
+
+        A container is the query itself rather than a segmented token, so
+        :data:`MAX_SEARCH_TOKEN_CODEPOINTS` deliberately does not apply — that bound
+        exists to keep a single needle cheap, and enforcing it here would discard
+        exactly the long no-space clauses reverse containment serves. The length is
+        already bounded by :data:`MAX_QUERY_CODEPOINTS` at every ingress, which is
+        re-asserted here because this method also runs for internal callers.
+        """
+        out: list[str] = []
+        for container in containers:
+            folded = normalize_label_match_text(container)
+            if not folded or len(folded) > MAX_QUERY_CODEPOINTS:
+                continue
+            if _UNSAFE_ENTITY_RE.search(folded) or not is_semantic_search_token(folded):
+                continue
+            out.append(folded)
+        return out
 
     def _graph_uri_prefix(self, namespace: str) -> str:
         """Build namespace graph URI prefix for STRSTARTS filtering.
@@ -132,12 +218,28 @@ class GraphTraverser:
         """
         return namespace_graph_prefix(self._graph_uri_template, namespace)
 
-    def _build_label_query(self, namespace: str, entities: list[str]) -> str:
-        def _escape(s: str) -> str:
-            return s.replace(chr(0x5C), chr(0x5C) + chr(0x5C)).replace(chr(0x22), chr(0x5C) + chr(0x22))
-
-        filters = " || ".join(f'CONTAINS(LCASE(?label), "{_escape(e)}")' for e in entities)
+    def _build_label_query(self, namespace: str, terms: list[str], containers: list[str] | None = None) -> str:
+        forward_filters = [f'CONTAINS(LCASE(?label), "{escape_sparql_string_literal(term)}")' for term in terms]
+        # ``STR()`` is required on the reverse arm and not on the forward one:
+        # SPARQL argument compatibility accepts CONTAINS(lang-tagged, simple) but
+        # rejects CONTAINS(simple, lang-tagged) as a type error, which FILTER then
+        # swallows as false. Without STR() every ``@ja``/``@th`` label would be
+        # invisible to reverse containment. STRLEN keeps a one-character label from
+        # matching any query that happens to contain that character.
+        reverse_filters = [
+            f'(STRLEN(STR(?label)) >= 2 && CONTAINS("{escape_sparql_string_literal(container)}", LCASE(STR(?label))))'
+            for container in containers or []
+        ]
+        filters = " || ".join(forward_filters + reverse_filters)
         graph_uri_prefix = self._graph_uri_prefix(namespace)
+        # Ordering is for DETERMINISM only, deliberately not for relevance. The two
+        # arms want opposite orders — a forward match is most specific when the
+        # label is SHORTEST (an exact hit), a reverse match when the label is
+        # LONGEST (a short one may have matched by straddling a word boundary) — so
+        # any single sort key demotes one of them. Sorting by label length was tried
+        # and put the exact ``claim`` hit last. ?entity keeps truncation reproducible
+        # across identical requests without claiming a relevance order the query
+        # cannot express.
         return f"""
         SELECT ?entity ?label ?type ?predicate ?related ?relLabel
         WHERE {{
@@ -151,7 +253,9 @@ class GraphTraverser:
             }}
           }}
           FILTER(STRSTARTS(STR(?g), "{graph_uri_prefix}"))
-        }} LIMIT {_MAX_TRAVERSAL_RESULTS}
+        }}
+        ORDER BY ?entity
+        LIMIT {_MAX_TRAVERSAL_RESULTS}
         """
 
     def _build_hop_query(self, namespace: str, uris: list[str], max_hops: int) -> str:

@@ -455,3 +455,32 @@ class TestResultPagination:
         res, _ = await self._run(pages, 1000)
         assert res.row_count == 0
         assert res.truncated is False
+
+
+@pytest.mark.unit
+class TestInjectLimitTrailingComment:
+    """Regression: a trailing ``-- comment`` line must not swallow the appended LIMIT.
+
+    Every textual-append fallback in ``_inject_limit`` used to append
+    `` LIMIT n`` to the last line. LLM-generated SQL frequently ends with a
+    ``-- comment`` line, so the cap landed inside the comment: the query
+    parsed fine server-side and executed WITHOUT the scan cap.
+    """
+
+    def test_no_limit_with_trailing_comment_appends_on_new_line(self):
+        sql = "SELECT a FROM t\n-- assumption: default scope"
+        out = AthenaQueryExecutor._inject_limit(sql, 1000)
+        assert out.splitlines()[-1].strip() == "LIMIT 1000", out
+
+    def test_parse_failure_with_trailing_comment_appends_on_new_line(self):
+        sql = "NOT VALID SQL AT ALL\n-- trailing"
+        out = AthenaQueryExecutor._inject_limit(sql, 500)
+        assert out.splitlines()[-1].strip() == "LIMIT 500", out
+
+    def test_normal_append_still_caps(self):
+        out = AthenaQueryExecutor._inject_limit("SELECT a FROM t", 100)
+        assert "LIMIT 100" in out
+
+    def test_existing_outer_limit_within_cap_unchanged(self):
+        sql = "SELECT a FROM t LIMIT 5"
+        assert AthenaQueryExecutor._inject_limit(sql, 100) == sql

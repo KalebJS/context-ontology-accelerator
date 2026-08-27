@@ -26,14 +26,14 @@ pytestmark = pytest.mark.unit
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SCRIPT = _REPO_ROOT / "tests" / "cdk" / "scripts" / "exec_oracle_sql.py"
-_SEED_SCRIPT = _REPO_ROOT / "tests" / "cdk" / "scripts" / "load-oracle-data.sh"
+_SEED_SQL = _REPO_ROOT / "tests" / "cdk" / "oracle-seed" / "seed.sql"
 
 # `tests/unit/` is published to the public mirror but `tests/cdk/` is not (see the
 # allowlist in .npmignore). Without this guard the module-level load below raises
 # FileNotFoundError during collection, which pytest reports as a collection error
 # and aborts the WHOLE suite — the mirror's unit-test job fails with exit 2 having
 # run nothing. Skip instead: there is no script to pin in that checkout.
-if not _SCRIPT.exists() or not _SEED_SCRIPT.exists():
+if not _SCRIPT.exists() or not _SEED_SQL.exists():
     pytest.skip("tests/cdk/ is absent from this checkout (public mirror)", allow_module_level=True)
 
 
@@ -90,9 +90,12 @@ def test_real_seed_script_yields_the_expected_ddl() -> None:
 
     Guards the case that matters — a splitter change that quietly drops half the
     schema would otherwise only show up as an Oracle scan finding fewer tables.
+
+    Reads oracle-seed/seed.sql directly (the single source of truth both the
+    manual load-oracle-data.sh path and the container's first-boot seed use) —
+    not extracted from a heredoc in the shell script, which no longer exists.
     """
-    sql = _SEED_SCRIPT.read_text()
-    body = sql.split("<<'SQL'", 1)[1].split("\nSQL\n", 1)[0]
+    body = _SEED_SQL.read_text()
     statements = _mod.split_statements(body)
 
     creates = [s for s in statements if s.upper().startswith("CREATE TABLE")]

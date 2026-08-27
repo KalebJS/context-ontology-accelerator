@@ -1073,3 +1073,32 @@ class TestSelectExpressionTranspileRoundTrip:
             transpiled = self._executor_transpile(selected, engine)
             # Should not raise UnsafeSQLError / parse error.
             SQLFirewall().validate(transpiled, dialect=engine)
+
+
+@pytest.mark.unit
+class TestResidualTokensKorean:
+    """The residual gate must see Korean: an ASCII-only tokenizer produces zero
+    residual tokens for Korean questions, silently disabling the partial-match
+    bypass for them (GitHub issue #95)."""
+
+    def _res(self, q, syn):
+        from coa_serve.tier1.metric_resolver import residual_tokens
+
+        i = q.lower().find(syn.lower())
+        assert i >= 0
+        return residual_tokens(q.lower(), [(i, i + len(syn))])
+
+    def test_unknown_game_name_survives_as_residual(self):
+        assert self._res("실버윙 어제 매출 알려줘", "어제 매출") == ["실버윙"]
+
+    def test_second_metric_request_survives(self):
+        res = self._res("어제 이탈 유저 수와 복귀 유저 수 같이 보여줘", "어제 이탈 유저")
+        assert "복귀" in res
+
+    def test_korean_scaffolding_is_stopworded(self):
+        assert self._res("어제 이탈한 유저 수 알려줘", "어제 이탈한 유저") == []
+        assert self._res("어제 복귀한 유저 수 알려줘", "어제 복귀한 유저") == []
+
+    def test_condition_qualifier_survives(self):
+        res = self._res("누적 결제 100만원 이상 유저의 어제 매출 알려줘", "어제 매출")
+        assert "누적" in res and "100만원" in res

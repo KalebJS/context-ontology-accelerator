@@ -230,7 +230,7 @@ def test_strategy_still_falls_back_on_non_transport_error():
     )
 
     with patch("coa_ontology.inducer.strategies.table_to_ontology.log") as mock_log:
-        _graph, novel, matches = TableToOntologyStrategy().induce(
+        _graph, novel, matches, dropped = TableToOntologyStrategy().induce(
             tables=[table],
             ontology_uri_prefix="http://ex.org/induced#",
             config={},

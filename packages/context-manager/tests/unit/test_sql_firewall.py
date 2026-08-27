@@ -223,6 +223,32 @@ class TestSQLFirewallEvaluate:
         with pytest.raises(UnsafeSQLError):
             fw.evaluate("DROP TABLE orders")
 
+    def test_evaluate_accepts_dialect_kwarg(self):
+        """Regression: evaluate() must accept a ``dialect`` kwarg. The shared
+        execution primitive calls ``evaluate(sql, profile, namespace=..., dialect=...)``;
+        a signature without ``dialect`` raises TypeError there (uncaught — only
+        UnsafeSQLError is handled), so every execution fails and the agentic arm
+        returns no executed SQL. Cedar is stubbed out to isolate the structural check."""
+        from coa_serve.tier2.cedar_authorizer import NullCedarAuthorizer
+
+        fw = SQLFirewall(cedar_authorizer=NullCedarAuthorizer())
+        result = fw.evaluate("SELECT * FROM orders", profile={}, namespace="ns", dialect="trino")
+        assert not result.denied
+
+    def test_evaluate_threads_dialect_to_validate(self):
+        """evaluate() must pass ``dialect`` through to validate() so an already-
+        transpiled engine-specific statement isn't rejected as unparseable trino.
+        ``APPROXIMATE COUNT(DISTINCT …)`` is Redshift-only syntax."""
+        from coa_serve.tier2.cedar_authorizer import NullCedarAuthorizer
+
+        fw = SQLFirewall(cedar_authorizer=NullCedarAuthorizer())
+        redshift_sql = "SELECT APPROXIMATE COUNT(DISTINCT customer) AS c FROM orders"
+        # Default (trino) reader can't parse it → spurious safety rejection.
+        with pytest.raises(UnsafeSQLError, match="Failed to parse SQL statement"):
+            fw.evaluate(redshift_sql, profile={})
+        # Redshift reader parses it cleanly → allowed.
+        assert not fw.evaluate(redshift_sql, profile={}, dialect="redshift").denied
+
 
 @pytest.mark.unit
 class TestSQLFirewallExtractTables:

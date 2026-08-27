@@ -163,6 +163,18 @@ _RESIDUAL_STOP_WORD_GROUPS = (
     "hello hi hiya hey greetings thanks thank thankyou thx cheers regards welcome",
     # Units and currencies — "revenue in USD" asks nothing extra of the SQL.
     "usd eur gbp jpy cad aud chf cny inr dollar dollars euro euros pound pounds yen currency percent percentage pct",
+    # Korean question scaffolding — the Korean counterparts of the groups above:
+    # request verbs ("tell/show me"), question words, counters that restate the
+    # metric's own aggregate (수/명/건), and connective padding. Same closed-list
+    # philosophy: an unlisted harmless word demotes to Tier 2 (slower, still
+    # answerable). Korean particles need no entries of their own because they
+    # attach to the preceding word (tokens are whitespace-delimited chunks).
+    "알려줘 알려줘요 알려주세요 알려주라 보여줘 보여줘요 보여주세요 구해줘 구해줘요 구해주세요"
+    " 말해줘 말해주세요 해줘 해주세요 주세요 줘 좀 부탁해 부탁드립니다"
+    " 얼마야 얼마 얼마나 얼마인지 몇 몇이야 몇인지 언제야 언제 언제인지 무엇 뭐야 뭐 뭔지"
+    " 궁금해 궁금합니다 확인해줘 확인 조회해줘 조회 정리해줘 정리"
+    " 수 수는 수와 수를 수가 명 명이야 건 개 값은 값이"
+    " 그리고 및 랑 이랑 하고 같이 함께 기준 기준으로 대해 대한 관련",
 )
 
 _RESIDUAL_STOP_WORDS = frozenset(word for group in _RESIDUAL_STOP_WORD_GROUPS for word in group.split())
@@ -193,7 +205,10 @@ the bug this gate exists to close):
 # Punctuation that never carries a qualifier. Tokenising on word characters alone
 # would silently drop a hyphenated or possessive qualifier, so we split on
 # non-word runs and keep every word-ish token.
-_RESIDUAL_TOKEN_RE = re.compile(r"[a-z0-9_%$]+")
+# Hangul syllables are included: an ASCII-only pattern produces zero residual
+# tokens for Korean questions, so every Korean question sailed through the
+# gate as if it had no unconsumed qualifiers (GitHub issue #95).
+_RESIDUAL_TOKEN_RE = re.compile(r"[a-z0-9_%$\uac00-\ud7a3]+")
 
 _FUZZY_MATCH_THRESHOLD = 0.88
 """Minimum SequenceMatcher ratio for a fuzzy metric near-miss to be accepted.
