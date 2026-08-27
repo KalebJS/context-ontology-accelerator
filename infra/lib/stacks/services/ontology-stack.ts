@@ -24,7 +24,11 @@ import { Paths } from "../../paths";
 import { resolveContext } from "../../context";
 import { bundlePython } from "../../utils/python-bundling";
 import { NetworkStack } from "../foundation/network-stack";
-import { DEFAULT_BEDROCK_MODEL_ID } from "../../constants";
+import {
+  DEFAULT_BEDROCK_MODEL_ID,
+  DEFAULT_BEDROCK_CHAT_MODEL_ID,
+  DEFAULT_BEDROCK_INDUCTION_MODEL_ID,
+} from "../../constants";
 
 export interface OntologyStackProps extends cdk.StackProps {
   readonly network: NetworkStack;
@@ -50,6 +54,16 @@ export interface OntologyStackProps extends cdk.StackProps {
   readonly desiredCount?: number;
   /** Shared Cloud Map private DNS namespace for service discovery. */
   readonly serviceNamespace: servicediscovery.IPrivateDnsNamespace;
+  /**
+   * Bedrock model IDs, resolved from the SSM deploy config (#94). Omitted →
+   * the shared defaults apply, so a deployment that configures nothing behaves
+   * exactly as before. Set these to deploy outside the US, where the default
+   * `us.` inference profiles are not invocable.
+   */
+  readonly bedrockEmbedModelId?: string;
+  readonly bedrockEmbedDimensions?: number;
+  readonly bedrockInductionLlmModelId?: string;
+  readonly bedrockChatModelId?: string;
   readonly alarmAction?: IAlarmActionStrategy;
 }
 
@@ -85,6 +99,20 @@ export class OntologyStack extends SCLStack {
     const { ssmPrefix } = resolveContext(this.node);
     const vpc = props.network.vpc;
     const ecsSecurityGroup = props.network.ecsSecurityGroup;
+
+    // ── Bedrock model IDs (#94) ────────────────────────────────────────
+    // Resolved ONCE here so the container environment, the IAM grants, and the
+    // cost dashboard's ModelId dimensions all derive from the same value. They
+    // used to be independent literals in this file, so changing the model for a
+    // non-US deploy left the dashboard querying a model nothing invokes (empty
+    // widgets). Config wins when set; otherwise the shared defaults apply, so a
+    // deployment configuring nothing is unchanged.
+    const embedModelId = props.bedrockEmbedModelId ?? DEFAULT_BEDROCK_MODEL_ID;
+    const embedDimensions = String(props.bedrockEmbedDimensions ?? 1024);
+    const inductionModelId =
+      props.bedrockInductionLlmModelId ?? DEFAULT_BEDROCK_INDUCTION_MODEL_ID;
+    const chatModelId =
+      props.bedrockChatModelId ?? DEFAULT_BEDROCK_CHAT_MODEL_ID;
 
     // ── OpenSearch config via SSM ──────────────────────────────────────
     const opensearchEndpoint = ssm.StringParameter.valueForStringParameter(
@@ -222,14 +250,19 @@ export class OntologyStack extends SCLStack {
         OSS_ENDPOINT: opensearchEndpoint,
         OSS_REGION: cdk.Aws.REGION,
         OSS_INDEX: opensearchCollectionName,
-        OSS_DIMENSIONS: "1024",
+        OSS_DIMENSIONS: embedDimensions,
         ONTOLOGY_ARTIFACTS_BUCKET: props.ontologyArtifactsBucket.bucketName,
         DYNAMODB_TABLE: this.table.tableName,
         DYNAMODB_REGION: cdk.Aws.REGION,
         BEDROCK_REGION: cdk.Aws.REGION,
-        BEDROCK_EMBED_MODEL_ID: DEFAULT_BEDROCK_MODEL_ID,
-        BEDROCK_EMBED_DIMENSIONS: "1024",
-        LLM_MODEL_ID: "us.anthropic.claude-sonnet-4-6",
+        BEDROCK_EMBED_MODEL_ID: embedModelId,
+        BEDROCK_EMBED_DIMENSIONS: embedDimensions,
+        LLM_MODEL_ID: inductionModelId,
+        // Description generation reads its own variable (main.py) — set it from
+        // the same resolved value so it cannot silently stay on a `us.` profile.
+        DESCRIPTION_LLM_MODEL_ID: inductionModelId,
+        // Shared BedrockClient default (constraint inference / nl_generator).
+        BEDROCK_CHAT_MODEL_ID: chatModelId,
         LLM_REGION: cdk.Aws.REGION,
         // SSM path to the Bedrock guardrail id — the app resolves it at runtime
         // and applies content filtering to LLM calls (constraint inference).
@@ -693,9 +726,12 @@ export class OntologyStack extends SCLStack {
         label: `${modelId} ${metricName}`,
       });
 
-    const rerankModelId = "us.anthropic.claude-sonnet-4-6"; // configured LLM_MODEL_ID
-    const haikuModelId = "us.anthropic.claude-haiku-4-5-20251001-v1:0"; // actual rerank/enrichment invoker
-    const embedModelId = "us.cohere.embed-v4:0";
+    // Dashboard ModelId dimensions come from the SAME resolved values as the
+    // container environment above (#94) — they used to be duplicate literals, so
+    // a model change for a non-US deploy left these widgets querying a
+    // dimension with no data.
+    const rerankModelId = inductionModelId; // configured LLM_MODEL_ID
+    const haikuModelId = chatModelId; // actual rerank/enrichment invoker
 
     // ponytail: Hardcoded us-west-2 on-demand list prices (USD per 1K tokens) as of
     // 2026-07-21 — CloudWatch math cannot look prices up, so these MUST be updated by

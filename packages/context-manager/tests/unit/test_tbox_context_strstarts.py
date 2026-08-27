@@ -135,6 +135,132 @@ class TestTBoxContextIsMappedFilter:
         sparql = graph_client.query.call_args[0][0]
         assert f"<{_IS_MAPPED_IRI}> true" in sparql
 
+    async def test_fetch_by_entities_preserves_unicode_graphemes(self, tbox_builder, graph_client):
+        await tbox_builder._fetch_by_entities("İstanbul कर्मचारी เครื่องปรับอากาศ", "ns-x")
+
+        sparql = graph_client.query.call_args[0][0]
+        assert 'CONTAINS(LCASE(?label), "i̇stanbul")' in sparql
+        assert 'CONTAINS(LCASE(?label), "कर्मचारी")' in sparql
+        assert 'CONTAINS(LCASE(?label), "เครื่องปรับอากาศ")' in sparql
+        assert f"<{_IS_MAPPED_IRI}> true" in sparql
+
+    async def test_fetch_by_entities_uses_bounded_reverse_containment_for_no_space_scripts(
+        self, tbox_builder, graph_client
+    ):
+        await tbox_builder._fetch_by_entities("请告诉我这台空调设备的制造商和型号", "ns-x")
+
+        sparql = graph_client.query.call_args[0][0]
+        assert 'CONTAINS("请告诉我这台空调设备的制造商和型号", LCASE(STR(?label)))' in sparql
+        assert "STRLEN(STR(?label)) >= 2" in sparql
+        assert 'CONTAINS(LCASE(?label), "请告")' not in sparql
+
+    async def test_fetch_by_entities_keeps_japanese_suffix_concepts(self, tbox_builder, graph_client):
+        await tbox_builder._fetch_by_entities(
+            "この施設に設置されているエレベーターのメーカーと型番を教えて",
+            "ns-x",
+        )
+
+        sparql = graph_client.query.call_args[0][0]
+        assert 'CONTAINS(LCASE(?label), "エレベーター")' in sparql
+        assert 'CONTAINS(LCASE(?label), "メーカー")' in sparql
+        assert 'CONTAINS(LCASE(?label), "型番")' in sparql
+
+    async def test_fetch_by_entities_skips_the_query_when_no_candidate_survives(self, tbox_builder, graph_client):
+        classes, properties = await tbox_builder._fetch_by_entities("of the", "ns-x")
+
+        assert (classes, properties) == ([], [])
+        graph_client.query.assert_not_called()
+
+    async def test_fetch_by_entities_keeps_matched_classes_when_property_rows_would_truncate(
+        self, tbox_builder, graph_client
+    ):
+        """A matched class must survive property-row volume.
+
+        Joined against the datatype OPTIONAL, one class fans out to
+        (properties x distinct values) rows; past the row cap, with no ORDER BY, a
+        class vanished from the parsed result and therefore from the prompt.
+        Reverse containment made that reachable by matching far more classes.
+        """
+        class_rows = [
+            {"class": f"https://ex.org/o#C{index}", "label": f"C{index}", "parentClass": None} for index in range(40)
+        ]
+        prop_rows = [
+            {"class": "https://ex.org/o#C0", "property": f"https://ex.org/o#p{index}", "propLabel": f"p{index}"}
+            for index in range(2000)
+        ]
+        graph_client.query = AsyncMock(side_effect=[class_rows, prop_rows])
+
+        classes, _properties = await tbox_builder._fetch_by_entities("空調設備型番", "ns-x")
+
+        assert {c["uri"] for c in classes} == {f"https://ex.org/o#C{index}" for index in range(40)}
+
+    async def test_fetch_by_entities_degrades_to_classes_when_property_fetch_fails(self, tbox_builder, graph_client):
+        graph_client.query = AsyncMock(
+            side_effect=[
+                [{"class": "https://ex.org/o#Emp", "label": "Emp", "parentClass": None}],
+                RuntimeError("neptune down"),
+            ]
+        )
+
+        classes, properties = await tbox_builder._fetch_by_entities("how many employees", "ns-x")
+
+        assert [c["uri"] for c in classes] == ["https://ex.org/o#Emp"]
+        assert properties == []
+
+    async def test_fetch_by_entities_deduplicates_classes_before_the_values_cap(self, tbox_builder, graph_client):
+        """Multilingual labels must not collapse the property-fetch class list.
+
+        The class query is DISTINCT over (class, label, parent), so a class with
+        three language labels yields three rows. Capping raw rows at 50 covered only
+        17 distinct classes and left the other 23 with no column hints — on exactly
+        the namespaces this feature serves.
+        """
+        class_rows = [
+            {"class": f"https://ex.org/o#C{index}", "label": label, "parentClass": None}
+            for index in range(40)
+            for label in (f"C{index}", f"クラス{index}", f"클래스{index}")
+        ]
+        graph_client.query = AsyncMock(side_effect=[class_rows, []])
+
+        await tbox_builder._fetch_by_entities("空調設備型番", "ns-x")
+
+        props_sparql = graph_client.query.call_args_list[1][0][0]
+        distinct_in_values = {f"https://ex.org/o#C{index}" for index in range(40)}
+        assert sum(uri in props_sparql for uri in distinct_in_values) == 40
+
+    async def test_fetch_by_entities_logs_class_row_cap_truncation(self, tbox_builder, graph_client):
+        """Past the class-query row cap, Neptune's row order decides what reaches
+        the prompt, so the truncation must be observable."""
+        from coa_serve.tier2.ontop import tbox_context as module
+
+        class_rows = [
+            {"class": f"https://ex.org/o#C{index}", "label": f"C{index}", "parentClass": None}
+            for index in range(module._SPARQL_RESULT_LIMIT)
+        ]
+        graph_client.query = AsyncMock(side_effect=[class_rows, []])
+
+        with patch.object(module, "logger") as log:
+            await tbox_builder._fetch_by_entities("空調設備型番", "ns-x")
+
+        assert any(call[0][0] == "tbox_entity_classes_truncated" for call in log.warning.call_args_list)
+
+    async def test_fetch_by_entities_logs_property_uri_truncation(self, tbox_builder, graph_client):
+        from coa_serve.tier2.ontop import tbox_context as module
+
+        class_rows = [
+            {"class": f"https://ex.org/o#C{index}", "label": f"C{index}", "parentClass": None}
+            for index in range(module._MAX_SPARQL_VALUES_URIS + 10)
+        ]
+        graph_client.query = AsyncMock(side_effect=[class_rows, []])
+
+        with patch.object(module, "logger") as log:
+            classes, _properties = await tbox_builder._fetch_by_entities("空調設備型番", "ns-x")
+
+        # Every matched class still surfaces; only the column hints are capped.
+        assert len(classes) == module._MAX_SPARQL_VALUES_URIS + 10
+        truncation = [c for c in log.info.call_args_list if c[0][0] == "tbox_entity_property_uris_truncated"]
+        assert truncation and truncation[0][1]["matched"] == module._MAX_SPARQL_VALUES_URIS + 10
+
     async def test_object_properties_require_both_ends_mapped(self, tbox_builder, graph_client):
         await tbox_builder._fetch_object_properties("ns-x")
         sparql = graph_client.query.call_args[0][0]
@@ -321,9 +447,13 @@ class TestTBoxContextDatatypePropertyGate:
         assert "?property a owl:DatatypeProperty" in sparql
 
     async def test_fetch_by_entities_gated_to_datatype(self, tbox_builder, graph_client):
+        graph_client.query = AsyncMock(side_effect=[[{"class": "https://example.org/o#Emp", "label": "Emp"}], []])
         await tbox_builder._fetch_by_entities("how many employees", "ns-x")
-        sparql = graph_client.query.call_args[0][0]
-        assert "?property a owl:DatatypeProperty" in sparql
+
+        # The datatype gate lives in the second (property) query since the fetch
+        # was split to stop property rows from evicting matched classes.
+        props_sparql = graph_client.query.call_args_list[1][0][0]
+        assert "?property a owl:DatatypeProperty" in props_sparql
 
     async def test_property_seeded_branch_gated_to_datatype(self, tbox_builder, graph_client):
         """A property-seeded hit branch must also require owl:DatatypeProperty, so a

@@ -30,18 +30,34 @@ from coa_common import BedrockEmbedder, resolve_region
 from coa_common.constants import DEFAULT_EMBED_MODEL_ID
 from coa_common.guardrail_metrics import (
     COMPONENT_NL_TO_SPARQL,
+    DECISION_ALLOW,
+    DECISION_ANONYMIZED,
+    DECISION_BLOCK,
+    DECISION_MODEL_FILTERED,
+    DECISION_UNKNOWN,
     assessments_from_trace,
     emit_guardrail_decision,
     filter_type_from_assessments,
 )
 
-from .base import ConverseResult, GuardrailBlockedError, instrumented
+from .base import (
+    STOP_REASON_MAX_TOKENS,
+    ContentFilteredError,
+    ConverseResult,
+    GuardrailBlockedError,
+    GuardrailOutcome,
+    instrumented,
+)
 
 logger = structlog.get_logger(__name__)
 
 _EXECUTOR = ThreadPoolExecutor(max_workers=10, thread_name_prefix="bedrock")
 
-# Guardrail policy paths covering all assessment types in outputAssessment traces.
+# Stop reasons that mean the guardrail acted. Says nothing about WHAT it did —
+# Bedrock uses the same value for masking and for blocking.
+_GUARDRAIL_STOP_REASONS = ("guardrail", "guardrail_intervened")
+
+# Guardrail policy paths covering all assessment types in guardrail traces.
 _GUARDRAIL_POLICY_PATHS = [
     ("topicPolicy", "topics"),
     ("contentPolicy", "filters"),
@@ -50,6 +66,14 @@ _GUARDRAIL_POLICY_PATHS = [
     ("sensitiveInformationPolicy", "piiEntities"),
     ("sensitiveInformationPolicy", "regexes"),
 ]
+
+# Policy keys we can actually parse (derived, so the two can never drift apart).
+_KNOWN_POLICY_KEYS = frozenset(policy for policy, _ in _GUARDRAIL_POLICY_PATHS)
+
+# Actions we understand. Anything else — including a future Bedrock action, or
+# ``contextualGroundingPolicy``, which we do not parse — must NOT be read as
+# permission: an unrecognized shape could be a block we failed to see.
+_KNOWN_ACTIONS = frozenset({"BLOCKED", "ANONYMIZED", "NONE"})
 
 # Timeout for queue.get() to prevent deadlock if thread dies without signaling.
 _STREAM_QUEUE_TIMEOUT_S = 300
@@ -68,17 +92,175 @@ _STREAM_QUEUE_TIMEOUT_S = 300
 _MODELS_REJECTING_TEMPERATURE: set[str] = set()
 
 
-def _assessment_has_block(assessment: dict) -> bool:
-    """Check if a guardrail assessment contains any BLOCKED action."""
+def _assessment_has_action(assessment: dict, action: str) -> bool:
+    """Whether any policy item in one assessment carries ``action``."""
     try:
         return any(
-            item.get("action") == "BLOCKED"
+            item.get("action") == action
             for policy_key, items_key in _GUARDRAIL_POLICY_PATHS
             for item in assessment.get(policy_key, {}).get(items_key, [])
         )
     except (TypeError, AttributeError):
         logger.warning("guardrail_malformed_assessment", assessment_keys=list(assessment.keys()) if assessment else [])
         return False
+
+
+def _carries_guardrail_action(value: object) -> bool:
+    """Whether a sub-tree carries an ``action`` field anywhere within it.
+
+    Only guardrail *policies* carry actions; inert metadata such as
+    ``invocationMetrics`` and ``appliedGuardrailDetails`` does not. This is the
+    line between an unparsed *policy* — which could hide a block we never saw —
+    and a benign metadata key we can safely ignore.
+    """
+    if isinstance(value, dict):
+        return "action" in value or any(_carries_guardrail_action(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_carries_guardrail_action(v) for v in value)
+    return False
+
+
+def _assessment_is_unparsed(assessment: dict) -> bool:
+    """Whether one assessment holds a shape we cannot classify.
+
+    Fails closed on:
+
+    * a known policy whose items are not a list, whose item is not a dict, or
+      whose action is outside :data:`_KNOWN_ACTIONS`;
+    * an *unknown* key that carries a guardrail action — a policy Bedrock added
+      that we do not parse (e.g. ``contextualGroundingPolicy``), which could be a
+      block we never saw.
+
+    Unknown keys that carry NO action are benign metadata and are ignored, rather
+    than blindly treating every unrecognized key as dangerous. That is what lets
+    real traces through: Bedrock always attaches ``appliedGuardrailDetails`` (and
+    ``invocationMetrics``) to each assessment, and the old name-allowlist rejected
+    the ones it had not been told about — downgrading merely-masked answers to
+    UNKNOWN and discarding them. Keying off the presence of an action instead
+    survives Bedrock adding new metadata without reopening the fail-open hole.
+    """
+    for policy_key, items_key in _GUARDRAIL_POLICY_PATHS:
+        try:
+            items = assessment.get(policy_key, {}).get(items_key, []) or []
+        except (TypeError, AttributeError):
+            return True
+        if not isinstance(items, list):
+            return True
+        for item in items:
+            if not isinstance(item, dict) or item.get("action") not in _KNOWN_ACTIONS:
+                return True
+    for key, value in assessment.items():
+        if key in _KNOWN_POLICY_KEYS:
+            continue
+        if _carries_guardrail_action(value):
+            return True
+    return False
+
+
+def _trace_has_unparsed_shape(guardrail_trace: dict) -> bool:
+    """Whether the trace contains anything this code cannot interpret.
+
+    Presence of an unparsed shape means we may have MISSED a block, so it must
+    downgrade the verdict to UNKNOWN rather than be ignored.
+
+    Deliberately walks the RAW trace rather than :func:`assessments_from_trace`,
+    which silently drops non-dict sides and entries. Relying on the flattened view
+    made this check blind to exactly the malformed input it exists to catch: a
+    readable ANONYMIZED beside an unreadable sibling was reported as plain masking,
+    i.e. it failed OPEN.
+
+    Only assessment *sides* are inspected. Other top-level trace keys are metadata
+    that carry no action, and treating them as unparsed would suppress every
+    guarded response. Both nesting shapes Bedrock uses are handled: ``inputAssessment``
+    maps a guardrail id to a single assessment, while ``outputAssessments`` (plural)
+    maps it to a LIST of them.
+    """
+    if not isinstance(guardrail_trace, dict):
+        return True
+    for side_key, side in guardrail_trace.items():
+        if "assessment" not in side_key.lower():
+            continue
+        if side is None:
+            # A null side (Bedrock leaves ``outputAssessments`` null when the
+            # output was not assessed) carries no action — nothing to interpret.
+            continue
+        if isinstance(side, dict):
+            entries = list(side.values())
+        elif isinstance(side, list):
+            entries = list(side)
+        else:
+            return True
+        for entry in entries:
+            # A side value is one assessment, or (outputAssessments) a list of them.
+            assessments = entry if isinstance(entry, list) else [entry]
+            for assessment in assessments:
+                if not isinstance(assessment, dict) or _assessment_is_unparsed(assessment):
+                    return True
+    return False
+
+
+def _classify_guardrail(stop_reason: str, guardrail_trace: dict) -> GuardrailOutcome:
+    """Classify what the guardrail did, failing closed on anything unreadable.
+
+    Precedence — an explicit block wins; then anything we could not parse; only
+    then may we conclude the intervention was harmless masking:
+
+    1. ``BLOCKED`` in either assessment            -> BLOCKED
+    2. any policy/action we cannot interpret       -> UNKNOWN
+    3. ``ANONYMIZED`` in either assessment         -> ANONYMIZED
+    4. the stop reason says the guardrail acted    -> UNKNOWN
+    5. otherwise                                   -> NONE
+
+    Rules 2 and 4 are the safety property. Rule 2 specifically covers a MIXED
+    trace: a recognized ``ANONYMIZED`` alongside an unrecognized policy shape must
+    not be reported as mere masking, because the shape we could not read might
+    have been a block. Ordering anonymize ahead of that check would fail OPEN.
+
+    A missing trace, an empty trace, and a malformed trace all land on UNKNOWN via
+    rule 4, so NONE requires a non-intervened stop reason and can never be reached
+    by failing to parse.
+    """
+    assessments = assessments_from_trace(guardrail_trace)
+    if any(_assessment_has_action(a, "BLOCKED") for a in assessments):
+        return GuardrailOutcome.BLOCKED
+    if _trace_has_unparsed_shape(guardrail_trace):
+        return GuardrailOutcome.UNKNOWN
+    if any(_assessment_has_action(a, "ANONYMIZED") for a in assessments):
+        return GuardrailOutcome.ANONYMIZED
+    if stop_reason in _GUARDRAIL_STOP_REASONS:
+        return GuardrailOutcome.UNKNOWN
+    return GuardrailOutcome.NONE
+
+
+def _redacted_assessment_actions(guardrail_trace: dict) -> list[str]:
+    """Summarize a trace as ``policy:type=action`` strings, dropping matched values.
+
+    Guardrail traces carry the RAW matched text (``{"type": "NAME", "action":
+    "ANONYMIZED", "match": "<a real person's name>"}``). Logging the trace object
+    would therefore write plaintext PII to CloudWatch — which is why enabling the
+    trace and redacting the log have to land together.
+    """
+    out: list[str] = []
+    for assessment in assessments_from_trace(guardrail_trace):
+        for policy_key, items_key in _GUARDRAIL_POLICY_PATHS:
+            try:
+                items = assessment.get(policy_key, {}).get(items_key, []) or []
+            except (TypeError, AttributeError):
+                continue
+            for item in items:
+                if isinstance(item, dict):
+                    out.append(f"{policy_key}:{item.get('type')}={item.get('action')}")
+    return out
+
+
+def _decision_for(outcome: GuardrailOutcome) -> str:
+    """Map an outcome onto its metrics ``Decision`` label."""
+    return {
+        GuardrailOutcome.NONE: DECISION_ALLOW,
+        GuardrailOutcome.ANONYMIZED: DECISION_ANONYMIZED,
+        GuardrailOutcome.BLOCKED: DECISION_BLOCK,
+        GuardrailOutcome.UNKNOWN: DECISION_UNKNOWN,
+    }[outcome]
 
 
 def _close_stream_quietly(stream: Any) -> None:
@@ -231,30 +413,38 @@ class BedrockLLMClient:
         latency_ms = (time.monotonic() - start) * 1000
 
         stop_reason = response.get("stopReason", "")
-        blocked = False
         guardrail_trace: dict[str, Any] = {}
 
-        # Parse guardrail trace to distinguish BLOCK from ANONYMIZE.
-        # stop_reason alone is insufficient — it fires for both actions.
-        if stop_reason in ("guardrail", "guardrail_intervened"):
+        # Classify what the guardrail DID. stop_reason alone is insufficient — it
+        # fires for masking and blocking alike — so the trace is requested (see
+        # _build_kwargs) and read across BOTH assessments.
+        if stop_reason in _GUARDRAIL_STOP_REASONS:
             guardrail_trace = response.get("trace", {}).get("guardrail", {})
-            if guardrail_trace:
-                blocked = any(_assessment_has_block(a) for a in guardrail_trace.get("outputAssessment", {}).values())
-                logger.info(
-                    "guardrail_trace",
-                    blocked=blocked,
-                    stop_reason=stop_reason,
-                    trace=guardrail_trace,
-                )
-            else:
-                # No trace available — conservatively treat as blocked
-                blocked = True
+        outcome = _classify_guardrail(stop_reason, guardrail_trace)
+        blocked = outcome is GuardrailOutcome.BLOCKED
+
+        if outcome is not GuardrailOutcome.NONE:
+            # NEVER log the trace object: it carries the raw matched values (a real
+            # person's name under a PII NAME match), so logging it would write
+            # plaintext PII to CloudWatch. Only derived labels.
+            logger.info(
+                "guardrail_trace",
+                outcome=outcome.value,
+                blocked=blocked,
+                stop_reason=stop_reason,
+                actions=_redacted_assessment_actions(guardrail_trace),
+            )
 
         # Emitted before the no-text check below: a hard block is the decision we
         # most need counted, and it is also the case most likely to return no
         # text. Only when a guardrail was actually applied — counting unguarded
         # calls as ALLOW would make the block rate meaningless (#111 AC10/AC11).
+        #
+        # ``blocked`` drives GuardrailBlocked and is therefore True only for a
+        # CONFIRMED block; UNKNOWN is suppressed but reported under its own
+        # decision so an unexplained suppression can be alarmed on separately.
         if guardrail_id:
+            model_filtered = stop_reason == "content_filtered"
             emit_guardrail_decision(
                 component=COMPONENT_NL_TO_SPARQL,
                 blocked=blocked,
@@ -263,17 +453,49 @@ class BedrockLLMClient:
                 # Serve already emits its other custom metrics as stdout EMF —
                 # same transport here, so no PutMetricData grant is needed.
                 transport="emf",
+                decision=DECISION_MODEL_FILTERED if model_filtered else _decision_for(outcome),
             )
 
         content_blocks = response.get("output", {}).get("message", {}).get("content", [])
         text_blocks = [b["text"] for b in content_blocks if isinstance(b, dict) and "text" in b]
         if not text_blocks:
+            if stop_reason == "content_filtered":
+                # The MODEL refused, which is not a guardrail policy action. Typed so
+                # callers and dashboards can tell the two apart; a ValueError subclass
+                # so anything that caught the old bare ValueError still does.
+                raise ContentFilteredError(
+                    f"Model filtered its own output: stopReason={stop_reason}",
+                    stop_reason=stop_reason,
+                )
             raise ValueError(f"No text content in Bedrock response: stopReason={stop_reason}")
 
         # Join ALL text blocks. The Converse API may split a response across several
         # content blocks; taking only the first silently truncated the generation
         # (and for NL→SQL / NL→SPARQL that means a query cut off mid-statement).
-        return ConverseResult(text="".join(text_blocks), guardrail_blocked=blocked)
+        text = "".join(text_blocks)
+
+        # UNKNOWN means we could not classify the intervention, so the text may be
+        # real model output that a policy would have blocked. Suppressing the flag
+        # while returning the content would fail OPEN in the text channel — callers
+        # such as tier2's sql_generator read .text without consulting the flag. On a
+        # confirmed BLOCK no suppression is needed: Bedrock has already substituted
+        # its blockedOutputsMessaging, so .text is boilerplate, not model content.
+        if outcome is GuardrailOutcome.UNKNOWN:
+            text = ""
+
+        # Truncation is a 200 with partial content, so nothing downstream fails
+        # loudly — log it here, once, where the cap that caused it is in scope.
+        # Reasoning models spend the SAME budget on their thinking blocks, so a
+        # cap that looks generous for the answer alone can still cut it off.
+        if stop_reason == STOP_REASON_MAX_TOKENS:
+            logger.warning(
+                "bedrock_output_truncated",
+                model=kwargs["modelId"],
+                max_tokens=max_tokens,
+                text_chars=len(text),
+            )
+
+        return ConverseResult(text=text, outcome=outcome, stop_reason=stop_reason)
 
     async def converse_stream(
         self,
@@ -327,7 +549,7 @@ class BedrockLLMClient:
         def _run_stream() -> None:
             """Run in thread — iterate EventStream, push text chunks to queue."""
             guardrail_triggered = False
-            was_blocked = False
+            guardrail_trace: dict[str, Any] = {}
             try:
                 client = self._get_client()
                 response = self._call_with_temperature_fallback(client.converse_stream, kwargs)
@@ -347,20 +569,34 @@ class BedrockLLMClient:
                             loop.call_soon_threadsafe(queue.put_nowait, text)
                     elif "messageStop" in event:
                         stop_reason = event["messageStop"].get("stopReason", "")
-                        if stop_reason in ("guardrail", "guardrail_intervened"):
+                        if stop_reason in _GUARDRAIL_STOP_REASONS:
                             guardrail_triggered = True
+                        elif stop_reason == STOP_REASON_MAX_TOKENS:
+                            # The consumer sees a stream that simply ends, so the cap
+                            # has to be reported here or not at all.
+                            logger.warning(
+                                "bedrock_output_truncated",
+                                model=kwargs["modelId"],
+                                max_tokens=max_tokens,
+                                streaming=True,
+                            )
                     elif "metadata" in event:
                         trace = event["metadata"].get("trace", {}).get("guardrail", {})
                         if trace:
-                            was_blocked = any(
-                                _assessment_has_block(a) for a in trace.get("outputAssessment", {}).values()
-                            )
+                            guardrail_trace = trace
                     # Safely ignore: messageStart, contentBlockStart, contentBlockStop
-                # Signal guardrail result if triggered
+                # Signal the guardrail outcome if it acted. Classified here rather
+                # than as a bare bool so an unexplained intervention (no trace) is
+                # distinguishable from a confirmed block — previously a traceless
+                # intervention left was_blocked False and raised NOTHING, so a real
+                # block passed through silently.
                 if guardrail_triggered:
                     loop.call_soon_threadsafe(
                         queue.put_nowait,
-                        ("_guardrail_result", was_blocked),
+                        (
+                            "_guardrail_result",
+                            _classify_guardrail("guardrail_intervened", guardrail_trace),
+                        ),
                     )
                 loop.call_soon_threadsafe(queue.put_nowait, None)
             except Exception as e:
@@ -368,9 +604,9 @@ class BedrockLLMClient:
 
         task = loop.run_in_executor(_EXECUTOR, _run_stream)
 
-        guardrail_intervened = False
-        guardrail_was_blocked = False
+        guardrail_outcome = GuardrailOutcome.NONE
         pending_exception: Exception | None = None
+        stream_start = time.monotonic()
         try:
             while True:
                 item = await asyncio.wait_for(queue.get(), timeout=_STREAM_QUEUE_TIMEOUT_S)
@@ -380,8 +616,7 @@ class BedrockLLMClient:
                     pending_exception = item
                     break
                 if isinstance(item, tuple) and item[0] == "_guardrail_result":
-                    guardrail_intervened = True
-                    guardrail_was_blocked = item[1]
+                    guardrail_outcome = item[1]
                     continue
                 yield item
         except TimeoutError:
@@ -413,10 +648,30 @@ class BedrockLLMClient:
         if pending_exception:
             raise pending_exception
 
-        # After stream completes, raise only if guardrail actually BLOCKED content.
-        # PII ANONYMIZE (masking) is not a block — the tokens already contain masked values.
-        if guardrail_intervened and guardrail_was_blocked:
-            raise GuardrailBlockedError("guardrail_blocked")
+        # Streaming telemetry. This path emitted NO guardrail metrics before, so a
+        # block on the streamed path was invisible on the dashboard that exists to
+        # count blocks. Emitted once, after classification, before any raise.
+        if guardrail_id:
+            emit_guardrail_decision(
+                component=COMPONENT_NL_TO_SPARQL,
+                blocked=guardrail_outcome is GuardrailOutcome.BLOCKED,
+                latency_ms=(time.monotonic() - stream_start) * 1000,
+                transport="emf",
+                decision=_decision_for(guardrail_outcome),
+            )
+
+        # KNOWN LIMITATION (deliberate, not an oversight): tokens are yielded above
+        # as they arrive, so by the time the outcome is known some content may
+        # already have reached the caller. Raising here cannot recall it. True
+        # pre-emptive suppression would require buffering the whole guarded output
+        # and giving up streaming, which is out of scope for this change.
+        #
+        # ANONYMIZE is not a block — the tokens already contain the masked values, so
+        # only BLOCKED and UNKNOWN raise. UNKNOWN raises because an intervention we
+        # cannot explain must not be treated as permission; previously a traceless
+        # intervention raised nothing at all, so a genuine block passed silently.
+        if guardrail_outcome in (GuardrailOutcome.BLOCKED, GuardrailOutcome.UNKNOWN):
+            raise GuardrailBlockedError(f"guardrail_{guardrail_outcome.value}")
 
     @staticmethod
     def _call_with_temperature_fallback(call_fn: Callable[..., Any], kwargs: dict[str, Any]) -> Any:
@@ -504,6 +759,12 @@ class BedrockLLMClient:
             kwargs["guardrailConfig"] = {
                 "guardrailIdentifier": guardrail_id,
                 "guardrailVersion": self._guardrail_version,
+                # REQUIRED, not diagnostic. Bedrock returns the guardrail trace only
+                # when asked, and without it an intervention is unclassifiable: a
+                # merely-anonymized answer is indistinguishable from a blocked one,
+                # which is what made serve delete correct answers. Matches
+                # libs/common/src/coa_common/bedrock.py, which already sets it.
+                "trace": "enabled",
             }
         return kwargs
 

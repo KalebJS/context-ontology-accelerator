@@ -549,7 +549,7 @@ def test_match_concepts_non_transport_failure_logs_and_falls_back_to_all_novel(c
             raise RuntimeError("a programming bug, not a transport fault")
 
     with caplog.at_level(logging.ERROR):
-        graph, novel, matches = TableToOntologyStrategy().induce(
+        graph, novel, matches, dropped = TableToOntologyStrategy().induce(
             tables=[table],
             ontology_uri_prefix="http://ex.org/induced#",
             config={},

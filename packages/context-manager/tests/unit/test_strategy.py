@@ -21,6 +21,7 @@ from coa_serve.exceptions import AccessDeniedError, NoResultError
 from coa_serve.orchestrator import Orchestrator
 from coa_serve.tier2.strategy import (
     StrategyContext,
+    StrategyOption,
     StrategyResult,
     StructuredQueryTier,
 )
@@ -762,3 +763,40 @@ class TestOrchestratorModelValidation:
         # Should not raise
         validate_model_id("us.anthropic.claude-sonnet-4-6")
         validate_model_id("arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2:1")
+
+
+# ── Strategy selection (_strategies_for) ──────────────────────────────────
+
+
+@pytest.mark.unit
+class TestAgenticStrategySelection:
+    """The AGENTIC arm is opt-in: it runs ONLY when pinned, never as a fallback."""
+
+    def _tier(self):
+        return StructuredQueryTier(
+            strategies=[
+                _make_strategy(StrategyOption.ONTOP),
+                _make_strategy(StrategyOption.NL_TO_SQL),
+                _make_strategy(StrategyOption.AGENTIC),
+            ]
+        )
+
+    def test_agentic_pin_selects_only_agentic(self):
+        picked = self._tier()._strategies_for(StrategyOption.AGENTIC)
+        assert [s.name for s in picked] == [StrategyOption.AGENTIC]
+
+    def test_agentic_excluded_from_nl_to_sql_first_fallback(self):
+        picked = self._tier()._strategies_for(StrategyOption.NL_TO_SQL_FIRST)
+        names = [s.name for s in picked]
+        assert StrategyOption.AGENTIC not in names
+        assert names[0] == StrategyOption.NL_TO_SQL  # matching strategy moves to front
+
+    def test_agentic_excluded_from_ontop_first_fallback(self):
+        picked = self._tier()._strategies_for(StrategyOption.ONTOP_FIRST)
+        names = [s.name for s in picked]
+        assert StrategyOption.AGENTIC not in names
+        assert names[0] == StrategyOption.ONTOP
+
+    def test_agentic_excluded_from_best(self):
+        picked = self._tier()._strategies_for(StrategyOption.BEST)
+        assert StrategyOption.AGENTIC not in [s.name for s in picked]

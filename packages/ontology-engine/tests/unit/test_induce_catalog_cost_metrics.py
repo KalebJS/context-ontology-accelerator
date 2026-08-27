@@ -231,7 +231,7 @@ def test_success_path_records_durations_and_volume() -> None:
         def induce(self, **kwargs):
             fake_graph = MagicMock()
             fake_graph.serialize.return_value = "@prefix : <#> ."
-            return fake_graph, {"orders"}, matches
+            return fake_graph, {"orders"}, matches, []
 
         def build_r2rml(self, **kwargs):
             fake_graph = MagicMock()

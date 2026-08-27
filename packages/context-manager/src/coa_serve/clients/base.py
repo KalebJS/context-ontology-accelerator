@@ -19,6 +19,7 @@ import functools
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 import structlog
@@ -168,16 +169,91 @@ class VectorClient(Protocol):
 # ── LLM Client (Bedrock) ─────────────────────────────────────────────────
 
 
+class GuardrailOutcome(StrEnum):
+    """What a Bedrock guardrail actually did to a Converse call.
+
+    ``stopReason=guardrail_intervened`` alone cannot distinguish these: Bedrock uses
+    it for masking and for blocking alike. Classifying them apart is what keeps a
+    merely-anonymized answer from being discarded as blocked content.
+    """
+
+    NONE = "none"
+    """No intervention — the stop reason was not a guardrail one."""
+
+    ANONYMIZED = "anonymized"
+    """Masked only (e.g. PII ``NAME`` → ``{NAME}``). The text remains usable."""
+
+    BLOCKED = "blocked"
+    """An explicit ``BLOCKED`` action. Bedrock has already substituted its own
+    blocked-message text, so ``ConverseResult.text`` is never model content here."""
+
+    UNKNOWN = "unknown"
+    """Intervened, but no trace was available to classify it. Treated as blocked
+    (fail closed) AND reported separately, because an unconfirmed suppression is not
+    a confirmed policy block."""
+
+
+STOP_REASON_MAX_TOKENS = "max_tokens"
+"""Converse ``stopReason`` for a generation cut short by the output-token cap."""
+
+
 @dataclass(frozen=True)
 class ConverseResult:
-    """Result of a Bedrock Converse call."""
+    """Result of a Bedrock Converse call.
+
+    ``outcome`` is authoritative; ``guardrail_blocked`` is retained as the
+    compatibility surface for existing callers and is kept consistent with it. Passing
+    either one alone is supported: whichever is omitted is derived in
+    ``__post_init__``.
+
+    ``stop_reason`` is the raw Converse ``stopReason``. It is carried because
+    ``max_tokens`` truncation is otherwise INVISIBLE: Bedrock returns the partial
+    text with HTTP 200, and a caller that only reads ``.text`` cannot tell a
+    finished answer from one cut mid-sentence. For NL→SQL that is a query cut
+    mid-statement which still parses as SQL, so it fails at execution rather than
+    at generation, where the cause would be obvious.
+    """
 
     text: str
     guardrail_blocked: bool = False
+    outcome: GuardrailOutcome | None = None
+    stop_reason: str = ""
+
+    def __post_init__(self) -> None:
+        """Reconcile ``outcome`` and ``guardrail_blocked`` so they can never disagree."""
+        if self.outcome is None:
+            derived = GuardrailOutcome.BLOCKED if self.guardrail_blocked else GuardrailOutcome.NONE
+            object.__setattr__(self, "outcome", derived)
+        else:
+            object.__setattr__(
+                self,
+                "guardrail_blocked",
+                self.outcome in (GuardrailOutcome.BLOCKED, GuardrailOutcome.UNKNOWN),
+            )
+
+    @property
+    def truncated(self) -> bool:
+        """True when the model stopped because it hit the output-token cap."""
+        return self.stop_reason == STOP_REASON_MAX_TOKENS
 
 
 class GuardrailBlockedError(Exception):
     """Raised when Bedrock guardrail blocks content (not anonymize — actual block)."""
+
+
+class ContentFilteredError(ValueError):
+    """The MODEL filtered its own output (``stopReason=content_filtered``).
+
+    Deliberately NOT a :class:`GuardrailBlockedError`: this is native model-side
+    filtering, not a Bedrock Guardrail policy action, and conflating them would make
+    the two indistinguishable in traces and on dashboards. Subclasses ``ValueError``
+    because that is what this condition raised before it was typed.
+    """
+
+    def __init__(self, message: str, *, stop_reason: str = "content_filtered") -> None:
+        """Carry the originating ``stopReason`` alongside the message."""
+        super().__init__(message)
+        self.stop_reason = stop_reason
 
 
 @runtime_checkable

@@ -11,8 +11,12 @@ from coa_common.config import SCLConfig, resolve_region
 class TestSCLConfig:
     """Tests for the base configuration."""
 
-    def test_default_values(self):
+    def test_default_values(self, monkeypatch):
         """Config should have sensible defaults."""
+        # aws_region falls back to the runtime environment (resolve_region),
+        # so clear the region vars or this test inherits the host's region.
+        for var in ("SCL_AWS_REGION", "AWS_REGION", "AWS_DEFAULT_REGION"):
+            monkeypatch.delenv(var, raising=False)
         config = SCLConfig()
         assert config.project_name == "coa"
         assert config.environment == "dev"
@@ -32,6 +36,21 @@ class TestSCLConfig:
         monkeypatch.setenv("SCL_AWS_REGION", "eu-west-1")
         config = SCLConfig()
         assert config.aws_region == "eu-west-1"
+
+    def test_aws_region_follows_runtime_environment(self, monkeypatch):
+        """#92 class-of-bug: infra sets AWS_REGION, never SCL_AWS_REGION, so
+        the config default must track the runtime region rather than pin
+        us-east-1."""
+        monkeypatch.delenv("SCL_AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        assert SCLConfig().aws_region == "us-west-2"
+
+    def test_scl_aws_region_precedence_over_runtime(self, monkeypatch):
+        """The SCL_ prefixed var remains an explicit operator override."""
+        monkeypatch.setenv("SCL_AWS_REGION", "eu-west-1")
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        assert SCLConfig().aws_region == "eu-west-1"
 
 
 @pytest.mark.unit

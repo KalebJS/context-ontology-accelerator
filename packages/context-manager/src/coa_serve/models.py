@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 
+from coa_common.constants import MAX_QUERY_CODEPOINTS, validate_query_text
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
 _MAX_DETAIL_LENGTH = 500  # Matches trace.py centralized truncation
@@ -79,13 +80,13 @@ class TraceStep(BaseModel):
 class InvokeRequest(BaseModel):
     """Inbound query request: the question, namespace, auth profile, and options."""
 
-    query: str = Field(..., min_length=1, max_length=4000)
+    query: str = Field(..., min_length=1, max_length=MAX_QUERY_CODEPOINTS)
 
     @field_validator("query", mode="before")
     @classmethod
-    def _strip_query(cls, v: str) -> str:
-        """Strip whitespace so whitespace-only queries are rejected by min_length."""
-        return v.strip() if isinstance(v, str) else v
+    def _strip_query(cls, value: object) -> str:
+        """Validate the raw bound before stripping or downstream segmentation."""
+        return validate_query_text(value)
 
     namespace: str = Field(..., min_length=1, max_length=128, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
     profile: dict = Field(default_factory=dict)

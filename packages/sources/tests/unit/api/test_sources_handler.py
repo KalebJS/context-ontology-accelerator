@@ -76,22 +76,28 @@ def _put_source(
     source_sub_type: str = "GLUE_DATABASE",
     status: str = "APPROVED",
     created_at: str = "2026-01-01T00:00:00Z",
+    configuration: dict | None = None,
 ) -> None:
-    """Insert a source item into DDB matching the sources-table schema."""
-    table.put_item(
-        Item={
-            "PK": f"NS#{namespace_id}",
-            "SK": f"SRC#{source_id}",
-            "namespaceId": namespace_id,
-            "sourceId": source_id,
-            "name": name,
-            "sourceType": source_type,
-            "sourceSubType": source_sub_type,
-            "status": status,
-            "createdAt": created_at,
-            "sourceTypeCreatedAt": f"{source_type}#{created_at}",
-        }
-    )
+    """Insert a source item into DDB matching the sources-table schema.
+
+    ``configuration`` is stored the way the create path stores it: one JSON blob
+    in an untyped column, whose shape only sourceSubType identifies.
+    """
+    item = {
+        "PK": f"NS#{namespace_id}",
+        "SK": f"SRC#{source_id}",
+        "namespaceId": namespace_id,
+        "sourceId": source_id,
+        "name": name,
+        "sourceType": source_type,
+        "sourceSubType": source_sub_type,
+        "status": status,
+        "createdAt": created_at,
+        "sourceTypeCreatedAt": f"{source_type}#{created_at}",
+    }
+    if configuration is not None:
+        item["configuration"] = json.dumps(configuration)
+    table.put_item(Item=item)
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +524,165 @@ class TestDatabaseDetailEngineProjection:
         detail = self._detail({})
         assert "queryEngine" not in detail
         assert "redshiftWorkgroup" not in detail.get("glueConfiguration", {})
+
+
+# ===================================================================
+# Database detail — configuration blob is typed by sourceSubType
+# ===================================================================
+
+_GET_RESOURCE = "/namespaces/{namespaceId}/sources/{sourceId}"
+
+_GLUE_CONFIG = {
+    "catalogId": "123456789012",
+    "region": "us-east-1",
+    "databaseName": "insurance_lake",
+}
+_JDBC_CONFIG = {
+    "engine": "POSTGRESQL",
+    "host": "db.example.internal",
+    "port": 5432,
+    "databaseName": "claims",
+}
+_ATHENA_CONFIG = {
+    "metadataFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:widgets-connector",
+    "databaseName": "widgets",
+}
+
+
+@pytest.mark.unit
+class TestDatabaseDetailConfigurationDispatch:
+    """The sources-table keeps every sub-type's configuration in one untyped
+    `configuration` column, so sourceSubType is the only thing that says which
+    response member the blob belongs under — and the shapes are not
+    interchangeable. GlueConfiguration requires catalogId + region, so reporting
+    an ATHENA_CONNECTOR config as Glue fails GetSourceOutput validation and
+    turns GET into a 500 rather than a cosmetic mislabel.
+    """
+
+    def _get(self, aws_env, sub_type: str, config: dict) -> tuple[int, dict]:
+        _put_source(
+            aws_env["table"],
+            _NAMESPACE_ID,
+            "src-cfg",
+            source_sub_type=sub_type,
+            configuration=config,
+        )
+        event = _make_event(
+            "GET",
+            _GET_RESOURCE,
+            path_params={"namespaceId": _NAMESPACE_ID, "sourceId": "src-cfg"},
+        )
+        return _parse_response(aws_env["handler"](event, None))
+
+    def test_athena_connector_config_returned_under_athena_key(self, aws_env):
+        """The regression: an ATHENA_CONNECTOR config read as Glue 500s."""
+        status, body = self._get(aws_env, "ATHENA_CONNECTOR", _ATHENA_CONFIG)
+
+        assert status == 200
+        details = body["databaseDetails"]
+        assert details["athenaConfiguration"] == _ATHENA_CONFIG
+        assert "glueConfiguration" not in details
+        assert "jdbcConfiguration" not in details
+
+    def test_glue_config_returned_under_glue_key(self, aws_env):
+        status, body = self._get(aws_env, "GLUE_DATABASE", _GLUE_CONFIG)
+
+        assert status == 200
+        details = body["databaseDetails"]
+        assert details["glueConfiguration"] == _GLUE_CONFIG
+        assert "athenaConfiguration" not in details
+
+    def test_jdbc_config_returned_under_jdbc_key(self, aws_env):
+        status, body = self._get(aws_env, "JDBC_DATABASE", _JDBC_CONFIG)
+
+        assert status == 200
+        details = body["databaseDetails"]
+        assert details["jdbcConfiguration"]["host"] == _JDBC_CONFIG["host"]
+        assert "glueConfiguration" not in details
+        assert "athenaConfiguration" not in details
+
+    # A row whose sourceSubType is absent or unrecognised cannot be asserted
+    # end-to-end: GetSourceOutput (and SourceSummary) declare sourceSubType
+    # @required, so such a row already fails response validation on that member
+    # alone, on both GET and LIST, regardless of how the configuration blob is
+    # typed. That is a pre-existing shape constraint, out of scope here — so the
+    # fallback is asserted on the projection function instead.
+    @pytest.mark.parametrize("sub_type", [{}, {"sourceSubType": "SOME_FUTURE_DATABASE"}])
+    def test_absent_or_unrecognised_sub_type_falls_back_to_glue(self, sub_type):
+        from coa_sources.api.sources_handler import _build_database_detail
+
+        item = {
+            "sourceType": "DATABASE",
+            "name": "legacy-src",
+            "status": "APPROVED",
+            "configuration": json.dumps(_GLUE_CONFIG),
+            **sub_type,
+        }
+        detail = _build_database_detail(item)
+
+        assert detail is not None
+        assert detail["glueConfiguration"] == _GLUE_CONFIG
+        assert "athenaConfiguration" not in detail
+
+    def test_every_detail_configuration_member_is_reachable(self):
+        """Fail loudly when a configuration member is added to the response
+        shape without a sub-type routing a blob to it — otherwise the new
+        sub-type silently lands in the Glue fallback and GET 500s again."""
+        from coa_control_plane_server.models.database_source_detail import DatabaseSourceDetail
+        from coa_sources.api.sources_handler import _DETAIL_CONFIG_KEYS
+
+        shape_members = {
+            field.alias or name
+            for name, field in DatabaseSourceDetail.model_fields.items()
+            if (field.alias or name).endswith("Configuration")
+        }
+        assert shape_members == set(_DETAIL_CONFIG_KEYS.values())
+
+    def test_every_database_sub_type_is_mapped(self):
+        """The member check above only catches a new *configuration* member. A
+        new DATABASE sub-type that reuses an existing one — say an
+        AURORA_DATABASE carrying a JdbcConfiguration — adds no member, so it
+        would pass that check while its blob lands in the Glue fallback and GET
+        500s exactly as ATHENA_CONNECTOR did. Every sub-type must therefore be
+        either mapped or explicitly declared as belonging to DOCUMENTS.
+        """
+        from coa_control_plane_server.models.source_sub_type import SourceSubType
+        from coa_sources.api.sources_handler import _DETAIL_CONFIG_KEYS
+
+        # DOCUMENTS sub-types: _build_database_detail is never reached for them
+        # (_item_to_detail branches on sourceType first), so they carry no
+        # DatabaseSourceDetail configuration member.
+        document_sub_types = {SourceSubType.S3.value, SourceSubType.LOCAL_UPLOAD.value}
+
+        unmapped = {s.value for s in SourceSubType} - set(_DETAIL_CONFIG_KEYS) - document_sub_types
+        assert not unmapped, (
+            f"sub-type(s) {sorted(unmapped)} have no _DETAIL_CONFIG_KEYS entry. Add one pointing at the "
+            f"DatabaseSourceDetail member that carries their configuration, or list them as DOCUMENTS above."
+        )
+
+
+@pytest.mark.unit
+class TestListIsUnaffectedBySubType:
+    """SourceSummary carries no configuration member (only the sourceSubType
+    string), so LIST projects every sub-type cleanly and needs no dispatch."""
+
+    def test_athena_connector_source_lists_without_configuration(self, aws_env):
+        _put_source(
+            aws_env["table"],
+            _NAMESPACE_ID,
+            "src-athena",
+            name="widgets-connector",
+            source_sub_type="ATHENA_CONNECTOR",
+            configuration=_ATHENA_CONFIG,
+        )
+        event = _make_event("GET", _LIST_RESOURCE, path_params={"namespaceId": _NAMESPACE_ID})
+        status, body = _parse_response(aws_env["handler"](event, None))
+
+        assert status == 200
+        item = body["items"][0]
+        assert item["sourceSubType"] == "ATHENA_CONNECTOR"
+        for field in ("glueConfiguration", "jdbcConfiguration", "athenaConfiguration", "configuration"):
+            assert field not in item
 
 
 @pytest.mark.unit

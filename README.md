@@ -112,7 +112,6 @@ AND DISCLAIMERS APPLY EXCEPT TO THE EXTENT PROHIBITED BY APPLICABLE LAW.
 
 | External Dependency | License | Source |
 | ------------------- | ------- | ------ |
-| PyMuPDF | AGPL-3.0 | https://pypi.org/project/PyMuPDF/ |
 | owlready2 | LGPL-3.0 | https://pypi.org/project/owlready2/ |
 
 ## License

@@ -7,6 +7,8 @@ Pipeline:
 1. Embed user question via the configured Bedrock embedder (Cohere Embed v4 by default)
 2. k-NN retrieval of top-K ontology classes from OpenSearch
 3. FK graph expansion: add 1-hop neighbors from the adjacency graph
+3b. Opt-in: walk the induced ontology 1 FK hop out from the retrieved classes and
+    append the reached tables with their columns (``graph_expander``; off by default)
 4. Build DDL context from retrieved class metadata
 5. LLM generates SQL directly from question + DDL context
 
@@ -15,10 +17,12 @@ Execution is handled by the orchestrator — this component only generates SQL.
 
 from __future__ import annotations
 
+import os
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import structlog
 
@@ -29,6 +33,102 @@ logger = structlog.get_logger(__name__)
 
 DEFAULT_RETRIEVAL_K = 7
 DEFAULT_MAX_TABLES = 10
+
+# Output-token budget for a generation. 1024 (the previous hardcoded value) is not
+# enough for the analytic queries this arm is asked for: measured against 867
+# generated Spider 2.0 queries, ~5% exceed 1024 tokens of SQL alone, and on a
+# reasoning model — which spends the SAME budget on its thinking blocks before
+# writing a character of SQL — roughly half exceeded what was left over. A cap hit
+# mid-statement is silent (see ``ConverseResult.stop_reason``): Bedrock returns the
+# partial text with HTTP 200 and ``_extract_sql`` accepts it, so the query fails at
+# execution with a confusing syntax error instead of at generation.
+#
+# 4096 is the client default and covers every query measured. The env knob exists so
+# a deployment paying for a smaller model, or one that wants to bound worst-case
+# latency, can lower it without a code change.
+#
+# Bounded on BOTH sides. The floor keeps a misconfiguration from truncating every
+# generation; the ceiling is 8x the default and ~16x the longest query measured, and
+# sits under every current Claude model's Converse limit (Opus 5 rejects a request
+# above 128000 outright), so a clamped value can never itself be what makes Bedrock
+# reject the call. Clamping is logged — an operator who asked for more should learn
+# they did not get it.
+_DEFAULT_MAX_OUTPUT_TOKENS = 4096
+_MIN_MAX_OUTPUT_TOKENS = 512
+_MAX_MAX_OUTPUT_TOKENS = 32768
+
+# How much of the schema context the `nl_to_sql_context` log line carries. A
+# PREVIEW, not the prompt — see the call site.
+_CONTEXT_PREVIEW_CHARS = 2000
+
+
+def _resolve_max_output_tokens() -> int:
+    """Output-token cap for SQL generation (``SERVE_NL2SQL_MAX_TOKENS``).
+
+    Clamped to ``[512, 32768]`` (see the constants) and never raises: a bad value
+    degrades to the default rather than taking the arm down.
+    """
+    raw = os.environ.get("SERVE_NL2SQL_MAX_TOKENS")
+    if raw is None:
+        return _DEFAULT_MAX_OUTPUT_TOKENS
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("nl_to_sql_max_tokens_invalid", value=raw, using=_DEFAULT_MAX_OUTPUT_TOKENS)
+        return _DEFAULT_MAX_OUTPUT_TOKENS
+
+    resolved = max(_MIN_MAX_OUTPUT_TOKENS, min(_MAX_MAX_OUTPUT_TOKENS, requested))
+    if resolved != requested:
+        logger.warning("nl_to_sql_max_tokens_clamped", requested=requested, using=resolved)
+    return resolved
+
+
+# Bounds for the OPT-IN ontology-graph expansion (``graph_expander`` on
+# :meth:`SQLGenerator.generate`).
+#
+# HOPS = 1 because this path generates once and cannot recover from a padded
+# prompt: its 2-shot ``correct()`` re-generates on an execution error but never
+# re-retrieves. One FK hop off a hub table already reaches much of a warehouse
+# schema, so hop 2 would trade a missing join table for a haystack.
+#
+# MAX_TABLES bounds the APPENDED block, whose size is otherwise set by FK fan-out
+# rather than by relevance: the walk is unconditional and ranks by hop then label
+# (adjacency, not question similarity), so on a wide schema an uncapped hop-1
+# frontier is dozens of tables and the appended block dominates a prompt whose
+# useful part came from retrieval. The reference point is the retrieved block:
+# retrieval contributes ``DEFAULT_RETRIEVAL_K`` (7) tables, so 15 lets the walk
+# roughly double the writer's table count. It is a context budget, not a measured
+# optimum — the three-cell result quoted in the README was taken at 8 — so
+# ``SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES`` moves it without a code change.
+# :meth:`OntologyGraphTool.expand_from` clamps to ``MAX_NODE_LIMIT`` regardless.
+GRAPH_EXPAND_HOPS = 1
+_DEFAULT_GRAPH_EXPAND_MAX_TABLES = 15
+
+
+def _resolve_graph_expand_max_tables() -> int:
+    """Appended-table cap (``SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES``).
+
+    Never raises, matching :func:`_resolve_max_output_tokens`: a bad value degrades
+    to the default rather than taking an opt-in enrichment's caller down. ``0`` is
+    legal and yields no appended tables (``expand_from`` returns ``[]``), which is a
+    way to isolate the flag's other effects; negatives clamp to it. Only the floor
+    is enforced here — the upper bound is ``expand_from``'s ``MAX_NODE_LIMIT``, and
+    duplicating it would put the graph tool's ceiling in two places (and reintroduce
+    the import :class:`GraphExpander` exists to avoid).
+    """
+    raw = os.environ.get("SERVE_NL2SQL_GRAPH_EXPAND_MAX_TABLES")
+    if raw is None:
+        return _DEFAULT_GRAPH_EXPAND_MAX_TABLES
+    try:
+        requested = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("nl_to_sql_graph_expand_max_tables_invalid", value=raw, using=_DEFAULT_GRAPH_EXPAND_MAX_TABLES)
+        return _DEFAULT_GRAPH_EXPAND_MAX_TABLES
+    resolved = max(0, requested)
+    if resolved != requested:
+        logger.warning("nl_to_sql_graph_expand_max_tables_clamped", requested=requested, using=resolved)
+    return resolved
+
 
 _SQL_CODE_BLOCK_RE = re.compile(r"```(?:sql)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 _CONFIDENCE_RE = re.compile(r"confidence:\s*([01](?:\.\d+)?)", re.IGNORECASE)
@@ -136,6 +236,35 @@ def _build_system_prompt(dialect: str) -> str:
     )
 
 
+@runtime_checkable
+class GraphExpander(Protocol):
+    """The one method this module needs from the ontology FK-graph tool.
+
+    Declared structurally rather than importing
+    :class:`~coa_serve.tier2.tools.OntologyGraphTool`: the generator is the reusable
+    Tier-2 SQL writer (Tier 3 constructs it too), and it should not acquire a
+    graph-client dependency to support an opt-in enrichment that is ``None`` on the
+    default path. The expander is already namespace-scoped, which is why no
+    namespace is passed here.
+    """
+
+    async def expand_from(
+        self,
+        seed_iris: list[str],
+        *,
+        hops: int = 1,
+        max_tables: int = 8,
+    ) -> list[dict[str, Any]]:
+        """Tables an FK walk reaches beyond ``seed_iris``, each with a schema line.
+
+        The signature defaults are the tool's own fallbacks, not this arm's policy:
+        :meth:`SQLGenerator.generate` always passes ``GRAPH_EXPAND_HOPS`` and a cap
+        from :func:`_resolve_graph_expand_max_tables`, so those constants — not these
+        — are what a deployment's prompt size follows.
+        """
+        ...
+
+
 @dataclass
 class NLtoSQLResult:
     """Result of NL-to-SQL SQL generation pipeline."""
@@ -196,6 +325,16 @@ class SQLGenerator:
         self._guardrail_id = guardrail_id
 
     @property
+    def llm(self) -> LLMClient:
+        """Return the LLM client backing generation and query embedding.
+
+        Exposed so a consumer that needs the SAME embedder this generator
+        retrieves with — e.g. the Tier-2 table tools — shares one client rather
+        than reaching into private state or being wired a second one.
+        """
+        return self._llm
+
+    @property
     def fk_adjacency(self) -> dict[str, set[str]]:
         """Return the bidirectional FK adjacency graph used for table expansion."""
         return self._fk_adjacency
@@ -214,6 +353,7 @@ class SQLGenerator:
         embedding: list[float] | None = None,
         model_id: str | None = None,
         dialect: str | None = None,
+        graph_expander: GraphExpander | None = None,
     ) -> NLtoSQLResult:
         """Run the NL-to-SQL pipeline: retrieve → expand → generate SQL.
 
@@ -230,6 +370,12 @@ class SQLGenerator:
             dialect: Optional per-call SQL dialect override (e.g. "postgresql", "athena").
                 When provided, overrides the instance default for this generation call,
                 ensuring the LLM generates SQL in the target source's dialect.
+            graph_expander: Optional ontology-FK walker (see
+                :meth:`~coa_serve.tier2.tools.OntologyGraphTool.expand_from`). When
+                supplied, tables one FK hop from the retrieved classes are appended
+                to the schema context with their columns. ``None`` — the default and
+                the only value on the unflagged path — skips the walk entirely, so
+                the prompt is byte-identical to the retrieval-only baseline.
         """
         trace: list[dict[str, Any]] = []
 
@@ -321,18 +467,106 @@ class SQLGenerator:
                 }
             )
 
+        # Step 3b: ontology-graph expansion (OPT-IN — see the `graph_expander` arg).
+        #
+        # Distinct from step 3 above in both its source and its effect. Step 3 reads
+        # the sources API's declared FK adjacency and only ever adds table *names*:
+        # `_build_raw_context` renders a table solely from a retrieved hit, so a name
+        # with no hit contributes nothing to the prompt. This walks the induced
+        # ontology (the same FK object-properties the agentic arm's explore_graph
+        # tool uses, including the inferred edges the source declares nowhere) and
+        # brings each reached table's COLUMNS back with it, so a table similarity
+        # missed becomes usable rather than merely mentioned.
+        graph_tables: list[dict[str, Any]] = []
+        if graph_expander is not None:
+            start = time.perf_counter()
+            seed_iris = [iri for iri in (hit_class_iri(h) for h in hits) if iri]
+            # Read per request, not at import: the cap is a context budget an
+            # operator may want to move on a running deployment, and resolving it
+            # here keeps it as overridable as SERVE_NL2SQL_MAX_TOKENS.
+            max_graph_tables = _resolve_graph_expand_max_tables()
+            try:
+                graph_tables = await graph_expander.expand_from(
+                    seed_iris,
+                    hops=GRAPH_EXPAND_HOPS,
+                    max_tables=max_graph_tables,
+                )
+                trace.append(
+                    {
+                        "step": "graph_expand_ontology",
+                        "status": "ok",
+                        "ms": _ms(start),
+                        "seeds": len(seed_iris),
+                        "max_tables": max_graph_tables,
+                        "added": [t.get("table") for t in graph_tables],
+                    }
+                )
+            except Exception as e:
+                # An enrichment, so it degrades rather than fails: a graph that is
+                # slow, unreachable, or holds no edges for this namespace must leave
+                # the question answered from retrieval alone.
+                logger.warning("nl_to_sql_graph_expand_failed", error=f"{type(e).__name__}: {str(e)[:120]}")
+                trace.append(
+                    {
+                        "step": "graph_expand_ontology",
+                        "status": "error",
+                        "ms": _ms(start),
+                        "seeds": len(seed_iris),
+                        "error": str(e)[:200],
+                    }
+                )
+            # Retrieval accounting for the walk: `seeds` is how many retrieved hits
+            # carried a class IRI at all. Zero means the index predates IRI stamping
+            # and the treatment cannot have applied — which EX alone cannot tell apart
+            # from a walk that found nothing useful. `max_tables` is logged because
+            # the cap is now an env knob: `added == max_tables` is the signal that the
+            # budget, rather than the FK frontier, decided what the writer saw.
+            logger.info(
+                "nl_to_sql_graph_expand",
+                namespace=namespace,
+                seeds=len(seed_iris),
+                hits=len(hits),
+                added=len(graph_tables),
+                max_tables=max_graph_tables,
+                capped=len(graph_tables) >= max_graph_tables > 0,
+                tables=[t.get("table") for t in graph_tables],
+            )
+
         # Step 4: Build context from class metadata (raw text — no DDL reformatting)
         ddl_context = _build_raw_context(hits, expanded_tables)
+        graph_block, graph_added = _graph_context_block(expanded_tables, graph_tables)
+        if graph_block:
+            # Appended AFTER the retrieved block, and never in place of it: a
+            # walk-derived schema has no sampled values, so overwriting a retrieved
+            # table with one would remove information the writer relies on for
+            # WHERE literals.
+            ddl_context = f"{ddl_context}\n{graph_block}"
+            expanded_tables = expanded_tables + graph_added
         # Log the schema context handed to the LLM so the NL→SQL INPUT is
         # observable (not just the generated SQL). `has_allowed_values` flags
         # whether per-column enum literals reached the prompt — the signal that
         # lets the LLM write correct WHERE values.
+        #
+        # `context_tables` is the authoritative list of what the writer saw.
+        # `context_preview` is capped at 2000 chars, which is 1-4 tables out of a
+        # context that routinely runs past 7000 — it has been read as "only 4 tables
+        # reach the model", so the cap is now flagged explicitly.
+        # `+ graph_added`: a walked table has no retrieved hit behind it, so
+        # `_context_tables` drops it — correct for the retrieved block, wrong for
+        # the log, since the graph block puts that table's schema in the prompt
+        # too. Without this the line reports fewer tables than the writer saw,
+        # which is exactly the misreading the `context_tables` field was added to
+        # stop. Appended once: `expanded_tables` already carries them by here.
+        context_tables = _context_tables(hits, expanded_tables) + graph_added
         logger.info(
             "nl_to_sql_context",
             namespace=namespace,
             context_chars=len(ddl_context),
+            context_tables=context_tables,
+            n_context_tables=len(context_tables),
             has_allowed_values="allowed values:" in ddl_context,
-            context_preview=ddl_context[:2000],
+            context_preview=ddl_context[:_CONTEXT_PREVIEW_CHARS],
+            context_preview_truncated=len(ddl_context) > _CONTEXT_PREVIEW_CHARS,
         )
 
         # Step 5: Generate SQL via LLM
@@ -366,6 +600,38 @@ class SQLGenerator:
             trace_steps=trace,
             data_source_id=resolved_source,
             ddl_context=ddl_context,
+        )
+
+    async def generate_from_context(
+        self,
+        question: str,
+        ddl_context: str,
+        *,
+        evidence: str = "",
+        model_id: str | None = None,
+        dialect: str | None = None,
+        feedback: str = "",
+    ) -> tuple[str, float]:
+        """Generate SQL from an ALREADY-ASSEMBLED schema context.
+
+        The public seam onto the SQL writer for callers that do their own table
+        selection — the Tier-2 tool layer, whose consumer chose the tables
+        explicitly — so retrieval is skipped but generation stays identical to
+        :meth:`generate`'s final step.
+
+        Args:
+            question: Natural language question.
+            ddl_context: Schema context for the chosen tables.
+            evidence: Optional domain hints.
+            model_id: Optional per-call LLM model override.
+            dialect: Optional per-call SQL dialect override.
+            feedback: Optional prior-attempt SQL + observation to revise from.
+
+        Returns:
+            Tuple of (sql_string, confidence_score).
+        """
+        return await self._generate_sql(
+            question, ddl_context, evidence, model_id=model_id, dialect=dialect, feedback=feedback
         )
 
     async def correct(
@@ -415,13 +681,15 @@ class SQLGenerator:
             "After the query, rate your confidence (0.0-1.0). Format: Confidence: X.X"
         )
 
+        max_tokens = _resolve_max_output_tokens()
         result: ConverseResult = await self._llm.converse(
             prompt,
             system=self._system_prompt,
-            max_tokens=1024,
+            max_tokens=max_tokens,
             temperature=0,
             model_id=model_id,
         )
+        _warn_if_truncated(result, max_tokens, step="correct")
         return _extract_sql(result.text), _extract_confidence(result.text)
 
     def _expand_with_fk(self, tables: list[str]) -> list[str]:
@@ -447,6 +715,7 @@ class SQLGenerator:
         evidence: str,
         model_id: str | None = None,
         dialect: str | None = None,
+        feedback: str = "",
     ) -> tuple[str, float]:
         """Call LLM to generate SQL from question and DDL context.
 
@@ -456,6 +725,10 @@ class SQLGenerator:
             evidence: Optional domain hints.
             model_id: Optional per-call LLM model override.
             dialect: Optional per-call SQL dialect override.
+            feedback: Optional prior-attempt SQL + observation. When the agentic
+                strategy re-generates after a failed/empty run, this carries the
+                previous query and what executing it returned, so the writer
+                REVISES it instead of re-emitting byte-identical SQL at temp 0.
 
         Returns:
             Tuple of (sql_string, confidence_score).
@@ -466,6 +739,17 @@ class SQLGenerator:
                 f"<user_context>{evidence[:500]}</user_context>\n"
             )
             if evidence
+            else ""
+        )
+        feedback_block = (
+            (
+                f"\n## Prior attempt in this session (revise it)\n"
+                f"{feedback}\n"
+                "The prior query above did not correctly answer the question. "
+                "Diagnose why from the observation and return a CORRECTED query "
+                "— do not repeat the prior query unchanged.\n"
+            )
+            if feedback
             else ""
         )
         # Prompt-injection scoping via Bedrock guardContent (tier3 pattern):
@@ -480,7 +764,8 @@ class SQLGenerator:
         # guardrail can only score the guardContent copy.
         prompt = (
             f"## Database Schema (relevant tables)\n```sql\n{ddl_context}\n```\n"
-            f"{evidence_block}\n"
+            f"{evidence_block}"
+            f"{feedback_block}\n"
             "Return the SQL in a ```sql code block.\n"
             "After the query, rate your confidence (0.0-1.0) that this query "
             "correctly answers the question. Format: Confidence: X.X"
@@ -489,10 +774,11 @@ class SQLGenerator:
         # Use per-request dialect if provided, otherwise fall back to instance default
         system_prompt = _build_system_prompt(dialect) if dialect else self._system_prompt
 
+        max_tokens = _resolve_max_output_tokens()
         result: ConverseResult = await self._llm.converse(
             prompt,
             system=system_prompt,
-            max_tokens=1024,
+            max_tokens=max_tokens,
             temperature=0,
             model_id=model_id,
             guardrail_id=self._guardrail_id,
@@ -503,25 +789,111 @@ class SQLGenerator:
             guard_content=question,
         )
 
+        _warn_if_truncated(result, max_tokens, step="generate")
         return _extract_sql(result.text), _extract_confidence(result.text)
+
+
+def _warn_if_truncated(result: ConverseResult, max_tokens: int, *, step: str) -> None:
+    """Report a generation the output-token cap cut short.
+
+    Named at the NL→SQL layer as well as in the Bedrock client because this is
+    where the consequence lives: ``_extract_sql`` will happily return a query that
+    ends mid-statement, so without this line the only symptom is a downstream
+    execution error that reads like a model mistake.
+    """
+    if result.truncated:
+        logger.warning(
+            "nl_to_sql_generation_truncated",
+            step=step,
+            max_tokens=max_tokens,
+            response_chars=len(result.text),
+        )
 
 
 def _ms(start: float) -> int:
     return int((time.perf_counter() - start) * 1000)
 
 
+def _table_name_from_class_text(text: str) -> str:
+    """The bare table name a retrieved class's text describes, or "" if none.
+
+    Class text is stored as "Table: <name> | Description: ... | Columns: ...".
+    Anything not in that shape falls back to its first whitespace-delimited token.
+
+    Single definition on purpose: this parse used to be copy-pasted at three call
+    sites, each of which indexed ``text.split()[0]`` behind an ``if text`` guard —
+    which is truthy for whitespace-only text while ``split()`` returns NO tokens,
+    so a blank ``context_text`` raised IndexError and failed the whole request.
+    """
+    if not text:
+        return ""
+    if text.startswith("Table: "):
+        return text.split(" | ")[0].replace("Table: ", "").strip().lower()
+    parts = text.split()
+    return parts[0].lower() if parts else ""
+
+
 def _extract_table_names(hits: list[VectorHit]) -> list[str]:
     """Extract table names from OpenSearch class hits."""
     tables = []
     for hit in hits:
-        text = hit.text
-        if text.startswith("Table: "):
-            name = text.split(" | ")[0].replace("Table: ", "").strip().lower()
-        else:
-            name = text.split()[0].lower() if text else ""
+        name = _table_name_from_class_text(hit.text)
         if name:
             tables.append(name)
     return list(dict.fromkeys(tables))
+
+
+def hit_class_iri(hit: VectorHit) -> str:
+    """Class IRI stamped on a hit, or "" when the index carries none.
+
+    The one place hit → class identity is read. A table name is not identity in a
+    pooled namespace (same-named tables in different databases are different
+    classes), so anything keyed on the ontology — a graph walk's seed, a
+    walk-discovered table's schema — has to travel by IRI.
+    """
+    md = getattr(hit, "metadata", None) or {}
+    return str(md.get("uri") or md.get("entity_uri") or "")
+
+
+def _graph_context_block(existing_tables: Iterable[str], graph_tables: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    """``(prompt block, added table names)`` for walk-discovered tables.
+
+    Tables the retrieved block already carries are dropped: their retrieved text is
+    strictly richer, and listing a table twice invites the writer to treat two
+    descriptions of one table as two tables.
+
+    The block is labelled with its provenance and with the reason it might be
+    irrelevant. These tables were NOT ranked by similarity to the question, so
+    presenting them indistinguishably from retrieved ones would trade a missing-join
+    failure for a spurious-join one; the writer is told what they are and left to
+    decide, which is also the only division of labour consistent with keeping table
+    selection model-driven.
+
+    Returns ``("", [])`` when nothing survives, so the caller appends
+    unconditionally and the unflagged path stays byte-identical.
+    """
+    have = {t.strip().lower() for t in existing_tables if t and t.strip()}
+    lines: list[str] = []
+    added: list[str] = []
+    for t in graph_tables:
+        name = str(t.get("table") or "").strip()
+        schema = str(t.get("schema") or "").strip()
+        if not name or not schema or name.lower() in have:
+            continue
+        have.add(name.lower())
+        added.append(name)
+        via = str(t.get("via") or "").strip()
+        lines.append(f"{schema}\n  -- reached via: {via}" if via else schema)
+    if not lines:
+        return "", []
+    header = (
+        "-- The tables below were NOT matched to the question by similarity. They are "
+        "one foreign-key hop from the tables above in the ontology's relationship graph, "
+        "listed in case the answer needs a bridge or lookup table that the question does "
+        "not name. Use one only if the question actually requires it, and join it on the "
+        "foreign key shown."
+    )
+    return "\n".join([header, *lines]), added
 
 
 def _resolve_data_source_from_hits(hits: list[VectorHit]) -> str:
@@ -563,11 +935,7 @@ def _hit_table_source_map(hits: list[VectorHit]) -> dict[str, str]:
         ds_id = hit.data_source_id
         if not ds_id:
             continue
-        text = hit.text or ""
-        if text.startswith("Table: "):
-            name = text.split(" | ")[0].replace("Table: ", "").strip().lower()
-        else:
-            name = text.split()[0].lower() if text else ""
+        name = _table_name_from_class_text(hit.text or "")
         if not name:
             continue
         existing = mapping.get(name)
@@ -611,6 +979,39 @@ def _resolve_data_source_from_sql(sql: str, hits: list[VectorHit]) -> str:
     return ""
 
 
+def _hit_map(hits: list[VectorHit]) -> dict[str, str]:
+    """Map bare table name -> the class text that describes it.
+
+    Prefers the richer ``context_text`` (carries per-column allowed values) over
+    the embedded text; the name is derived from whichever text is used, since both
+    start with "Table: <name> | ...".
+
+    Keyed by the BARE name, so two same-named classes from different databases
+    collapse to whichever was seen last. That is only reachable in a namespace
+    pooling several databases, and fixing it needs a qualified identity rather than
+    a name — deliberately left alone here.
+    """
+    hit_map: dict[str, str] = {}
+    for hit in hits:
+        text = hit.metadata.get("context_text") or hit.text
+        name = _table_name_from_class_text(text)
+        if name:
+            hit_map[name] = text
+    return hit_map
+
+
+def _context_tables(hits: list[VectorHit], expanded_tables: list[str]) -> list[str]:
+    """The tables :func:`_build_raw_context` actually renders, in prompt order.
+
+    Not the same list as ``expanded_tables``: a name with no retrieved hit behind
+    it (an FK-expanded neighbour) contributes nothing to the context. Logged so the
+    set of tables the writer saw is readable directly, instead of being counted off
+    a length-capped preview string.
+    """
+    hit_map = _hit_map(hits)
+    return [table for table in expanded_tables if hit_map.get(table)]
+
+
 def _build_raw_context(hits: list[VectorHit], expanded_tables: list[str]) -> str:
     """Pass class text directly as context — no DDL reformatting.
 
@@ -618,26 +1019,8 @@ def _build_raw_context(hits: list[VectorHit], expanded_tables: list[str]) -> str
     ('Table: name | Description: ... | Columns: col:type (desc), ...') which
     LLMs parse effectively without transformation to CREATE TABLE syntax.
     """
-    hit_map = {}
-    for hit in hits:
-        # Prefer the richer context_text (carries per-column allowed values) when
-        # present; fall back to the embedded text. The table name is derived from
-        # whichever text we use — both start with "Table: <name> | ...".
-        text = hit.metadata.get("context_text") or hit.text
-        if text.startswith("Table: "):
-            name = text.split(" | ")[0].replace("Table: ", "").strip().lower()
-        else:
-            name = text.split()[0].lower() if text else ""
-        if name:
-            hit_map[name] = text
-
-    lines = []
-    for table in expanded_tables:
-        text = hit_map.get(table)
-        if text:
-            lines.append(text)
-
-    return "\n".join(lines)
+    hit_map = _hit_map(hits)
+    return "\n".join(hit_map[table] for table in expanded_tables if hit_map.get(table))
 
 
 _SQL_KEYWORD_RE = re.compile(r"\b(SELECT|WITH)\b", re.IGNORECASE)

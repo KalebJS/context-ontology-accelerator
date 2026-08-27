@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -57,6 +58,7 @@ from ..templates import (
     DEFAULT_EDGE_TYPED_LIMIT,
     EDGE_TYPED_TRAVERSAL,
     KEYWORD_ENTITY_SEARCH,
+    KEYWORD_ENTITY_SEARCH_WITH_CONTAINERS,
     MAX_EDGE_TYPES,
     MAX_ENTITIES,
     MIN_EDGE_TYPES,
@@ -69,6 +71,22 @@ from .base import ToolResult
 logger = structlog.get_logger(__name__)
 
 TOOL_NAME = "graph_traversal"
+
+# Compatibility contract with graphrag-lexical-graph 3.18.7's persisted
+# ``Entity.search_str``. Keep this tiny local copy instead of importing the
+# toolkit's private graph_utils module at import time: that module eagerly pulls
+# the toolkit and LlamaIndex graph stack, violating this tool's lazy-import
+# boundary. A unit test compares this function with the installed helper.
+_GRAPHRAG_SEARCH_STRING_PATTERN = re.compile(r"([^\s\w]|_)+")
+
+
+def normalize_graphrag_search_text(value: str) -> str:
+    """Normalize a query candidate exactly like toolkit 3.18.7 ``search_str``."""
+    normalized = _GRAPHRAG_SEARCH_STRING_PATTERN.sub(" ", value)
+    while "  " in normalized:
+        normalized = normalized.replace("  ", " ")
+    return normalized.lower().strip()
+
 
 # Default wall-clock cap for a single graph query. The toolkit call is synchronous
 # and cannot be cancelled once running, so it executes on a bounded worker pool and
@@ -249,16 +267,32 @@ class GraphTraversalTool:
     async def _invoke_keyword(
         self, namespace: str, *, query: str = "", limit: int = DEFAULT_EDGE_TYPED_LIMIT, **_: Any
     ) -> ToolResult:
-        # Canonical serve-layer query-term extraction (toolkit-free): tokenizes,
-        # lowercases, drops stop words and <=2-char tokens, so terms match the
-        # entity ``search_str`` (which is itself a normalized, lowercased string).
-        from ....query_utils import extract_query_entities
+        # Build one bounded raw plan, then apply the property graph's persisted
+        # ``search_str`` contract at this sink only. RDF consumers intentionally
+        # keep their LCASE-compatible spelling instead.
+        from ....query_utils import build_query_search_plan
 
-        terms = extract_query_entities(query or "", max_count=5)
-        if not terms:
+        search_plan = build_query_search_plan(query or "", max_count=5)
+        terms = list(
+            dict.fromkeys(
+                normalized
+                for candidate in search_plan.terms
+                if (normalized := normalize_graphrag_search_text(candidate))
+            )
+        )
+        containers = list(
+            dict.fromkeys(
+                normalized
+                for candidate in search_plan.containers
+                if (normalized := normalize_graphrag_search_text(candidate))
+            )
+        )
+        probes = list(dict.fromkeys(terms + containers))
+        if not probes:
             return ToolResult(detail=f"{self.name}[keyword]: no usable terms in query")
-        cypher = KEYWORD_ENTITY_SEARCH.format(entity_label=self._entity_label(namespace), limit=int(limit))
-        rows = await self._run_cypher(cypher, {"terms": terms})
+        template = KEYWORD_ENTITY_SEARCH_WITH_CONTAINERS if containers else KEYWORD_ENTITY_SEARCH
+        cypher = template.format(entity_label=self._entity_label(namespace), limit=int(limit))
+        rows = await self._run_cypher(cypher, {"probes": probes, "terms": terms, "containers": containers})
         entities = [
             GraphEntity(uri=row.get("uri", ""), label=row.get("label", ""), type=row.get("class", ""))
             for row in rows

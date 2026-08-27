@@ -867,7 +867,7 @@ def _run_induction(
             # in ``finally``.
             watchdog = _start_watchdog(job_id, ns, watchdog_stop, region=config.get("llm_region"))
 
-            proposal_graph, novel_tables, matches = strategy_instance.induce(
+            proposal_graph, novel_tables, matches, dropped_tables = strategy_instance.induce(
                 tables=all_tables,
                 ontology_uri_prefix=body.ontology_uri_prefix,
                 config=config,
@@ -998,6 +998,7 @@ def _run_induction(
                 ),
                 induced_ontology_id=proposal_id,
                 induced_ontology_uri=body.ontology_uri_prefix,
+                dropped_tables=[schemas_mod.DroppedTable(**d) for d in dropped_tables],
             )
 
             job.status = schemas_mod.JobStatus.COMPLETED

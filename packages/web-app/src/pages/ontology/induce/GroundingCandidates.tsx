@@ -115,7 +115,22 @@ export function GroundingCandidates({
   return (
     <SpaceBetween size="s">
       {/* Status line — current grounding state, unsaved indicator. */}
-      {chosenUri ? (
+      {isSuggested && chosenUri ? (
+        <StatusIndicator type={hasPending ? "pending" : "warning"}>
+          Ambiguous match to <strong>{localName(chosenUri)}</strong>
+          {hasPending && " (unsaved — click Save changes to apply)"}
+          {match.matched_ontology_id && !hasPending && (
+            <>
+              {" "}
+              from <strong>{ontologyLabel(match.matched_ontology_id)}</strong>
+            </>
+          )}
+          <Box variant="small" display="inline" color="text-status-inactive">
+            {" "}
+            — low confidence, review before accepting
+          </Box>
+        </StatusIndicator>
+      ) : chosenUri ? (
         <StatusIndicator type={hasPending ? "pending" : "success"}>
           Grounded to <strong>{localName(chosenUri)}</strong>
           {hasPending && " (unsaved — click Save changes to apply)"}

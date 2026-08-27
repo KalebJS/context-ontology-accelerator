@@ -34,6 +34,18 @@ from .sources_registry import SourcesRegistry
 
 logger = structlog.get_logger(__name__)
 
+
+def _append_limit(sql: str, max_rows: int) -> str:
+    """Textual-append fallback for ``_inject_limit``.
+
+    The LIMIT goes on its OWN line: LLM-generated SQL frequently ends with a
+    ``-- comment`` line (e.g. a stated assumption), and a same-line append
+    would land inside that comment — silently removing the scan cap while the
+    query still executes.
+    """
+    return f"{sql.rstrip().rstrip(';')}\nLIMIT {int(max_rows)}"
+
+
 _POOL_SIZE = int(os.environ.get("ATHENA_THREAD_POOL_SIZE", "3"))
 _EXECUTOR = ThreadPoolExecutor(max_workers=_POOL_SIZE, thread_name_prefix="athena")
 
@@ -316,17 +328,17 @@ class AthenaQueryExecutor:
         try:
             parsed = sqlglot.parse_one(sql, dialect="trino")
         except Exception:
-            return f"{sql.rstrip(';')} LIMIT {int(max_rows)}"
+            return _append_limit(sql, max_rows)
 
         # Only the OUTER query's own limit — args.get("limit"), not find() which
         # descends into subqueries. Set-ops (UNION/EXCEPT) and non-Select roots
         # don't carry an outer .args["limit"] we can safely edit → textual append.
         if not isinstance(parsed, sqlglot.exp.Select):
-            return f"{sql.rstrip(';')} LIMIT {int(max_rows)}"
+            return _append_limit(sql, max_rows)
 
         limit_node = parsed.args.get("limit")
         if limit_node is None:
-            return f"{sql.rstrip(';')} LIMIT {int(max_rows)}"
+            return _append_limit(sql, max_rows)
 
         existing = limit_node.expression
         # Replace the outer LIMIT when it is non-integer (param/expr) OR an integer
@@ -340,7 +352,7 @@ class AthenaQueryExecutor:
         try:
             return parsed.sql(dialect="trino")
         except Exception:
-            return f"{sql.rstrip(';')} LIMIT {int(max_rows)}"
+            return _append_limit(sql, max_rows)
 
     @staticmethod
     def _rewrite_table_names_for_federation(sql: str, schema: str) -> str:

@@ -32,12 +32,13 @@ import time
 import structlog
 from coa_common import ontology_vector_index_name
 
-from ...clients.base import QueryExecutor
+from ...clients.base import GraphClient, QueryExecutor
 from ...exceptions import AccessDeniedError
 from ...identity import display_principal
 from ...step_ids import StepId
 from ..sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError
 from ..strategy import StrategyContext, StrategyOption, StrategyResult, capped_max_rows
+from ..tools import OntologyGraphTool
 from .sql_generator import SQLGenerator
 
 logger = structlog.get_logger(__name__)
@@ -60,6 +61,27 @@ _SQL_STRING_LITERAL = re.compile(r"'((?:[^']|'')*)'")
 # Shortest literal we treat as a "user value". A 1-char filter is too likely to
 # be an incidental substring of the question to protect from correction.
 _MIN_USER_LITERAL_LEN = 2
+
+
+def _graph_expand_enabled(options: dict | None = None) -> bool:
+    """True when ontology-graph expansion of the retrieved tables is on.
+
+    When on (and a graph client is wired), the tables one FK hop from the retrieved
+    classes are appended to the schema context with their columns — this path's only
+    route to a table vector retrieval did not rank, since it has one shot and no
+    tools. Where the agentic arm's ``explore_graph`` is a tool the model may or may
+    not call, this fires on every generation, so the measured effect is the graph's,
+    not the model's tool adherence.
+
+    Two toggles, matching the agentic flags: env ``SERVE_NL2SQL_GRAPH_EXPAND``
+    (deployment-wide, off) and per-request ``options.flatGraphExpand``. The
+    per-request form is what lets expansion-on and expansion-off run PAIRED against
+    ONE image; without it the two arms need two deployments and the delta is
+    confounded with everything else that differed between them.
+    """
+    if options and str(options.get("flatGraphExpand", "")).strip().lower() in ("1", "true", "on", "yes"):
+        return True
+    return os.environ.get("SERVE_NL2SQL_GRAPH_EXPAND", "").strip().lower() in ("1", "true", "on", "yes")
 
 
 def _user_supplied_literal_in_sql(sql: str, query: str) -> bool:
@@ -101,6 +123,7 @@ class NLtoSQLStrategy:
         query_executor: QueryExecutor | None,
         oss_ontology_index: str = "",
         max_shots: int | None = None,
+        graph_client: GraphClient | None = None,
     ):
         """Wire the SQL generator, firewall, executor, and ontology index.
 
@@ -111,11 +134,16 @@ class NLtoSQLStrategy:
             oss_ontology_index: OpenSearch ontology index used for class retrieval.
             max_shots: Maximum generation+execution attempts (1 = no self-correction).
                 Defaults to the NL_TO_SQL_MAX_SHOTS env var or 2.
+            graph_client: Optional SPARQL client backing the opt-in ontology-graph
+                expansion (``SERVE_NL2SQL_GRAPH_EXPAND`` /
+                ``options.flatGraphExpand``). Unused unless one of those is on, so
+                passing it is inert on the default path.
         """
         self._sql_generator = sql_generator
         self._firewall = firewall
         self._query_executor = query_executor
         self._oss_ontology_index = oss_ontology_index
+        self._graph_client = graph_client
         self._max_shots = max_shots if max_shots is not None else _resolve_max_shots()
 
     async def resolve(self, query: str, namespace: str, context: StrategyContext) -> StrategyResult | None:
@@ -156,6 +184,16 @@ class NLtoSQLStrategy:
                 logger.warning("dialect_resolution_failed", error=str(e), fallback="athena")
 
         evidence = options.get("evidence", "")[:500]
+        # Request-scoped: the tool caches this namespace's FK edges and named graphs
+        # for the life of the object, and that cache must not outlive a request (a
+        # namespace can be re-ingested between two of them). No catalog is passed —
+        # there is no agent here, so seeds are the retrieved classes' IRIs rather
+        # than a table name needing resolution.
+        graph_expander = (
+            OntologyGraphTool(self._graph_client, namespace=namespace)
+            if (_graph_expand_enabled(options) and self._graph_client is not None)
+            else None
+        )
         nl_to_sql_result = await self._sql_generator.generate(
             query,
             namespace=namespace,
@@ -164,6 +202,7 @@ class NLtoSQLStrategy:
             embedding=embedding,
             model_id=context.model_id,
             dialect=dialect,
+            graph_expander=graph_expander,
         )
 
         t_ms = int((time.perf_counter() - t_start) * 1000)

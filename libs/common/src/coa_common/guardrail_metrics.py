@@ -6,8 +6,15 @@
 One helper for every site that decides a guardrail outcome (issue #111, AC10/AC11).
 Emits three metrics under ``COA/Guardrails``:
 
-* ``GuardrailInvocations`` (Count) — every decision, allow or block.
-* ``GuardrailBlocked`` (Count) — 1 only when the guardrail intervened with a block.
+* ``GuardrailInvocations`` (Count) — every decision, whatever the outcome. Carries the
+  ``Decision`` dimension, so ALLOW/ANONYMIZED/BLOCK/UNKNOWN/MODEL_FILTERED are separable.
+* ``GuardrailBlocked`` (Count) — 1 only when the guardrail intervened with a **confirmed**
+  block. Never incremented for an unconfirmed suppression: see ``GuardrailUnknown``.
+* ``GuardrailUnknown`` (Count) — 1 when the guardrail intervened but the outcome could not
+  be classified (no trace). Such a call IS suppressed, but suppression on missing evidence
+  is not a policy block, and folding it into ``GuardrailBlocked`` would make both numbers
+  unrecoverable. Should be zero in steady state — a non-zero value means guardrail traces
+  stopped arriving, which previously destroyed answers silently.
 * ``GuardrailLatency`` (Milliseconds) — wall-clock of the guarded call.
 
 Block *rate* is deliberately NOT emitted: it is a CloudWatch math expression
@@ -64,6 +71,17 @@ COMPONENT_ONTOLOGY_SHAPES = "ontology-shapes"
 
 DECISION_ALLOW = "ALLOW"
 DECISION_BLOCK = "BLOCK"
+# Masked, not blocked. Its own value because masking is invisible otherwise: an
+# NTSB/TimeBank benchmark found 68% of one arm's answers silently carrying {NAME}
+# placeholders, which no existing metric would have surfaced.
+DECISION_ANONYMIZED = "ANONYMIZED"
+# Guardrail intervened but no trace was returned, so the action is unknown. The call
+# is suppressed (fail closed) yet deliberately NOT counted as a confirmed block.
+DECISION_UNKNOWN = "UNKNOWN"
+# The model filtered its own output (``stopReason=content_filtered``). Not a
+# Bedrock Guardrail policy action at all — kept distinct so a native model refusal
+# is never read as a guardrail block, nor (as before) as an ALLOW.
+DECISION_MODEL_FILTERED = "MODEL_FILTERED"
 
 # Guardrail policy key → (items key, reported filter_type). Mirrors
 # ``guardrail_screener.GUARDRAIL_POLICY_PATHS``, deliberately re-declared rather
@@ -164,23 +182,29 @@ def emit_guardrail_decision(
     transport: Literal["put", "emf"] = "put",
     region: str | None = None,
     cloudwatch_client: Any = None,
+    decision: str | None = None,
 ) -> None:
-    """Record one guardrail allow/block decision as metrics plus a log line.
+    """Record one guardrail decision as metrics plus a log line.
 
-    Emits on BOTH outcomes so the allow path is observable too (a guardrail
+    Emits on EVERY outcome so the allow path is observable too (a guardrail
     that stopped being called looks identical to one that never blocks unless
     invocations are counted).
 
     Args:
         component: Dimension value, e.g. :data:`COMPONENT_KG_BUILD`.
-        blocked: True when the guardrail intervened with a block.
+        blocked: True only for a CONFIRMED block; drives ``GuardrailBlocked``.
+            An unconfirmed suppression passes ``blocked=False`` with
+            ``decision=DECISION_UNKNOWN`` so the two stay separable.
         latency_ms: Wall-clock of the guarded call, in milliseconds.
         filter_type: CONTENT/PII/TOPIC/NONE, from :func:`filter_type_from_assessments`.
         transport: ``"put"`` for ECS (PutMetricData), ``"emf"`` for Lambda-style stdout.
         region: Region override for the CloudWatch client (``"put"`` only).
         cloudwatch_client: Injected client for tests (``"put"`` only).
+        decision: Explicit decision label. Omit to derive ALLOW/BLOCK from
+            ``blocked``, which is what every pre-existing caller does.
     """
-    decision = DECISION_BLOCK if blocked else DECISION_ALLOW
+    if decision is None:
+        decision = DECISION_BLOCK if blocked else DECISION_ALLOW
 
     # Best-effort, and separately suppressed from the metrics below: a logging
     # failure must not cost us the metric, nor vice versa.
@@ -214,6 +238,8 @@ def _emit_emf(component: str, decision: str, blocked: bool, latency_ms: float) -
     emit_metric(METRICS_NAMESPACE, "GuardrailLatency", latency_ms, "Milliseconds", Component=component)
     if blocked:
         emit_metric(METRICS_NAMESPACE, "GuardrailBlocked", 1, "Count", Component=component)
+    if decision == DECISION_UNKNOWN:
+        emit_metric(METRICS_NAMESPACE, "GuardrailUnknown", 1, "Count", Component=component)
 
 
 def _emit_put(
@@ -244,6 +270,15 @@ def _emit_put(
         metric_data.append(
             {
                 "MetricName": "GuardrailBlocked",
+                "Unit": "Count",
+                "Dimensions": component_dim,
+                "Value": 1.0,
+            }
+        )
+    if decision == DECISION_UNKNOWN:
+        metric_data.append(
+            {
+                "MetricName": "GuardrailUnknown",
                 "Unit": "Count",
                 "Dimensions": component_dim,
                 "Value": 1.0,

@@ -351,10 +351,10 @@ export function ClassDetailPanel({
                 />
               )}
             </FormField>
-            {/* Origin — grounding is carried by skos:exactMatch/closeMatch
+            {/* Origin — grounding is carried by skos:exactMatch/closeMatch/relatedMatch
                 (coa:groundedTo retired, Item 8); ``g.groundedTo`` is the
                 foundational target's local name. */}
-            {g.groundedTo ? (
+            {g.matchType === "exact" || g.matchType === "close" ? (
               <Box>
                 <Box variant="awsui-key-label">Grounded to</Box>
                 <Badge color="blue">{g.groundedTo}</Badge>
@@ -381,6 +381,15 @@ export function ClassDetailPanel({
                     </InfoPopover>
                   </>
                 )}
+              </Box>
+            ) : g.matchType === "related" ? (
+              <Box>
+                <Box variant="awsui-key-label">Origin</Box>
+                <Badge>Ambiguous match to {g.groundedTo}</Badge>
+                <Box variant="small" display="inline">
+                  {" "}
+                  (low confidence, review Grounding tab)
+                </Box>
               </Box>
             ) : (
               <Box>
