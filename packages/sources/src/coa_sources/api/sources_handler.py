@@ -34,6 +34,7 @@ from typing import Any
 import boto3
 import structlog
 from boto3.dynamodb.conditions import Attr
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common import resolve_region
 from coa_common.constants import (
@@ -181,7 +182,12 @@ def _get_sqs():
 def _get_s3():
     global _s3
     if _s3 is None:
-        _s3 = boto3.client("s3", region_name=_AWS_REGION)
+        # Pin SigV4 for presigned document-upload URLs: a no-Config client
+        # falls back to the deprecated SigV2 presigner in pre-2014 regions,
+        # and SigV2-only regions can't presign at all. Only ContentType is
+        # signed (see document_routes._handle_upload_urls), so browser PUTs
+        # stay valid under SigV4.
+        _s3 = boto3.client("s3", region_name=_AWS_REGION, config=Config(signature_version="s3v4"))
     return _s3
 
 
