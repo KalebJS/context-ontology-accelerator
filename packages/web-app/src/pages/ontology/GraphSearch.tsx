@@ -30,7 +30,7 @@ import {
   listOntologies,
   type GraphSearchHit,
   type GraphVertex,
-  type OntologyRecord,
+  type ListedOntology,
 } from "../../services/ontology-engine";
 import {
   useGraphClasses,
@@ -359,14 +359,14 @@ export function ontologyIdFromGraphUri(graphUri: string | undefined): string {
  */
 export function resolveOntologyInfo(
   graphUri: string | undefined,
-  byId: Map<string, OntologyRecord>,
+  byId: Map<string, ListedOntology>,
 ): OntologyInfo {
   const id = ontologyIdFromGraphUri(graphUri);
   const rec = byId.get(id);
   return {
     id,
     name: rec?.title || localName(id) || "Unknown ontology",
-    induced: rec?.ontology_type === "induced",
+    induced: rec?.ontologyType === "induced",
   };
 }
 
@@ -380,7 +380,7 @@ export function resolveOntologyInfo(
  */
 export function resolveVertexSources(
   graphUris: string[] | undefined,
-  byId: Map<string, OntologyRecord>,
+  byId: Map<string, ListedOntology>,
 ): OntologyInfo[] {
   const byId2 = new Map<string, OntologyInfo>();
   for (const g of graphUris ?? []) {
@@ -400,17 +400,19 @@ export const ALL_ONTOLOGIES_VALUE = "__all__";
  * ALL_ONTOLOGIES_VALUE}); its ``description`` marks induced ontologies.
  */
 export function buildOntologyFilterOptions(
-  byId: Map<string, OntologyRecord>,
+  byId: Map<string, ListedOntology>,
 ): SelectProps.Option[] {
   const records = [...byId.values()].sort((a, b) =>
-    (a.title || a.ontology_id).localeCompare(b.title || b.ontology_id),
+    (a.title || a.ontologyId || "").localeCompare(
+      b.title || b.ontologyId || "",
+    ),
   );
   return [
     { value: ALL_ONTOLOGIES_VALUE, label: "All ontologies" },
     ...records.map((r) => ({
-      value: r.ontology_id,
-      label: r.title || localName(r.ontology_id),
-      description: r.ontology_type === "induced" ? "Induced" : undefined,
+      value: r.ontologyId,
+      label: r.title || localName(r.ontologyId),
+      description: r.ontologyType === "induced" ? "Induced" : undefined,
     })),
   ];
 }
@@ -422,14 +424,16 @@ export function buildOntologyFilterOptions(
  * ontology (or an empty registry).
  */
 export function defaultOntologyFilterValue(
-  byId: Map<string, OntologyRecord>,
+  byId: Map<string, ListedOntology>,
 ): string {
   const induced = [...byId.values()]
-    .filter((r) => r.ontology_type === "induced")
+    .filter((r) => r.ontologyType === "induced")
     .sort((a, b) =>
-      (a.title || a.ontology_id).localeCompare(b.title || b.ontology_id),
+      (a.title || a.ontologyId || "").localeCompare(
+        b.title || b.ontologyId || "",
+      ),
     );
-  return induced[0]?.ontology_id ?? ALL_ONTOLOGIES_VALUE;
+  return induced[0]?.ontologyId ?? ALL_ONTOLOGIES_VALUE;
 }
 
 /** A List-view row: a class enriched with its ontology + description. */
@@ -466,7 +470,7 @@ export type ClassRow = {
  */
 export function buildClassRows(
   classes: GraphSearchHit[],
-  ontologyById: Map<string, OntologyRecord>,
+  ontologyById: Map<string, ListedOntology>,
   descriptionByUri: Map<string, string>,
 ): ClassRow[] {
   const rows: ClassRow[] = classes.map((c) => {
@@ -602,7 +606,7 @@ export function GraphSearchPage() {
   );
   // ontology_id → registry record, for resolving ontology name + induced flag
   // in the List view (fetched once on mount alongside the classes).
-  const [ontologyById, setOntologyById] = useState<Map<string, OntologyRecord>>(
+  const [ontologyById, setOntologyById] = useState<Map<string, ListedOntology>>(
     new Map(),
   );
 
@@ -779,7 +783,7 @@ export function GraphSearchPage() {
     listOntologies(apiClient, namespaceId)
       .then((records) => {
         if (cancelled) return;
-        setOntologyById(new Map(records.map((r) => [r.ontology_id, r])));
+        setOntologyById(new Map(records.map((r) => [r.ontologyId, r])));
       })
       .catch(() => {
         // Best-effort: registry enriches ontology names in the List view.

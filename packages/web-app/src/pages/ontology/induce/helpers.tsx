@@ -10,6 +10,74 @@ export function shortId(id: string, len = 8): string {
 }
 
 /**
+ * Human-readable source-type label for a proposal. ``source_type`` is a
+ * first-class field on the proposal (not inside ``metadata``); pre-schema-delta
+ * rows lack it and are treated as structured, matching the backend's
+ * asymmetric backfill in ``dynamo_store.list_proposals``.
+ */
+export function proposalSourceTypeLabel(
+  sourceType: string | undefined,
+): string {
+  return sourceType === "UNSTRUCTURED" ? "Unstructured" : "Structured";
+}
+
+/**
+ * A per-run size label the proposals list can show as a real disambiguator
+ * that a single (often generic) ``label`` cannot provide:
+ *
+ *   - structured runs → tables processed (``metadata.tables_processed``,
+ *     written by the catalog induction path)
+ *   - unstructured runs → classes induced (``metadata.class_count``,
+ *     written by the unstructured induction path; tables are not processed).
+ *
+ * ``null`` when nothing meaningful is recorded (e.g. an in-flight
+ * ``inducing`` stub row that has no metadata yet). ``source_type`` lives
+ * on the proposal itself (a first-class column, not inside ``metadata``);
+ * pre-schema-delta rows lack it and are treated as structured, matching
+ * the backend's asymmetric backfill in ``dynamo_store.list_proposals``.
+ */
+export function proposalScope(
+  metadata: Record<string, unknown> | undefined,
+  sourceType: string | undefined,
+): string | null {
+  const isUnstructured = sourceType === "UNSTRUCTURED";
+  const key = isUnstructured ? "class_count" : "tables_processed";
+  const value = metadata?.[key];
+  // Reject NaN/Infinity AND negatives — a negative count is corrupted data,
+  // never a real "N tables"/"N classes". Treated as "no metric" ("—").
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+    return null;
+  const unit = isUnstructured
+    ? value === 1
+      ? "class"
+      : "classes"
+    : value === 1
+      ? "table"
+      : "tables";
+  return `${value} ${unit}`;
+}
+
+/**
+ * Numeric sort key for the scope column. Returns the raw
+ * ``tables_processed`` (structured) or ``class_count`` (unstructured), or
+ * ``-1`` for rows with nothing to show (sink-to-bottom on ascending sort).
+ */
+export function proposalScopeSortKey(
+  metadata: Record<string, unknown> | undefined,
+  sourceType: string | undefined,
+): number {
+  const key =
+    sourceType === "UNSTRUCTURED" ? "class_count" : "tables_processed";
+  const value = metadata?.[key];
+  // Mirror proposalScope: negatives are corrupted data → treat as "no metric"
+  // (-1) so they sink to the bottom on ascending sort rather than sorting below
+  // a legitimate 0.
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : -1;
+}
+
+/**
  * Proposal statuses that mean an accept is in flight: a worker is (or was)
  * running, so Accept must stay disabled and the detail page should keep polling.
  * Mirrors the backend's ``_ACCEPT_IN_PROGRESS_STATUSES`` (proposals.py).

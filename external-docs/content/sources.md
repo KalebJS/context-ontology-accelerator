@@ -43,6 +43,28 @@ flowchart LR
 | JDBC | `JDBC_DATABASE` | Oracle | Athena federated only |
 | JDBC | `JDBC_DATABASE` | Snowflake | Athena federated only |
 
+### Custom data source connectors
+
+A source with no native support above — SAP, a mainframe, an internal REST API, a
+proprietary SaaS — reaches COA through an **Athena Query Federation connector**: a Lambda
+you deploy in your own account and register as an Athena data catalog. COA then queries it
+through Athena, the same federated path a JDBC source uses.
+
+Because a connector supplies its own metadata, you declare what COA would otherwise read
+from a database's information schema:
+
+- **Column descriptions** are the Arrow schema's per-column comments.
+- **Primary and foreign keys** travel inside those same comments, as `@pk` and
+  `@fk(parent_table.parent_column)` tags that COA parses out and strips.
+
+Two COA roles reach a connector and both must be granted: the **serve** role runs queries,
+and the **discovery** role runs `DESCRIBE` — which is the only way the key tags are read.
+Grant serve alone and the connector answers queries correctly while no declared key is
+ever found.
+
+A reference connector, and a toolkit that handles the comment placement and tag encoding
+for you, live in the `connectors/` directory of this repository; start from its README.
+
 ### Direct SQL vs Athena federated
 
 For JDBC sources, the serve layer picks the query path automatically — you don't
@@ -431,6 +453,20 @@ LIMIT 100;
 | Snowflake/Oracle scan succeeds but Athena queries return `TABLE_NOT_FOUND` on an empty catalog | Historical casing-filter bug (fixed) — the federated catalog resolved but exposed zero objects because Snowflake/Oracle fold unquoted identifiers to UPPERCASE | Fixed in current releases (the lowercase casing filter is no longer sent for Oracle/Snowflake). Delete and re-create the source if it was onboarded before the fix — the property is non-updatable |
 | `SCAN_FAILED` with `... exceeding the limit of N` | Source has more tables than `MAX_TABLES_PER_SOURCE` (default `10000`); discovery fails fast rather than hitting the Lambda timeout | Narrow the scan scope with `schemaFilter` / `schemaExcludeFilter` / `tableFilter` (e.g. exclude system schemas like `schemaExcludeFilter: "information_schema\|pg_catalog\|sys"`). If a larger source genuinely needs to be scanned in one pass, raise (or set `0` to disable) the `MAX_TABLES_PER_SOURCE` env var on the `sources-db-connector` Lambda. |
 | Scan times out on a very large Glue/Athena catalog | Enum sampling issues one Athena query per candidate column; the fan-out has to fit inside the scan Lambda timeout | Sampling queries run in parallel, capped by the `ATHENA_SAMPLING_CONCURRENCY` env var on the `sources-db-connector` Lambda (default `16`). Raise it if the account's Athena concurrent-DML quota allows more in-flight queries — that quota, not this setting, is the real ceiling. A non-numeric value falls back to `16`, and the effective concurrency is floored at `1`. |
+
+### Custom connector issues
+
+Symptoms specific to a source reached through an Athena federation connector. The connector's own
+guide (`connectors/README.md`) covers each in more depth.
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Tables are discovered but no primary or foreign keys arrive | The discovery role has no `lambda:InvokeFunction` on the connector, so `DESCRIBE` — the only thing that reads the key tags — never ran | Grant the role named by `/{prefix}/sources/db-connector-role-arn`. Queries work without it, which is why this looks like a metadata problem rather than a permissions one |
+| `DESCRIBE` returns names and types with no comment column | The connector put comments on the Arrow *field* rather than in the schema's metadata, where Athena reads them | Build the schema with the toolkit's `TableSchema`, which makes the working placement the only one expressible |
+| A large result returns **zero rows** with status `SUCCEEDED` | The connector could not write its spill: no `spill_bucket`, the wrong prefix, or no `s3:PutObject` under it | Check the Lambda's `spill_bucket` and that `spill_prefix` is `connectors/<id>/spills`; confirm objects appear there during a query |
+| `AccessDenied`, but only on large results | Spill is read with the *querying* role's credentials, not the connector's | Grant the serve and discovery roles `s3:GetObject` under the spill prefix and `kms:Decrypt` on the spill key |
+| A `@fk(...)` tag appears verbatim in a stored description | The tag was malformed, and the parser's warning goes to COA's logs rather than the connector's | Build tags with the toolkit's `ColumnComment` rather than by hand |
+| Every read fails while metadata calls succeed | The connector's Lambda is missing `JAVA_TOOL_OPTIONS=--add-opens=java.base/java.nio=ALL-UNNAMED`, which Arrow needs on Java 17 | Set it; the CDK construct does this for you |
 
 ## Document Sources
 

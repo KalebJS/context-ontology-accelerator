@@ -174,7 +174,12 @@ class OntologyCatalogClient:
         with httpx.Client(timeout=30) as client:
             resp = client.get(f"{self.base_url}/ontologies/", params={"uri": uri})
             resp.raise_for_status()
-            results = resp.json()
+            payload = resp.json()
+            # ListOntologies answers with a {"ontologies": [...]} envelope; a bare
+            # array is still accepted so an older deployment keeps working. Note a
+            # non-empty dict is truthy, so the envelope must be unwrapped BEFORE
+            # the emptiness check or ``results[0]`` raises KeyError instead.
+            results = payload.get("ontologies") or [] if isinstance(payload, dict) else payload
             if not results:
                 raise ValueError(f"Ontology with URI '{uri}' not found")
             return results[0]
