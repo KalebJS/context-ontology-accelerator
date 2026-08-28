@@ -34,6 +34,7 @@ from typing import Any
 import boto3
 import structlog
 from boto3.dynamodb.conditions import Attr
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common import resolve_region
 from coa_common.constants import (
@@ -55,6 +56,11 @@ from coa_control_plane_server.models.source_summary import SourceSummary
 from coa_control_plane_server.models.source_type import SourceType
 from pydantic import ValidationError
 
+from coa_sources.database.connectors.athena_catalog import (
+    AthenaCatalogError,
+    delete_lambda_catalog,
+    derive_catalog_name,
+)
 from coa_sources.database.connectors.glue_connection_provisioner import (
     cleanup_federated_resources,
 )
@@ -181,7 +187,12 @@ def _get_sqs():
 def _get_s3():
     global _s3
     if _s3 is None:
-        _s3 = boto3.client("s3", region_name=_AWS_REGION)
+        # Pin SigV4 for presigned document-upload URLs: a no-Config client
+        # falls back to the deprecated SigV2 presigner in pre-2014 regions,
+        # and SigV2-only regions can't presign at all. Only ContentType is
+        # signed (see document_routes._handle_upload_urls), so browser PUTs
+        # stay valid under SigV4.
+        _s3 = boto3.client("s3", region_name=_AWS_REGION, config=Config(signature_version="s3v4"))
     return _s3
 
 
@@ -810,6 +821,37 @@ def _handle_delete(namespace_id: str, source_id: str) -> dict[str, Any]:
                     "status": current_status,
                 },
             )
+        sub_type = item.get("sourceSubType", "")
+
+        # A custom-connector source owns a top-level LAMBDA-type Athena data
+        # catalog, which is a plain athena:DeleteDataCatalog on this role — no
+        # Glue object, no Lake Formation grants, and so nothing to assume the
+        # federation provisioner's admin role for.
+        #
+        # This must run BEFORE the federated-teardown block below, and that block
+        # must exclude this sub-type: a Lambda catalog also populates
+        # `athenaDataCatalogName`, so it would otherwise match, assume the
+        # LF-admin role, and call glue.delete_catalog — a no-op for a Lambda
+        # catalog — reporting success while leaking the registration.
+        #
+        # Fails the delete (HTTP 500) rather than proceeding, for the same reason
+        # the federated teardown does: the source row is the only handle on the
+        # catalog, so dropping the row after a failed teardown orphans it.
+        if sub_type == SourceSubType.ATHENA_CONNECTOR:
+            catalog_name = item.get("athenaDataCatalogName") or derive_catalog_name(source_id)
+            try:
+                delete_lambda_catalog(catalog_name=catalog_name)
+            except AthenaCatalogError:
+                logger.exception(
+                    "athena_data_catalog_delete_failed",
+                    source_id=source_id,
+                    catalog_name=catalog_name,
+                )
+                return api_response(
+                    500,
+                    {"error": "Failed to remove the Athena data catalog; deletion not completed"},
+                )
+
         # Teardown of any Glue federated catalog / connection provisioned for
         # this source. Dropping an LF-governed catalog requires the federation
         # provisioner's Lake Formation admin role, so we assume it and run the
@@ -819,7 +861,11 @@ def _handle_delete(namespace_id: str, source_id: str) -> dict[str, Any]:
         # delete can be retried — rather than silently orphaning the resources.
         glue_conn = item.get("glueConnectionName")
         athena_cat = item.get("athenaDataCatalogName")
-        if (glue_conn or athena_cat) and _FEDERATION_PROVISIONER_ROLE_ARN:
+        if (
+            sub_type != SourceSubType.ATHENA_CONNECTOR
+            and (glue_conn or athena_cat)
+            and _FEDERATION_PROVISIONER_ROLE_ARN
+        ):
             try:
                 creds = (
                     _get_sts()

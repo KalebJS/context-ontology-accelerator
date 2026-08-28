@@ -1,4 +1,4 @@
-.PHONY: setup generate format lint test test-unit test-integ build load-test load-test-slow load-test-teardown deploy-dev deploy-serve destroy-dev preflight docs web-dev vkg-dev version version-check
+.PHONY: setup generate format lint test test-unit test-integ build load-test load-test-slow load-test-teardown deploy-dev deploy-serve deploy-example-connector destroy-dev preflight docs web-dev vkg-dev version version-check
 
 setup: generate
 	./scripts/setup-dev.sh
@@ -84,15 +84,27 @@ deploy-dev:
 deploy-serve:
 	./scripts/deploy-serve.sh dev
 
+## Deploy the example Athena federation connector (connectors/) into a dev account,
+## giving integration tests a federated source to query. Separate from deploy-dev on
+## purpose: it stands in for something a customer deploys in their own account, and it
+## must run AFTER COA — it reads COA's serve and discovery role ARNs from SSM.
+## Optional env vars: SCL_PREFIX (default: coa — matches the CDK app),
+## FUNCTION_NAME_PREFIX (default <prefix>-<env>-), EXAMPLE_BULK_ROWS /
+## EXAMPLE_BULK_ROW_BYTES to size the fixture past Athena's 6 MB limit and exercise spill.
+deploy-example-connector:
+	./scripts/deploy-example-connector.sh dev
+
 ## Tear down all dev stacks in one command. Deletes AgentCore Runtimes,
-## waits for their ENIs to detach (currently disabled — see destroy.sh),
+## waits for their ENIs to detach (and stops if they do not),
 ## deletes VKG's ECS services, force-deletes the DataZone domain (cascades
-## to RETAINed child resources CFN can't clear on its own), then runs
+## to RETAINed child resources CFN can't clear on its own), deletes every connector
+## stack (separate CDK apps, so `cdk destroy --all` never sees them), then runs
 ## `cdk destroy --all` and verifies no stacks remain (see #660, #661, #707).
 ## Optional env vars: SCL_PREFIX (default: coa — matches the CDK app), SCL_DESTROY_YES=1 to skip
-## the confirmation prompt (e.g. in CI), SCL_ENI_WAIT_MAX_SECONDS (default
-## 600), SCL_ECS_WAIT_MAX_SECONDS (default 300), and
-## SCL_DOMAIN_WAIT_MAX_SECONDS (default 300) to tune wait budgets.
+## the confirmation prompt (e.g. in CI), and the wait budgets
+## SCL_ENI_WAIT_MAX_SECONDS (600), SCL_ECS_WAIT_MAX_SECONDS (300),
+## SCL_DOMAIN_WAIT_MAX_SECONDS (300), SCL_CLOUDMAP_WAIT_MAX_SECONDS (180),
+## SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS (600).
 destroy-dev:
 	make generate
 	pnpm install

@@ -544,7 +544,7 @@ _JDBC_CONFIG = {
     "databaseName": "claims",
 }
 _ATHENA_CONFIG = {
-    "metadataFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:widgets-connector",
+    "connectorFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:widgets-connector",
     "databaseName": "widgets",
 }
 
@@ -730,3 +730,15 @@ class TestGetSourceMetricsBestEffort:
         doc_details = body.get("documentDetails", {})
         for field in ("documentsProcessed", "chunksLLM", "chunksEmbed", "chunksGraph"):
             assert field not in doc_details
+
+
+class TestPresignS3ClientConfig:
+    """Regression: presign client must use SigV4. A no-Config client falls back
+    to the deprecated SigV2 presigner in pre-2014 regions and can't presign at
+    all in SigV4-only regions (us-east-2, eu-*, ap-*, ca-*, me-*, af-*)."""
+
+    def test_get_s3_pins_sigv4(self):
+        from coa_sources.api import sources_handler
+
+        sources_handler._s3 = None  # reset cold-start singleton
+        assert sources_handler._get_s3().meta.config.signature_version == "s3v4"

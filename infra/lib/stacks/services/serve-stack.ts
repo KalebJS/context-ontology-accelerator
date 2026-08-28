@@ -19,7 +19,14 @@ import { parseEcrImageUri } from "../../utils/ecr-utils";
 import { bundlePython } from "../../utils/python-bundling";
 import { fromRoot, Paths } from "../../paths";
 import { DynamoDBTable, SCLStack, SclMonitoring } from "../../constructs";
-import { DEFAULT_BEDROCK_MODEL_ID } from "../../constants";
+import {
+  CONNECTOR_SPILL_KEY_GLOB,
+  CONNECTOR_SPILL_KMS_TAG_KEY,
+  CONNECTOR_SPILL_KMS_TAG_VALUE,
+  CONNECTOR_TAG_KEY,
+  CONNECTOR_TAG_VALUE,
+  DEFAULT_BEDROCK_MODEL_ID,
+} from "../../constants";
 import { TABLE_NAMES } from "@coa/shared";
 
 export interface ServeStackProps extends cdk.StackProps {
@@ -818,6 +825,254 @@ export class ServeStack extends SCLStack {
             `arn:aws:s3:::${athenaSpillBucket}`,
             `arn:aws:s3:::${athenaSpillBucket}/*`,
           ],
+        }),
+      );
+
+      // ── Custom Athena federation connectors (ATHENA_CONNECTOR sources) ──
+      //
+      // Invoke a customer-authored connector Lambda, and read what it spills.
+      // Both resources live in the CUSTOMER's account and are unknown at deploy
+      // time, so neither can be resource-enumerated. Containment is by condition
+      // key plus the customer's own resource policies, which must independently
+      // name this role — see the custom-connectors LLD §6.
+      //
+      // `aws:CalledVia` is populated on forward access sessions, so these Allows
+      // match only while Athena is executing a statement for this role, never a
+      // direct call from serve code. The key is multi-valued and its order
+      // cannot be constrained, hence ForAnyValue: AWS documents "somewhere in
+      // the chain" as the intended semantics. Evaluation fails CLOSED — an
+      // absent key does not match — so an error here denies rather than widens.
+      runtime.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "AthenaFederationConnectorInvoke",
+          actions: ["lambda:InvokeFunction"],
+          // The account MUST stay a wildcard — the connector lives in the
+          // customer's — so the ARN cannot scope this. A resource TAG does:
+          // Lambda evaluates aws:ResourceTag natively for InvokeFunction, with no
+          // per-resource opt-in, so an untagged function is simply unreachable.
+          // Preferred over a name convention because a tag cannot be matched by
+          // accident: a function that merely happens to be named a certain way
+          // does not inherit the grant. Athena exposes no condition key naming the
+          // catalog a forward-access-session invoke serves, so the tag is the
+          // tightest mechanism available.
+          //
+          // Region-pinned by choice, not by necessity: Athena CAN invoke a
+          // connector in another region when given its full ARN, but we do not
+          // support that topology, and the control-plane rejects a connector ARN
+          // outside this region at source-create.
+          resources: [`arn:aws:lambda:${region}:*:function:*`],
+          conditions: {
+            "ForAnyValue:StringEquals": {
+              "aws:CalledVia": "athena.amazonaws.com",
+            },
+            StringEquals: {
+              [`aws:ResourceTag/${CONNECTOR_TAG_KEY}`]: CONNECTOR_TAG_VALUE,
+            },
+          },
+        }),
+      );
+      // The escalation this Allow would otherwise open, closed explicitly.
+      //
+      // `aws:CalledVia` is satisfied by an Athena UDF
+      // (`USING EXTERNAL FUNCTION ... LAMBDA '<arn>'`), which needs nothing but
+      // StartQueryExecution — already held above — plus lambda:InvokeFunction. A
+      // same-account invoke also needs no resource policy, so without this Deny
+      // the Allow reaches every in-region Lambda in THIS account, including the
+      // federation provisioner that holds Lake Formation admin.
+      //
+      // A Deny on our own name prefix rather than an `aws:ResourceAccount`
+      // exclusion, because excluding the account would also rule out a connector
+      // deployed alongside this stack — which is how the reference connector and
+      // its integration test are deployed. Such a connector must therefore NOT be
+      // named with this deployment's prefix, or this Deny catches it — the one
+      // consequence the onboarding guide has to state. Spill works for it either
+      // way: the spill read below spans every account including this one, bounded
+      // by the key prefix rather than by an account exclusion.
+      //
+      // Kept as belt-and-braces even though the Allow is now tag-scoped: none of
+      // our own functions carries the connector tag, so the Allow no longer reaches
+      // them. This Deny is what holds if one ever acquires it — an automated
+      // tagging policy, a copy-pasted construct, or a future function that
+      // legitimately needs the tag for another reason would otherwise become
+      // Athena-invocable by inheriting the Allow. A Deny cannot be out-voted by any
+      // Allow, so it is the cheap insurance against a tag applied by mistake.
+      //
+      // Conditioned on `aws:CalledVia` so it cannot touch the direct invokes this
+      // role makes legitimately (the AOSS proxy Lambda shares this prefix); Athena
+      // has no reason to invoke one of our own functions.
+      //
+      // Scoped to the deployment prefix without the environment segment, so it
+      // covers every environment's functions in this account rather than only
+      // this one's. Breadth is the safe direction for a Deny.
+      runtime.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "DenyAthenaInvokeOfOwnFunctions",
+          effect: iam.Effect.DENY,
+          actions: ["lambda:InvokeFunction"],
+          resources: [
+            `arn:aws:lambda:${region}:${account}:function:${prefix}-*`,
+          ],
+          conditions: {
+            "ForAnyValue:StringEquals": {
+              "aws:CalledVia": "athena.amazonaws.com",
+            },
+          },
+        }),
+      );
+      // Spill reads. Above 6 MB a connector's response is written to ITS OWN
+      // spill bucket and Athena — acting for this role — fetches it to assemble
+      // results. Spill is automatic and connector-side; the only choice here is
+      // whether Orion can read the result, and withholding it fails ordinary
+      // queries rather than exotic ones (a connector that advertises no limit
+      // pushdown makes Athena request the whole table and apply the LIMIT
+      // itself, so even a trivial SELECT ... LIMIT 1000 can spill).
+      //
+      // The bucket cannot be pinned — the customer owns it — so the KEY PREFIX is
+      // what bounds this grant. Every connector is required to spill under
+      // CONNECTOR_SPILL_KEY_GLOB (`connectors/{connectorId}/spills/...`), which is
+      // what lets the statement span every account INCLUDING this one without
+      // becoming a general S3 read: a bucket in our account is reachable only at
+      // that path, which nothing else of ours writes to.
+      //
+      // Spanning our own account is deliberate. It is the one topology the earlier
+      // `aws:ResourceAccount` exclusion could not serve — a connector deployed
+      // alongside Orion could never spill — and excluding an account bought nothing
+      // that a key prefix does not, because cross-account S3 already requires the
+      // bucket's own policy to name this role.
+      //
+      // `aws:RequestedRegion` is kept, since S3 ARNs carry no region.
+      //
+      // Only the serve role gets this: spill is a record-path mechanism, and
+      // discovery's entire Athena surface (SHOW/DESCRIBE) is metadata traffic that
+      // never spills.
+      //
+      // Getting the prefix wrong fails in the worst way available: every small
+      // result set works, and the first query to cross 6 MB returns AccessDenied.
+      // Hence the onboarding guide states the required value rather than leaving it
+      // to the connector's `spill_prefix` default.
+      //
+      // Note `*` spans `/` inside an S3 relative id, so this is not anchored at the
+      // start of the key — it matches the segments appearing anywhere in it. It
+      // still turns an account-wide read primitive into a spill-shaped one, which is
+      // the point, but it is not a containment boundary on its own.
+      //
+      // The bucket-level half of this grant lives in the two statements below.
+      // Cross-account S3 authorizes on both sides, and a spill read fails without
+      // them even when the customer's bucket policy grants all three actions:
+      // simulating the role showed GetObject `allowed` while ListBucket and
+      // GetBucketLocation were `implicitDeny`.
+      runtime.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "AthenaFederationSpillRead",
+          actions: ["s3:GetObject"],
+          resources: [`arn:aws:s3:::*/${CONNECTOR_SPILL_KEY_GLOB}`],
+          conditions: {
+            "ForAnyValue:StringEquals": {
+              "aws:CalledVia": "athena.amazonaws.com",
+            },
+            StringEquals: { "aws:RequestedRegion": region },
+          },
+        }),
+      );
+      // Bucket-level companions to the read above. Both are separate statements
+      // rather than extra actions on it, for two independent reasons:
+      //
+      //  * The resource differs. GetObject takes an object ARN, these take the
+      //    bucket ARN, so the spill-prefix path pattern cannot scope them.
+      //  * `s3:prefix` applies to ListBucket only. Folded into one statement it
+      //    would also gate GetBucketLocation, where the key is absent — and
+      //    `StringLike` against an absent key is false, denying the very call
+      //    this exists to allow.
+      //
+      // ListBucket carries the prefix condition because on a wildcard bucket it is
+      // otherwise an enumeration primitive. Scoped this way it can only list under a
+      // connector's spill prefix, via Athena — and for a bucket in another account
+      // the bucket's own policy must still name this role.
+      //
+      // GetBucketLocation cannot be scoped at all: it takes a bucket ARN, has no
+      // `s3:prefix`, and now spans this account too. It reveals only a bucket's
+      // region, which is the least sensitive thing S3 will answer, and Athena calls
+      // it to resolve the endpoint before reading a spilled object.
+      //
+      // Residual risk, stated because it is the likely next failure: if Athena ever
+      // lists without supplying a prefix, `s3:prefix` is absent and this denies it.
+      // The symptom would be an identical 403 with GetObject and GetBucketLocation
+      // both simulating `allowed`.
+      runtime.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "AthenaFederationSpillBucketLocation",
+          actions: ["s3:GetBucketLocation"],
+          resources: ["arn:aws:s3:::*"],
+          conditions: {
+            "ForAnyValue:StringEquals": {
+              "aws:CalledVia": "athena.amazonaws.com",
+            },
+            StringEquals: { "aws:RequestedRegion": region },
+          },
+        }),
+      );
+      runtime.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "AthenaFederationSpillList",
+          actions: ["s3:ListBucket"],
+          resources: ["arn:aws:s3:::*"],
+          conditions: {
+            "ForAnyValue:StringEquals": {
+              "aws:CalledVia": "athena.amazonaws.com",
+            },
+            StringEquals: { "aws:RequestedRegion": region },
+            StringLike: { "s3:prefix": CONNECTOR_SPILL_KEY_GLOB },
+          },
+        }),
+      );
+      // Decrypt for a spill bucket under SSE-KMS. Note this is NOT the
+      // connector's own `kms_key_id` spill encryption: there the SDK's
+      // KmsKeyFactory calls GenerateDataKey and ships the PLAINTEXT key to
+      // Athena on the Split, so the reader never calls KMS at all. Bucket-level
+      // SSE-KMS is the case that needs a grant, and there S3 — not Athena — is
+      // the immediate KMS caller, so the condition is `kms:ViaService`.
+      // `aws:CalledVia` is deliberately absent: conditions within a statement
+      // are ANDed, and adding it would make the grant depend on whether S3
+      // appends itself to the chain, which AWS does not document.
+      runtime.addToRolePolicy(
+        new iam.PolicyStatement({
+          sid: "AthenaFederationSpillDecryptViaS3",
+          actions: ["kms:Decrypt"],
+          resources: [`arn:aws:kms:${region}:*:key/*`],
+          conditions: {
+            // Both keys live in ONE StringEquals object: a second `StringEquals`
+            // property would overwrite the first in the object literal, silently
+            // dropping kms:ViaService and widening this grant to any KMS caller.
+            //
+            // Scoped by a resource TAG on the key, not by excluding this account.
+            // The spill key prefix is not expressible here — S3 Bucket Keys put the
+            // BUCKET arn in kms:EncryptionContext, not the object's — so a tag is
+            // the only per-resource handle KMS offers, and it is a better one than
+            // an account exclusion in both directions: it stops this reaching
+            // Orion's own keys, AND it stops it reaching arbitrary FOREIGN keys,
+            // which an exclusion left wide open.
+            //
+            // This is why SSE-KMS on a connector's spill bucket is REQUIRED rather
+            // than one shape among several. The SDK already encrypts spilled content
+            // with its own ephemeral AES-GCM key, so bucket encryption is not what
+            // protects the data — mandating it is what puts a kms:Decrypt check on
+            // EVERY spilled read. Without the mandate the check is skipped for the
+            // common case (SSE-S3, or no bucket encryption) and spill authorization
+            // rests on the key prefix alone; with it, a bucket Athena was induced to
+            // read from fails closed unless its key was deliberately tagged.
+            //
+            // Spans every account including this one, which is what lets a connector
+            // deployed alongside Orion spill at all — the previous exclusion made
+            // that impossible.
+            //
+            // Cannot regress the managed-JDBC path: Orion's own spill bucket is
+            // S3_MANAGED, so it never calls KMS.
+            StringEquals: {
+              "kms:ViaService": `s3.${region}.amazonaws.com`,
+              [`aws:ResourceTag/${CONNECTOR_SPILL_KMS_TAG_KEY}`]:
+                CONNECTOR_SPILL_KMS_TAG_VALUE,
+            },
+          },
         }),
       );
 

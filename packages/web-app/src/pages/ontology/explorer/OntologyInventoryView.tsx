@@ -25,9 +25,12 @@ import type { ApiClient } from "@components/ApiClientProvider";
 import { formatTimestamp } from "@utils/helpers";
 import {
   listOntologies,
-  type OntologyRecord,
+  type ListedOntology,
 } from "../../../services/ontology-engine";
-import { ontologyTypeDisplay, ontologyTypeGroup } from "../../OntologyPage";
+import {
+  ontologyTypeDisplay,
+  ontologyTypeGroup,
+} from "@utils/ontology-display";
 
 type TypeFilter = "all" | "induced" | "foundational" | "uploaded";
 
@@ -39,7 +42,7 @@ export function OntologyInventoryView({
   namespace?: string;
 }) {
   const navigate = useNavigate();
-  const [items, setItems] = useState<OntologyRecord[]>([]);
+  const [items, setItems] = useState<ListedOntology[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -55,10 +58,26 @@ export function OntologyInventoryView({
       .finally(() => setLoading(false));
   }, [apiClient, namespace, refreshKey]);
 
+  // Poll while a row is mid-delete so "Delete in progress" clears itself instead
+  // of looking hung. Same 4s cadence as the Induction page's poll.
+  //
+  // A row whose teardown failed keeps `status: "deleting"` and gains a
+  // `deleteError` (see _mark_delete_error in the catalog router), so polling on
+  // status alone never terminates. Wedged rows are excluded: the row is
+  // finished changing, and the error is surfaced in the status cell instead.
+  const hasDeleting = items.some(
+    (o) => o.status === "deleting" && !o.deleteError,
+  );
+  useEffect(() => {
+    if (!namespace || !hasDeleting) return;
+    const id = window.setInterval(() => setRefreshKey((k) => k + 1), 4000);
+    return () => window.clearInterval(id);
+  }, [namespace, hasDeleting]);
+
   const counts = useMemo(() => {
     const c = { induced: 0, foundational: 0, uploaded: 0 };
     for (const o of items) {
-      const g = ontologyTypeGroup(o.ontology_type);
+      const g = ontologyTypeGroup(o.ontologyType);
       if (g === "induced" || g === "foundational" || g === "uploaded")
         c[g] += 1;
     }
@@ -69,9 +88,7 @@ export function OntologyInventoryView({
     () =>
       typeFilter === "all"
         ? items
-        : items.filter(
-            (o) => ontologyTypeGroup(o.ontology_type) === typeFilter,
-          ),
+        : items.filter((o) => ontologyTypeGroup(o.ontologyType) === typeFilter),
     [items, typeFilter],
   );
 
@@ -90,7 +107,7 @@ export function OntologyInventoryView({
       <SortableTable
         loading={loading}
         items={visible}
-        trackBy="ontology_id"
+        trackBy="ontologyId"
         defaultSortingColumnId="title"
         columnDefinitions={[
           {
@@ -98,15 +115,17 @@ export function OntologyInventoryView({
             header: "Ontology",
             isRowHeader: true,
             sortingComparator: (a, b) =>
-              (a.title || a.ontology_id).localeCompare(
-                b.title || b.ontology_id,
+              (a.title || a.ontologyId || "").localeCompare(
+                b.title || b.ontologyId || "",
               ),
             cell: (o) => {
-              // Only induced ontologies have a browsable graph-contents page.
+              // Only induced ontologies have a detail page, and not while their
+              // graph is being torn down.
               const href =
-                ontologyTypeGroup(o.ontology_type) === "induced"
+                ontologyTypeGroup(o.ontologyType) === "induced" &&
+                o.status !== "deleting"
                   ? `/namespaces/${namespace}/ontology/induced?ontology_id=${encodeURIComponent(
-                      o.ontology_id,
+                      o.ontologyId,
                     )}`
                   : null;
               return (
@@ -119,10 +138,10 @@ export function OntologyInventoryView({
                         navigate(href);
                       }}
                     >
-                      {o.title || o.ontology_id}
+                      {o.title || o.ontologyId}
                     </Link>
                   ) : (
-                    <Box>{o.title || o.ontology_id}</Box>
+                    <Box>{o.title || o.ontologyId}</Box>
                   )}
                   <Box variant="small" color="text-status-inactive">
                     {o.uri}
@@ -135,17 +154,21 @@ export function OntologyInventoryView({
             id: "type",
             header: "Type",
             sortingComparator: (a, b) =>
-              ontologyTypeGroup(a.ontology_type).localeCompare(
-                ontologyTypeGroup(b.ontology_type),
+              ontologyTypeGroup(a.ontologyType).localeCompare(
+                ontologyTypeGroup(b.ontologyType),
               ),
             cell: (o) => {
-              const { label, color } = ontologyTypeDisplay(o.ontology_type);
-              return o.status === "deleting" ? (
+              const { label, color } = ontologyTypeDisplay(o.ontologyType);
+              if (o.status !== "deleting")
+                return <Badge color={color}>{label}</Badge>;
+              // A wedged teardown stops the poll, so say so here rather than
+              // showing "in progress" forever. Retry = re-issue the delete.
+              return o.deleteError ? (
+                <StatusIndicator type="error">Delete failed</StatusIndicator>
+              ) : (
                 <StatusIndicator type="in-progress">
                   Delete in progress
                 </StatusIndicator>
-              ) : (
-                <Badge color={color}>{label}</Badge>
               );
             },
           },
@@ -153,29 +176,29 @@ export function OntologyInventoryView({
             id: "classes",
             header: "Classes",
             sortingComparator: (a, b) =>
-              (a.class_count ?? 0) - (b.class_count ?? 0),
-            cell: (o) => o.class_count ?? 0,
+              (a.classCount ?? 0) - (b.classCount ?? 0),
+            cell: (o) => o.classCount ?? 0,
           },
           {
             id: "properties",
             header: "Properties",
             sortingComparator: (a, b) =>
-              (a.property_count ?? 0) - (b.property_count ?? 0),
-            cell: (o) => o.property_count ?? 0,
+              (a.propertyCount ?? 0) - (b.propertyCount ?? 0),
+            cell: (o) => o.propertyCount ?? 0,
           },
           {
             id: "axioms",
             header: "Axioms",
             sortingComparator: (a, b) =>
-              (a.axiom_count ?? 0) - (b.axiom_count ?? 0),
-            cell: (o) => o.axiom_count ?? 0,
+              (a.axiomCount ?? 0) - (b.axiomCount ?? 0),
+            cell: (o) => o.axiomCount ?? 0,
           },
           {
             id: "created",
             header: "Created",
             sortingComparator: (a, b) =>
-              (a.created_at ?? "").localeCompare(b.created_at ?? ""),
-            cell: (o) => formatTimestamp(o.created_at),
+              (a.createdAt ?? "").localeCompare(b.createdAt ?? ""),
+            cell: (o) => formatTimestamp(o.createdAt),
           },
         ]}
         empty={

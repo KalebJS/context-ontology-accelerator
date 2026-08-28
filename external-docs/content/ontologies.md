@@ -136,6 +136,14 @@ with `409 Conflict`, and the UI disables the **Delete** action on those rows
 check). To resolve a blocked delete: first delete the induced ontology (or
 ontologies) that depend on the reference, then delete the reference.
 
+**Where each Delete lives in the web app:**
+
+- **Foundational / uploaded** — **Induction** page → **Reference ontologies**
+  tab → the row's **Delete** action.
+- **Induced** — **Explorer** → **Ontologies** tab → open the ontology → **Delete
+  ontology**. (Induced ontologies aren't listed on the Induction page, so this is
+  the path to use when the guard above tells you to remove one first.)
+
 ## Validating and repairing datatype issues
 
 Before you accept a proposal, **Validate** runs consistency and quality checks on

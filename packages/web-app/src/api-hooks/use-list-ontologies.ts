@@ -7,18 +7,24 @@ import {
   type OntologyRecord,
 } from "@coa/control-plane-client";
 import { useControlPlaneClient } from "@components/ControlPlaneClientProvider";
+import {
+  hasOntologyId,
+  type ListedOntology,
+} from "../services/ontology-engine";
 
-export type { OntologyRecord };
+export type { OntologyRecord, ListedOntology };
 
 export function useListOntologies(namespaceId: string | undefined) {
   const client = useControlPlaneClient();
-  return useQuery<OntologyRecord[], Error>({
+  return useQuery<ListedOntology[], Error>({
     queryKey: ["ontologies", namespaceId],
     queryFn: async () => {
       const out = await client.send(
         new ListOntologiesCommand({ namespaceId: namespaceId! }),
       );
-      return (out.ontologies ?? []) as OntologyRecord[];
+      // Same boundary narrowing as listOntologies(): the generated type makes
+      // the @required id optional, so drop rows that can't be keyed or linked.
+      return (out.ontologies ?? []).filter(hasOntologyId);
     },
     enabled: !!namespaceId,
   });

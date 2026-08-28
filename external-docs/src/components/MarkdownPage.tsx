@@ -18,6 +18,7 @@ const mdFileToPageId: Record<string, PageId> = {
   'sources.md': 'sources',
   'index.md': 'sources',
   'cross-account-sources.md': 'cross-account-sources',
+  'athena-connector-sources.md': 'athena-connector-sources',
   'ontologies.md': 'ontologies',
   'metrics.md': 'metrics',
   'serve.md': 'serve',
