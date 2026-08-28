@@ -19,67 +19,67 @@ import {
   ONTOLOGY_INGEST_TERMINAL,
   proposalStatusDisplay,
   resolveCompletedInductionAction,
-  deleteOntologyCopy,
 } from "./OntologyPage";
+import { deleteOntologyCopy } from "@utils/ontology-display";
 import type { OntologyRecord } from "../services/ontology-engine";
 
 function record(overrides: Partial<OntologyRecord>): OntologyRecord {
   return {
-    ontology_id: "http://ex.org/o",
+    ontologyId: "http://ex.org/o",
     uri: "http://ex.org/o",
     title: "Onto",
-    ontology_type: "foundational",
+    ontologyType: "foundational",
     format: "turtle",
-    domain_tags: [],
-    class_count: 0,
-    property_count: 0,
-    axiom_count: 0,
-    embedding_count: 0,
-    created_at: "",
-    updated_at: "",
+    domainTags: [],
+    classCount: 0,
+    propertyCount: 0,
+    axiomCount: 0,
+    embeddingCount: 0,
+    createdAt: "",
+    updatedAt: "",
     ...overrides,
   };
 }
 
 describe("ontologyIngestState derivation", () => {
-  it("maps parse_status ok → ready", () => {
-    expect(ontologyIngestState(record({ parse_status: "ok" }))).toBe("ready");
+  it("maps parseStatus ok → ready", () => {
+    expect(ontologyIngestState(record({ parseStatus: "ok" }))).toBe("ready");
   });
-  it("maps parse_status parse_error → failed", () => {
-    expect(ontologyIngestState(record({ parse_status: "parse_error" }))).toBe(
+  it("maps parseStatus parse_error → failed", () => {
+    expect(ontologyIngestState(record({ parseStatus: "parse_error" }))).toBe(
       "failed",
     );
   });
-  it("maps parse_status pending (no embeddings yet) → ingesting", () => {
-    expect(ontologyIngestState(record({ parse_status: "pending" }))).toBe(
+  it("maps parseStatus pending (no embeddings yet) → ingesting", () => {
+    expect(ontologyIngestState(record({ parseStatus: "pending" }))).toBe(
       "ingesting",
     );
   });
-  it("treats pending-with-embeddings as ready (foundational-load leaves parse_status stuck at pending)", () => {
+  it("treats pending-with-embeddings as ready (foundational-load leaves parseStatus stuck at pending)", () => {
     // Regression: FIBO ontologies load embeddings but the append path can
-    // leave parse_status="pending" — a positive embedding_count means DONE,
+    // leave parseStatus="pending" — a positive embeddingCount means DONE,
     // so it must NOT show "Ingesting" forever (which also hung the poll).
     expect(
       ontologyIngestState(
-        record({ parse_status: "pending", embedding_count: 11 }),
+        record({ parseStatus: "pending", embeddingCount: 11 }),
       ),
     ).toBe("ready");
   });
   it("parse_error wins even with embeddings present", () => {
     expect(
       ontologyIngestState(
-        record({ parse_status: "parse_error", embedding_count: 5 }),
+        record({ parseStatus: "parse_error", embeddingCount: 5 }),
       ),
     ).toBe("failed");
   });
-  it("falls back to ready for legacy rows (no parse_status, embeddings > 0)", () => {
+  it("falls back to ready for legacy rows (no parseStatus, embeddings > 0)", () => {
     expect(
-      ontologyIngestState(record({ parse_status: null, embedding_count: 42 })),
+      ontologyIngestState(record({ parseStatus: null, embeddingCount: 42 })),
     ).toBe("ready");
   });
   it("treats a legacy row with no embeddings as still ingesting", () => {
     expect(
-      ontologyIngestState(record({ parse_status: null, embedding_count: 0 })),
+      ontologyIngestState(record({ parseStatus: null, embeddingCount: 0 })),
     ).toBe("ingesting");
   });
 
@@ -268,13 +268,13 @@ describe("OntologiesTab Actions cell", () => {
     // One registered (loaded, ready) ontology.
     listOntologies.mockResolvedValue([
       record({
-        ontology_id: "http://ex.org/loaded",
+        ontologyId: "http://ex.org/loaded",
         uri: "http://ex.org/loaded",
         title: "Loaded Onto",
-        ontology_type: "user_uploaded",
-        parse_status: "ok",
-        embedding_count: 10,
-        class_count: 5,
+        ontologyType: "user_uploaded",
+        parseStatus: "ok",
+        embeddingCount: 10,
+        classCount: 5,
       }),
     ]);
     // One curated foundational NOT yet loaded → placeholder "Load" row.
@@ -286,7 +286,7 @@ describe("OntologiesTab Actions cell", () => {
           title: "FIBO",
           description: "",
           format: "turtle",
-          domain_tags: [],
+          domainTags: [],
         },
       ],
     });
@@ -309,7 +309,7 @@ describe("OntologiesTab Actions cell", () => {
           title: "FIBO",
           description: "",
           format: "turtle",
-          domain_tags: [],
+          domainTags: [],
         },
       ],
     });
@@ -354,20 +354,20 @@ describe("OntologiesTab Actions cell", () => {
     // placeholder (_available) stays Load-only and is covered separately.
     listOntologies.mockResolvedValue([
       record({
-        ontology_id: "http://ex.org/mine",
+        ontologyId: "http://ex.org/mine",
         uri: "http://ex.org/mine",
         title: "My Uploaded Onto",
-        ontology_type: "user_uploaded",
-        parse_status: "ok",
-        embedding_count: 10,
+        ontologyType: "user_uploaded",
+        parseStatus: "ok",
+        embeddingCount: 10,
       }),
       record({
-        ontology_id: "http://ex.org/fibo",
+        ontologyId: "http://ex.org/fibo",
         uri: "http://ex.org/fibo",
         title: "FIBO Loaded",
-        ontology_type: "foundational",
-        parse_status: "ok",
-        embedding_count: 10,
+        ontologyType: "foundational",
+        parseStatus: "ok",
+        embeddingCount: 10,
       }),
     ]);
     // A curated foundational NOT yet loaded → placeholder Load row, no Delete.
@@ -379,7 +379,7 @@ describe("OntologiesTab Actions cell", () => {
           title: "Schema.org (available)",
           description: "",
           format: "turtle",
-          domain_tags: [],
+          domainTags: [],
         },
       ],
     });
@@ -402,20 +402,20 @@ describe("OntologiesTab Actions cell", () => {
     // to delete the foundational (409); the UI disables its Delete to match.
     listOntologies.mockResolvedValue([
       record({
-        ontology_id: "http://ex.org/fibo",
+        ontologyId: "http://ex.org/fibo",
         uri: "http://ex.org/fibo",
         title: "FIBO Loaded",
-        ontology_type: "foundational",
-        parse_status: "ok",
-        embedding_count: 10,
+        ontologyType: "foundational",
+        parseStatus: "ok",
+        embeddingCount: 10,
       }),
       record({
-        ontology_id: "http://ex.org/induced",
+        ontologyId: "http://ex.org/induced",
         uri: "http://ex.org/induced",
         title: "Induced Onto",
-        ontology_type: "induced",
-        parse_status: "ok",
-        embedding_count: 10,
+        ontologyType: "induced",
+        parseStatus: "ok",
+        embeddingCount: 10,
       }),
     ]);
     listFoundationalOntologies.mockResolvedValue({ items: [] });
@@ -435,12 +435,12 @@ describe("OntologiesTab Actions cell", () => {
   it("shows 'Delete in progress' and no Delete action while an uploaded row is deleting", async () => {
     listOntologies.mockResolvedValue([
       record({
-        ontology_id: "http://ex.org/mine",
+        ontologyId: "http://ex.org/mine",
         uri: "http://ex.org/mine",
         title: "My Uploaded Onto",
-        ontology_type: "user_uploaded",
-        parse_status: "ok",
-        embedding_count: 10,
+        ontologyType: "user_uploaded",
+        parseStatus: "ok",
+        embeddingCount: 10,
         status: "deleting",
       }),
     ]);
@@ -463,12 +463,12 @@ describe("OntologiesTab Actions cell", () => {
     deleteOntology.mockResolvedValue(undefined);
     listOntologies.mockResolvedValue([
       record({
-        ontology_id: "http://ex.org/mine",
+        ontologyId: "http://ex.org/mine",
         uri: "http://ex.org/mine",
         title: "My Uploaded Onto",
-        ontology_type: "user_uploaded",
-        parse_status: "ok",
-        embedding_count: 10,
+        ontologyType: "user_uploaded",
+        parseStatus: "ok",
+        embeddingCount: 10,
       }),
     ]);
     listFoundationalOntologies.mockResolvedValue({ items: [] });
@@ -503,7 +503,7 @@ describe("OntologiesTab Actions cell", () => {
     expect(confirmButton).toBeEnabled();
     fireEvent.click(confirmButton);
 
-    // The delete call fired with the row's ontology_id (a full IRI).
+    // The delete call fired with the row's ontologyId (a full IRI).
     await waitFor(() =>
       expect(deleteOntology).toHaveBeenCalledWith(
         expect.anything(),
@@ -616,18 +616,18 @@ describe("Induce Ontology modal — grounding is available for both strategies",
     // default (deselectable) so new runs converge with prior ones.
     listOntologies.mockResolvedValue([
       record({
-        ontology_id: "http://ns/induced-a",
+        ontologyId: "http://ns/induced-a",
         uri: "http://ns/induced-a",
         title: "My Induced Ontology",
-        ontology_type: "induced",
-        embedding_count: 12,
+        ontologyType: "induced",
+        embeddingCount: 12,
       }),
       record({
-        ontology_id: "http://fibo/loaded",
+        ontologyId: "http://fibo/loaded",
         uri: "http://fibo/loaded",
         title: "FIBO Loaded",
-        ontology_type: "foundational",
-        embedding_count: 9,
+        ontologyType: "foundational",
+        embeddingCount: 9,
       }),
     ]);
     await openInductionModal();
@@ -663,45 +663,45 @@ describe("Induce Ontology modal — grounding is available for both strategies",
 
   it("surfaces not-ready ontologies as disabled with a per-row status label (issue #540)", async () => {
     // A namespace with one ready, one still-embedding, one failed, and one
-    // legacy (no parse_status but embedded) ontology. Before #540 the three
+    // legacy (no parseStatus but embedded) ontology. Before #540 the three
     // non-ready rows were the still-embedding and failed ones — silently
     // dropped from the dropdown with no signal. Now every loaded ontology is
     // SHOWN; readiness (selectability) is derived from ontologyIngestState so
     // it can never disagree with the Ontologies-list StatusIndicator.
     listOntologies.mockResolvedValue([
       record({
-        ontology_id: "http://ns/ready",
+        ontologyId: "http://ns/ready",
         uri: "http://ns/ready",
         title: "Ready Onto",
-        ontology_type: "foundational",
-        parse_status: "ok",
-        embedding_count: 9,
+        ontologyType: "foundational",
+        parseStatus: "ok",
+        embeddingCount: 9,
       }),
       record({
-        ontology_id: "http://ns/embedding",
+        ontologyId: "http://ns/embedding",
         uri: "http://ns/embedding",
         title: "Embedding Onto",
-        ontology_type: "foundational",
-        parse_status: "pending",
-        embedding_count: 0,
+        ontologyType: "foundational",
+        parseStatus: "pending",
+        embeddingCount: 0,
       }),
       record({
-        ontology_id: "http://ns/failed",
+        ontologyId: "http://ns/failed",
         uri: "http://ns/failed",
         title: "Failed Onto",
-        ontology_type: "foundational",
-        parse_status: "parse_error",
-        embedding_count: 0,
+        ontologyType: "foundational",
+        parseStatus: "parse_error",
+        embeddingCount: 0,
       }),
       record({
-        ontology_id: "http://ns/legacy",
+        ontologyId: "http://ns/legacy",
         uri: "http://ns/legacy",
         title: "Legacy Onto",
-        ontology_type: "foundational",
-        // Legacy row persisted before parse_status existed: null parse_status
+        ontologyType: "foundational",
+        // Legacy row persisted before parseStatus existed: null parseStatus
         // but embeddings present ⇒ ready (matches ontologyIngestState()).
-        parse_status: null,
-        embedding_count: 7,
+        parseStatus: null,
+        embeddingCount: 7,
       }),
     ]);
     await openInductionModal();

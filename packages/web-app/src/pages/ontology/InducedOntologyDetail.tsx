@@ -7,23 +7,31 @@
  * Uses react-query hooks + the Smithy-generated TS client for data fetching.
  * The ontology IRI is passed as the ``ontology_id`` query param.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import Alert from "@cloudscape-design/components/alert";
 import Badge from "@cloudscape-design/components/badge";
 import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Container from "@cloudscape-design/components/container";
+import FormField from "@cloudscape-design/components/form-field";
 import Header from "@cloudscape-design/components/header";
+import Input from "@cloudscape-design/components/input";
 import KeyValuePairs from "@cloudscape-design/components/key-value-pairs";
 import Link from "@cloudscape-design/components/link";
+import Modal from "@cloudscape-design/components/modal";
 import SpaceBetween from "@cloudscape-design/components/space-between";
 import Spinner from "@cloudscape-design/components/spinner";
+import StatusIndicator from "@cloudscape-design/components/status-indicator";
 import Tabs from "@cloudscape-design/components/tabs";
 import { SortableTable } from "@components/SortableTable";
 import { useOntologyOverview } from "@api-hooks/use-ontology-overview";
 import { useListOntologies } from "@api-hooks/use-list-ontologies";
-import { downloadOntology } from "../../services/ontology-engine";
+import {
+  deleteOntology,
+  downloadOntology,
+} from "../../services/ontology-engine";
+import { OntologyDeleteWarning } from "@components/ontology/OntologyDeleteWarning";
 import { downloadTextFile } from "@utils/download";
 import { useApiClient } from "@components/ApiClientProvider";
 import { useBreadcrumbs } from "@components/BreadcrumbProvider";
@@ -82,10 +90,70 @@ export function InducedOntologyDetailPage() {
   const [turtleLoading, setTurtleLoading] = useState(false);
   const [turtleError, setTurtleError] = useState<string | null>(null);
   const [downloadBusy, setDownloadBusy] = useState(false);
+  // The only induced-ontology delete in the app — without it the Induction
+  // page's `blockedByInduced` guard can never be cleared.
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [deleteConfirmText, setDeleteConfirmText] = useState("");
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const isDeleting = record?.status === "deleting";
 
-  const classes = overview?.classes ?? [];
+  function closeDeleteModal() {
+    setShowDeleteModal(false);
+    setDeleteConfirmText("");
+    setDeleteError(null);
+  }
+
+  async function confirmDelete() {
+    if (!namespaceId || !ontologyId) return;
+    setDeleteBusy(true);
+    setDeleteError(null);
+    try {
+      await deleteOntology(apiClient, namespaceId, ontologyId);
+      // Teardown is async; the inventory polls, this page doesn't.
+      closeDeleteModal();
+      navigate(`/namespaces/${namespaceId}/ontology/graph?tab=ontologies`);
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : "Failed to delete");
+    } finally {
+      setDeleteBusy(false);
+    }
+  }
+
+  // Memoised so it is a stable dependency for the groundedAgainst rollup below;
+  // `overview?.classes ?? []` allocates a new array on every render otherwise.
+  const classes = useMemo(() => overview?.classes ?? [], [overview?.classes]);
   const relationships = overview?.objectProperties ?? [];
   const attributes = overview?.datatypeProperties ?? [];
+
+  // Group per-class `groundedTo` IRIs by owning ontology. Uses graph edges, not
+  // the induction report — the report is per-job and gone once accepted.
+  const groundedAgainst = useMemo(() => {
+    const targets = classes
+      .map((c) => c.groundedTo)
+      .filter((t): t is string => Boolean(t));
+    if (targets.length === 0) return [];
+    // Longest-prefix wins so a more specific ontology IRI beats a shorter one.
+    const candidates = (ontologies ?? [])
+      .filter((r) => r.uri && r.ontologyId !== ontologyId)
+      .slice()
+      .sort((a, b) => (b.uri?.length ?? 0) - (a.uri?.length ?? 0));
+    const counts = new Map<
+      string,
+      { key: string; label: string; count: number }
+    >();
+    for (const target of targets) {
+      const owner = candidates.find((r) => target.startsWith(r.uri!));
+      // Fall back to the IRI namespace so unregistered targets still show.
+      const key = owner?.ontologyId ?? target.replace(/[^#/]*$/, "");
+      const label = owner?.title || owner?.uri || key;
+      const prev = counts.get(key);
+      // `key` is kept for React — titles aren't unique.
+      counts.set(key, { key, label, count: (prev?.count ?? 0) + 1 });
+    }
+    return [...counts.values()].sort((a, b) => b.count - a.count);
+  }, [classes, ontologies, ontologyId]);
+  const groundedClassCount = classes.filter((c) => c.groundedTo).length;
 
   async function ensureTurtle(): Promise<string | null> {
     if (turtle !== null) return turtle;
@@ -146,13 +214,29 @@ export function InducedOntologyDetailPage() {
       <Header
         variant="h1"
         actions={
-          <Button
-            iconName="download"
-            loading={downloadBusy}
-            onClick={handleDownload}
-          >
-            Download .ttl
-          </Button>
+          <SpaceBetween direction="horizontal" size="xs">
+            {isDeleting && (
+              <Box padding={{ top: "xxs" }}>
+                <StatusIndicator type="in-progress">
+                  Delete in progress
+                </StatusIndicator>
+              </Box>
+            )}
+            <Button
+              iconName="download"
+              loading={downloadBusy}
+              onClick={handleDownload}
+            >
+              Download .ttl
+            </Button>
+            <Button
+              onClick={() => setShowDeleteModal(true)}
+              disabled={isDeleting}
+              disabledReason="A delete is already in progress for this ontology."
+            >
+              Delete ontology
+            </Button>
+          </SpaceBetween>
         }
         description={ontologyId}
       >
@@ -165,13 +249,93 @@ export function InducedOntologyDetailPage() {
         </Alert>
       )}
 
+      {/* A stuck delete: still "deleting" but teardown failed. Re-issue to retry. */}
+      {isDeleting && record?.deleteError && (
+        <Alert type="error" header="Delete failed — retry to try again">
+          {record.deleteError}
+        </Alert>
+      )}
+
+      {showDeleteModal && (
+        <Modal
+          visible
+          onDismiss={closeDeleteModal}
+          header={`Delete ontology "${record?.title || localName(ontologyId)}"?`}
+          footer={
+            <Box float="right">
+              <SpaceBetween direction="horizontal" size="xs">
+                <Button variant="link" onClick={closeDeleteModal}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="primary"
+                  loading={deleteBusy}
+                  disabled={deleteBusy || deleteConfirmText !== "delete"}
+                  onClick={confirmDelete}
+                >
+                  Delete
+                </Button>
+              </SpaceBetween>
+            </Box>
+          }
+        >
+          <SpaceBetween size="m">
+            <OntologyDeleteWarning
+              ontologyType="induced"
+              name={record?.title || localName(ontologyId)}
+            />
+            {deleteError && (
+              <Alert type="error" header="Delete failed">
+                {deleteError}
+              </Alert>
+            )}
+            <FormField label="Type delete to confirm">
+              <Input
+                value={deleteConfirmText}
+                onChange={({ detail }) => setDeleteConfirmText(detail.value)}
+                placeholder="delete"
+                disabled={deleteBusy}
+              />
+            </FormField>
+          </SpaceBetween>
+        </Modal>
+      )}
+
       <Container>
         <KeyValuePairs
-          columns={3}
+          columns={4}
           items={[
             { label: "Classes", value: String(classes.length) },
             { label: "Relationships", value: String(relationships.length) },
             { label: "Attributes", value: String(attributes.length) },
+            {
+              label: "Grounded against",
+              value:
+                groundedAgainst.length === 0 ? (
+                  // Mid-fetch must not read as "ungrounded".
+                  <Box color="text-status-inactive">
+                    {loading ? "—" : "None (all classes novel)"}
+                  </Box>
+                ) : (
+                  <SpaceBetween size="xxxs">
+                    {groundedAgainst.map((g) => (
+                      <Box key={g.key}>
+                        {g.label}{" "}
+                        <Box
+                          variant="small"
+                          color="text-status-inactive"
+                          display="inline"
+                        >
+                          ({g.count} {g.count === 1 ? "class" : "classes"})
+                        </Box>
+                      </Box>
+                    ))}
+                    <Box variant="small" color="text-status-inactive">
+                      {groundedClassCount} of {classes.length} classes grounded
+                    </Box>
+                  </SpaceBetween>
+                ),
+            },
           ]}
         />
       </Container>

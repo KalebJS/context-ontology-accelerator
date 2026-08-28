@@ -19,6 +19,7 @@ const SECTIONS: NavSection[] = [
   { stage: 'Scan', items: [
     { id: 'sources', label: 'Sources' },
     { id: 'cross-account-sources', label: 'Cross-Account Sources' },
+    { id: 'athena-connector-sources', label: 'Custom Connectors' },
   ]},
   { stage: 'Model', items: [
     { id: 'ontologies', label: 'Ontologies' },

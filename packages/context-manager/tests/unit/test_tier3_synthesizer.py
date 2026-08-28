@@ -313,3 +313,74 @@ class TestSynthesizerStreaming:
         assert "[CONFIDENCE" not in streamed
         assert "The filing process is X." in streamed
         assert result.answer == streamed.strip() or result.answer == streamed
+
+
+@pytest.mark.unit
+class TestStructuredRowBudget:
+    """TIER3_SYNTH_MAX_ROWS lifts the hardcoded 20-row synthesis budget.
+
+    The fixed cap silently discarded rows beyond the first 20, so a multi-day
+    x multi-country result reached synthesis as a sliver and the model
+    reported the retrieved remainder as missing data."""
+
+    @pytest.mark.asyncio
+    async def test_default_caps_at_twenty(self, mock_bedrock, monkeypatch):
+        monkeypatch.delenv("TIER3_SYNTH_MAX_ROWS", raising=False)
+        mock_bedrock.converse.return_value = ConverseResult(text="A. [CONFIDENCE: 0.9]")
+        synth = Synthesizer(mock_bedrock, guardrail_id="gr-123")
+        rows = [{"i": f"row{i:03d}"} for i in range(30)]
+        await synth.synthesize("q", [], [], structured_data=rows)
+        prompt = mock_bedrock.converse.call_args.kwargs["prompt"]
+        assert "row019" in prompt and "row020" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_env_raises_budget(self, mock_bedrock, monkeypatch):
+        monkeypatch.setenv("TIER3_SYNTH_MAX_ROWS", "500")
+        mock_bedrock.converse.return_value = ConverseResult(text="A. [CONFIDENCE: 0.9]")
+        synth = Synthesizer(mock_bedrock, guardrail_id="gr-123")
+        rows = [{"i": f"row{i:03d}"} for i in range(98)]
+        await synth.synthesize("q", [], [], structured_data=rows)
+        prompt = mock_bedrock.converse.call_args.kwargs["prompt"]
+        assert "row097" in prompt
+
+    @pytest.mark.asyncio
+    async def test_invalid_env_falls_back(self, mock_bedrock, monkeypatch):
+        monkeypatch.setenv("TIER3_SYNTH_MAX_ROWS", "banana")
+        mock_bedrock.converse.return_value = ConverseResult(text="A. [CONFIDENCE: 0.9]")
+        synth = Synthesizer(mock_bedrock, guardrail_id="gr-123")
+        rows = [{"i": f"row{i:03d}"} for i in range(30)]
+        await synth.synthesize("q", [], [], structured_data=rows)
+        prompt = mock_bedrock.converse.call_args.kwargs["prompt"]
+        assert "row019" in prompt and "row020" not in prompt
+
+
+@pytest.mark.unit
+class TestSynthesisTokenBudget:
+    """TIER3_SYNTH_MAX_TOKENS lifts the synthesis output budget (default 4096).
+
+    Reasoning-class models spend output tokens on reasoning before the visible
+    answer, so the client default truncated long tabular answers mid-table."""
+
+    @pytest.mark.asyncio
+    async def test_default_passes_4096(self, mock_bedrock, monkeypatch):
+        monkeypatch.delenv("TIER3_SYNTH_MAX_TOKENS", raising=False)
+        mock_bedrock.converse.return_value = ConverseResult(text="A. [CONFIDENCE: 0.9]")
+        synth = Synthesizer(mock_bedrock, guardrail_id="gr-123")
+        await synth.synthesize("q", [], [])
+        assert mock_bedrock.converse.call_args.kwargs["max_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_env_raises_budget(self, mock_bedrock, monkeypatch):
+        monkeypatch.setenv("TIER3_SYNTH_MAX_TOKENS", "12000")
+        mock_bedrock.converse.return_value = ConverseResult(text="A. [CONFIDENCE: 0.9]")
+        synth = Synthesizer(mock_bedrock, guardrail_id="gr-123")
+        await synth.synthesize("q", [], [])
+        assert mock_bedrock.converse.call_args.kwargs["max_tokens"] == 12000
+
+    @pytest.mark.asyncio
+    async def test_env_cannot_shrink_below_default(self, mock_bedrock, monkeypatch):
+        monkeypatch.setenv("TIER3_SYNTH_MAX_TOKENS", "100")
+        mock_bedrock.converse.return_value = ConverseResult(text="A. [CONFIDENCE: 0.9]")
+        synth = Synthesizer(mock_bedrock, guardrail_id="gr-123")
+        await synth.synthesize("q", [], [])
+        assert mock_bedrock.converse.call_args.kwargs["max_tokens"] == 4096

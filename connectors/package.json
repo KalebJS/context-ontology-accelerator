@@ -1,0 +1,13 @@
+{
+  "name": "coa-connectors",
+  "version": "0.1.0",
+  "description": "Workspace root for the connector CDK toolkit and each connector's own CDK app",
+  "private": true,
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "typescript": "~5.7.0"
+  }
+}

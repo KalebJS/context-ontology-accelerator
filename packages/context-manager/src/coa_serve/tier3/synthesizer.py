@@ -35,6 +35,41 @@ _MAX_STRUCTURED_ROWS = 20
 _MAX_CELL_LENGTH = 200
 _MAX_RELATIONSHIPS_PER_ENTITY = 3
 
+
+def _max_structured_rows() -> int:
+    """Structured-row budget for the synthesis prompt (default 20, env-tunable).
+
+    The hardcoded cap silently discarded rows beyond the first 20: a 7-day x
+    14-country result (98 rows) reached synthesis as day 1 plus a sliver of
+    day 2, and the model truthfully reported the rest of the period as
+    "missing" even though the tool had retrieved it. TIER3_SYNTH_MAX_ROWS
+    raises the budget per deployment; clamped so a typo cannot blow the
+    prompt (2,000 rows x ~200 chars ~= 400KB worst case).
+    """
+    try:
+        v = int(os.environ.get("TIER3_SYNTH_MAX_ROWS", str(_MAX_STRUCTURED_ROWS)))
+    except ValueError:
+        v = _MAX_STRUCTURED_ROWS
+    return max(1, min(2000, v))
+
+
+def _synth_max_tokens() -> int:
+    """Output-token budget for the synthesis call (default 4096, env-tunable).
+
+    Same pathology as the NL->SQL generation budget: reasoning-class default
+    models spend output tokens on reasoning BEFORE the visible answer, so the
+    client-default 4096 truncates long tabular answers mid-table (observed:
+    a 98-row daily/country breakdown cut off at 406 chars). TIER3_SYNTH_MAX_TOKENS
+    raises the budget per deployment; floored at the old default so misconfig
+    can only widen, never shrink below prior behavior.
+    """
+    try:
+        v = int(os.environ.get("TIER3_SYNTH_MAX_TOKENS", "4096"))
+    except ValueError:
+        v = 4096
+    return max(4096, min(64000, v))
+
+
 # System instruction passed via the Converse API's `system` parameter.
 # All static instructions go here (not in the user message) to avoid triggering
 # PROMPT_ATTACK guardrail filters. Per AWS best practices, only user-supplied
@@ -204,6 +239,7 @@ class Synthesizer:
             guardrail_id=self._guardrail_id or None,
             guard_content=guard_content,
             model_id=model_id,
+            max_tokens=_synth_max_tokens(),
         )
         duration_ms = int((time.perf_counter() - start) * 1000)
 
@@ -289,6 +325,7 @@ class Synthesizer:
                 guardrail_id=self._guardrail_id or None,
                 guard_content=guard_content,
                 model_id=model_id,
+                max_tokens=_synth_max_tokens(),
             ):
                 accumulated.append(token)
                 pending += token
@@ -346,6 +383,7 @@ class Synthesizer:
                 guardrail_id=self._guardrail_id or None,
                 guard_content=guard_content,
                 model_id=model_id,
+                max_tokens=_synth_max_tokens(),
             )
             duration_ms = int((time.perf_counter() - start) * 1000)
             if result.guardrail_blocked:
@@ -422,7 +460,7 @@ class Synthesizer:
         if structured_data:
             rows_text = "\n".join(
                 str({k: str(v).replace("\n", " ")[:_MAX_CELL_LENGTH] for k, v in row.items()})
-                for row in structured_data[:_MAX_STRUCTURED_ROWS]
+                for row in structured_data[: _max_structured_rows()]
             )
             sections.append(f"<scl_structured_{nonce}>\n{rows_text}\n</scl_structured_{nonce}>")
 

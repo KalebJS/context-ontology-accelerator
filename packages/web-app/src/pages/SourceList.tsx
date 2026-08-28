@@ -33,6 +33,7 @@ const SOURCE_TYPE_LABELS: Record<string, string> = {
 const SOURCE_SUBTYPE_LABELS: Record<string, string> = {
   GLUE_DATABASE: "Glue",
   JDBC_DATABASE: "JDBC",
+  ATHENA_CONNECTOR: "Athena connector",
   S3: "S3",
   LOCAL_UPLOAD: "Upload",
 };

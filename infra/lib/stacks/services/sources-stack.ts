@@ -38,6 +38,8 @@ import { StorageStack } from "../foundation/storage-stack";
 import { TABLE_NAMES } from "@coa/shared";
 import {
   SourceStatus,
+  CONNECTOR_TAG_KEY,
+  CONNECTOR_TAG_VALUE,
   DEFAULT_MAX_FILE_SIZE_MB,
   DEFAULT_BEDROCK_CHAT_MODEL_ID,
   DEFAULT_BEDROCK_MODEL_ID,
@@ -520,6 +522,101 @@ export class SourcesStack extends SCLStack {
         resources: [
           `arn:aws:athena:${this.region}:${this.account}:workgroup/*`,
         ],
+      }),
+    );
+    // Athena data-catalog resolution for ATHENA_CONNECTOR (custom connector)
+    // sources. Discovery runs `SHOW DATABASES` / `SHOW TABLES` / `DESCRIBE`
+    // against the Lambda-backed catalog the sources API registered at source
+    // create, and Athena resolves the catalog name → connector ARN through
+    // GetDataCatalog. Scoped to the same `{sanitizedPrefix}ds_*` names the
+    // registrar derives, so this reaches only catalogs this deployment created.
+    dbConnectorFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "AthenaConnectorCatalogRead",
+        actions: ["athena:GetDataCatalog"],
+        resources: [
+          `arn:aws:athena:${this.region}:${this.account}:datacatalog/${fedResourcePrefix}*`,
+        ],
+      }),
+    );
+    // Invoke a customer-authored Athena federation connector — but only when
+    // Athena is the one doing it. The connector Lambda lives in the CUSTOMER's
+    // account and its ARN is unknown at deploy time, so the resource cannot be
+    // enumerated; containment is by condition key plus the customer's own
+    // Lambda resource policy, which must independently name this role.
+    //
+    // `aws:CalledVia` is populated on forward access sessions, so this Allow
+    // matches only while Athena is executing a statement for this role and
+    // never for a direct `lambda:Invoke` from discovery code. It is multi-valued
+    // and its order cannot be constrained, hence ForAnyValue — AWS documents
+    // "somewhere in the chain" as the intended semantics. Evaluation fails
+    // CLOSED: an absent key does not match, so a bug here denies rather than
+    // widens.
+    //
+    // Region-pinned by choice, not by necessity: Athena CAN invoke a connector
+    // in another region when given its full ARN, but we do not support that
+    // topology, and the control-plane rejects such an ARN at source-create.
+    dbConnectorFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "AthenaFederationConnectorInvoke",
+        actions: ["lambda:InvokeFunction"],
+        // The account MUST stay a wildcard — the connector lives in the customer's
+        // — so the ARN cannot scope this. A resource TAG does: Lambda evaluates
+        // aws:ResourceTag natively for InvokeFunction, with no per-resource opt-in,
+        // so an untagged function is simply unreachable. Preferred over a name
+        // convention because a tag cannot be matched by accident.
+        resources: [`arn:aws:lambda:${this.region}:*:function:*`],
+        conditions: {
+          "ForAnyValue:StringEquals": {
+            "aws:CalledVia": "athena.amazonaws.com",
+          },
+          StringEquals: {
+            [`aws:ResourceTag/${CONNECTOR_TAG_KEY}`]: CONNECTOR_TAG_VALUE,
+          },
+        },
+      }),
+    );
+    // The escalation the Allow above would otherwise open, closed explicitly.
+    //
+    // `aws:CalledVia` is satisfied by an Athena UDF
+    // (`USING EXTERNAL FUNCTION ... LAMBDA '<arn>'`), which needs only
+    // StartQueryExecution — already granted above — plus lambda:InvokeFunction. A
+    // same-account invoke also needs no resource policy, so without this Deny the
+    // Allow reaches every in-region Lambda in THIS account, including the
+    // federation provisioner that holds Lake Formation admin.
+    //
+    // Kept as belt-and-braces even though the Allow is now tag-scoped: none of our
+    // own functions carries the connector tag, so the Allow no longer reaches them.
+    // This Deny is what holds if one ever acquires it — an automated tagging policy,
+    // a copy-pasted construct, or a future function that legitimately needs the tag
+    // for another reason would otherwise become Athena-invocable by inheriting the
+    // Allow. A Deny cannot be out-voted by any Allow, so it is the cheap insurance
+    // against a tag applied by mistake.
+    //
+    // A Deny on our own name prefix rather than an `aws:ResourceAccount` exclusion,
+    // because excluding the account would also rule out a connector deployed
+    // alongside this stack — which is how the reference connector and its
+    // integration test are deployed. Such a connector must therefore NOT be named
+    // with this deployment's prefix, or this Deny catches it.
+    // Conditioned on `aws:CalledVia` so it
+    // cannot affect direct invokes; Athena has no reason to invoke one of ours.
+    //
+    // Scoped to the deployment prefix without the environment segment, so it
+    // covers every environment's functions in this account rather than only this
+    // one's. Breadth is the safe direction for a Deny.
+    dbConnectorFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "DenyAthenaInvokeOfOwnFunctions",
+        effect: iam.Effect.DENY,
+        actions: ["lambda:InvokeFunction"],
+        resources: [
+          `arn:aws:lambda:${this.region}:${this.account}:function:${resolveContext(this.node).prefix}-*`,
+        ],
+        conditions: {
+          "ForAnyValue:StringEquals": {
+            "aws:CalledVia": "athena.amazonaws.com",
+          },
+        },
       }),
     );
     // Lake Formation data access for governed Glue tables (ignored in
@@ -2270,9 +2367,8 @@ export class SourcesStack extends SCLStack {
     // declares no `AlreadyExistsException`, so a duplicate name is a 400
     // indistinguishable from a malformed request.
     //
-    // This grant is deployed ahead of the registrar. When that handler lands it
-    // must derive the catalog name with
-    // `glue_connection_provisioner._build_catalog_name`
+    // The registrar derives the catalog name with
+    // `glue_connection_provisioner.build_catalog_name`
     // (`{sanitizedPrefix}ds_{sha256(sourceId)[:16]}`) — the same derivation the
     // federated-JDBC path uses — which is what lets `fedResourcePrefix` scope
     // this to catalogs this deployment created rather than every catalog in the

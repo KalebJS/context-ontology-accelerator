@@ -365,6 +365,7 @@ Frontend polls `GET /sources/{sourceId}` and inspects the `status` field. Termin
 |-------|-------------|-------------|
 | `GLUE_DATABASE` | `DATABASE` | AWS Glue Data Catalog database |
 | `JDBC_DATABASE` | `DATABASE` | JDBC-connected relational database |
+| `ATHENA_CONNECTOR` | `DATABASE` | Customer-authored Athena Query Federation SDK connector — a Lambda in the customer's account, registered here as a `LAMBDA`-type Athena data catalog and discovered through Athena SQL (`SHOW`/`DESCRIBE`) |
 | `S3` | `DOCUMENTS` | S3 bucket prefix |
 | `LOCAL_UPLOAD` | `DOCUMENTS` | Direct file upload |
 
@@ -402,6 +403,7 @@ Frontend polls `GET /sources/{sourceId}` and inspects the `status` field. Termin
 | `SMUS_DOMAIN_ID` | Yes | DataZone domain ID |
 | `PROJECT_ACCESS_ROLE_ARN` | Yes | IAM role ARN for DataZone project access |
 | `FEDERATION_PROVISIONER_ROLE_ARN` | No | ARN of the federation provisioner role holding Lake Formation data-lake-admin privileges. The handler assumes it to tear down a JDBC source's Glue federated catalog on deletion. When unset, federated-resource cleanup is skipped. |
+| `RESOURCE_PREFIX` | Yes, for `ATHENA_CONNECTOR` | Deployment resource prefix (e.g. `scl-dev-`), used to derive the per-source Athena data-catalog name. **Load-bearing:** unset, `derive_catalog_name` falls back to a hard-coded `coa-dev-`, and every `CreateDataCatalog` then fails `AccessDenied` against the prefix-scoped IAM policy — which reads as a policy defect rather than a naming one. |
 | `ALLOWED_ORIGIN` | No | CORS allowed origin (default: `*`) |
 
 ## Environment Variables (Database Pipeline)
@@ -506,6 +508,10 @@ JDBC database sub-types (PostgreSQL, MySQL, Redshift, SQL Server) become directl
 ### When provisioning happens
 
 Federation provisioning runs as its own dedicated pipeline step — **`DbFederation`** — that executes _after_ Discovery and _before_ Enrichment (`Discovery → Federation → Enrichment`). It is isolated in the `sources-federation-provisioner` Lambda, which holds the Lake Formation data-lake-admin privilege required to create federated catalogs; keeping it out of the broad discovery connector limits the blast radius of that privilege. Provisioning is **idempotent** — re-scans are no-ops if the resources already exist. The handler self-gates: **S3/Iceberg sources** (`GLUE_DATABASE` without a `host`) and JDBC sources with incomplete config return success and are skipped — they are already queryable through Athena's native `AwsDataCatalog`.
+
+**`ATHENA_CONNECTOR` sources take a third branch.** There is nothing to provision: their Lambda-backed Athena data catalog is registered by the sources API at **source-create**, not here, because this sub-type's discovery queries that catalog and Discovery runs first. The branch only marks the source `queryable` — discovery having succeeded is the evidence, since the `SHOW`/`DESCRIBE` statements it ran prove the catalog resolves and the connector answers. No Glue object and no Lake Formation grant exist for this sub-type, so nothing else gates it. The write raises on failure for the same reason it does for JDBC: a source that scanned cleanly and then answers nothing is worse than a failed scan.
+
+A sub-type the `SourceSubType` enum recognises but this handler has no branch for now **raises** rather than silently skipping, so a new `DATABASE` sub-type cannot ship leaving every source of that type stuck at `queryable=False`. An absent or unrecognised value keeps the historical no-op, since a source deleted concurrently with its scan reads back as an empty record.
 
 Federation failure is **FATAL for JDBC sources**. If provisioning or its persistence raises, the `DbFederation` step fails and the pipeline's error catch marks the scan `FAILED` and the source `SCAN_FAILED` — a source that isn't queryable is not a successful scan. (This is a behavioral change from the previous non-fatal approach where discovery completed even if federation failed.)
 
