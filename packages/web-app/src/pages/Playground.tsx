@@ -39,6 +39,17 @@ import { scrollToBottom } from "@utils/scroll";
 
 import { buildQueryEndpoint } from "@utils/build-query-endpoint";
 
+/**
+ * The execution-mode toggle's options, typed by `ExecutionMode` so the ids sent
+ * as `options.mode` and the labels shown to the user stay in one place.
+ * `deep-reasoning` was previously labelled "Agentic"; serve still accepts the old
+ * wire value, but the UI only ever sends the current one.
+ */
+const EXECUTION_MODE_OPTIONS: readonly { id: ExecutionMode; text: string }[] = [
+  { id: "standard", text: "Standard" },
+  { id: "deep-reasoning", text: "Deep Reasoning" },
+];
+
 export const Playground: React.FC = () => {
   const runtimeContext = useContext(RuntimeConfigContext);
   const { namespaceId: urlNamespaceId } = useParams<{ namespaceId: string }>();
@@ -51,7 +62,7 @@ export const Playground: React.FC = () => {
 
   const [inputValue, setInputValue] = useState("");
   // Sent as options.mode on every query. Defaults to "standard" to match serve's
-  // deployment default; agentic (~140s p50 vs ~30s) is opt-in via the toggle.
+  // deployment default; deep reasoning (~140s p50 vs ~30s) is opt-in via the toggle.
   const [mode, setMode] = useState<ExecutionMode>("standard");
   const [selectedMessage, setSelectedMessage] = useState<
     ChatMessageType | undefined
@@ -205,15 +216,16 @@ export const Playground: React.FC = () => {
             <SegmentedControl
               selectedId={mode}
               onChange={({ detail }) => {
-                // selectedId is one of the option ids below, both valid modes.
-                if (detail.selectedId === "agentic") setMode("agentic");
-                else if (detail.selectedId === "standard") setMode("standard");
+                // Resolve against the typed option list rather than comparing
+                // string literals, so an id and the state setter cannot drift
+                // apart — a mismatch is a compile error, not a dead toggle.
+                const picked = EXECUTION_MODE_OPTIONS.find(
+                  (o) => o.id === detail.selectedId,
+                );
+                if (picked) setMode(picked.id);
               }}
               label="Execution mode"
-              options={[
-                { id: "standard", text: "Standard" },
-                { id: "agentic", text: "Agentic" },
-              ]}
+              options={EXECUTION_MODE_OPTIONS}
             />
             <Button
               variant="normal"

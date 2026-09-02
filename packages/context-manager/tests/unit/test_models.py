@@ -413,14 +413,14 @@ class TestDimensionsNormalization:
             namespace="demo",
             options={
                 "dimensions": [{"name": "region", "value": "EMEA"}],
-                "mode": "agentic",
+                "mode": "deep-reasoning",
                 "excludeTools": ["vector_search"],
                 "retrieverStrategy": "chunk_based_semantic",
                 "tierOverride": 1,
             },
         )
         assert req.options["dimensions"] == {"region": "EMEA"}
-        assert req.options["mode"] == "agentic"
+        assert req.options["mode"] == "deep-reasoning"
         assert req.options["excludeTools"] == ["vector_search"]
         assert req.options["retrieverStrategy"] == "chunk_based_semantic"
         assert req.options["tierOverride"] == 1

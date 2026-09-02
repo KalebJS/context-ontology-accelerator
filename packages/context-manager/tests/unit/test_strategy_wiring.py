@@ -346,7 +346,7 @@ class TestKnowledgeRetrieverHandRolledParity:
         mock_graph.traverse.assert_awaited_once()
 
 
-# ── mode request toggle: standard vs agentic ────────────────────────
+# ── mode request toggle: standard vs deep-reasoning ─────────────────
 
 
 @pytest.mark.unit
@@ -355,12 +355,12 @@ class TestModeRequestToggle:
 
     Mode is orthogonal to the tier cascade — the request field is ``mode``. The
     deployment default is ``standard`` (serve-stack TIER3_STRATEGY=hand-rolled), so
-    a caller opts IN to the multi-step loop with ``mode="agentic"``. Selecting
-    agentic hands the whole request to the loop, bypassing the T1->T2 cascade.
+    a caller opts IN to the multi-step loop with ``mode="deep-reasoning"``. Selecting
+    deep reasoning hands the whole request to the loop, bypassing the T1->T2 cascade.
     """
 
-    async def test_agentic_mode_bypasses_the_tier_cascade(self):
-        """Selecting agentic routes straight to the loop — mode is not a tier.
+    async def test_deep_reasoning_mode_bypasses_the_tier_cascade(self):
+        """Selecting deep reasoning routes straight to the loop — mode is not a tier.
 
         Without this, a question T1/T2 can answer returns before Tier 3, so the
         toggle appears to do nothing on any namespace with a structured source.
@@ -374,7 +374,7 @@ class TestModeRequestToggle:
             return MagicMock()  # T1 WOULD answer
 
         async def _t3(*a, **k):
-            ran.append("tier3_agentic")
+            ran.append("tier3_deep_reasoning")
             return MagicMock(result=MagicMock())
 
         orch._run_tier1 = _t1
@@ -386,45 +386,53 @@ class TestModeRequestToggle:
 
         from coa_serve.models import InvokeRequest
 
-        await orch.resolve(InvokeRequest(query="q", namespace="ns", options={"mode": "agentic"}))
-        assert ran == ["tier3_agentic"], f"agentic must bypass the cascade, ran={ran}"
+        await orch.resolve(InvokeRequest(query="q", namespace="ns", options={"mode": "deep-reasoning"}))
+        assert ran == ["tier3_deep_reasoning"], f"deep reasoning must bypass the cascade, ran={ran}"
 
-    def test_explicit_tier_override_wins_over_agentic_mode(self):
+    def test_explicit_tier_override_wins_over_deep_reasoning_mode(self):
         """A tierOverride is a direct instruction and is honored over mode routing."""
         orch, _ = _make_orchestrator(lexical_enabled=True, deployment_strategy="chunk_based_semantic")
         orch._agentic_retriever = MagicMock()
-        # The short-circuit guard is `tier_override is None and _is_agentic_engaged`,
-        # so a tierOverride disables the bypass regardless of mode.
-        assert orch._is_agentic_engaged({"mode": "agentic"}) is True  # engaged flag unchanged
+        # The short-circuit guard is `tier_override is None and
+        # _is_deep_reasoning_engaged`, so a tierOverride disables the bypass
+        # regardless of mode.
+        assert orch._is_deep_reasoning_engaged({"mode": "deep-reasoning"}) is True  # engaged flag unchanged
 
-    def test_validator_accepts_standard_and_agentic(self):
+    def test_validator_accepts_standard_and_deep_reasoning(self):
         from coa_serve.models import InvokeRequest
 
-        for mode in ("agentic", "standard"):
+        for mode in ("deep-reasoning", "standard"):
             req = InvokeRequest(query="q", namespace="ns", options={"mode": mode})
             assert req.options["mode"] == mode
+
+    def test_validator_still_accepts_deprecated_agentic_spelling(self):
+        """The pre-rename wire value must not start 400-ing on upgrade."""
+        from coa_serve.models import InvokeRequest
+
+        req = InvokeRequest(query="q", namespace="ns", options={"mode": "agentic"})
+        assert req.options["mode"] == "agentic"
 
     def test_validator_rejects_unknown_mode(self):
         from coa_serve.models import InvokeRequest
 
-        with pytest.raises(ValueError, match="must be 'agentic' or 'standard'"):
+        with pytest.raises(ValueError, match="must be 'deep-reasoning' or 'standard'"):
             InvokeRequest(query="q", namespace="ns", options={"mode": "turbo"})
 
-    def test_standard_opts_out_even_when_deployment_default_is_agentic(self):
+    def test_standard_opts_out_even_when_deployment_default_is_deep_reasoning(self):
         """The whole point of the toggle: 'standard' must win over the default."""
         orch, _ = _make_orchestrator(lexical_enabled=True, deployment_strategy="chunk_based_semantic")
         orch._agentic_retriever = MagicMock()  # a retriever IS available
-        orch._tier3_agentic_default = True  # deployment default says agentic
+        orch._tier3_deep_reasoning_default = True  # deployment default says deep reasoning
 
-        assert orch._is_agentic_engaged({"mode": "standard"}) is False
-        assert orch._is_agentic_engaged({"mode": "agentic"}) is True
-        assert orch._is_agentic_engaged({}) is True  # absent → deployment default
+        assert orch._is_deep_reasoning_engaged({"mode": "standard"}) is False
+        assert orch._is_deep_reasoning_engaged({"mode": "deep-reasoning"}) is True
+        assert orch._is_deep_reasoning_engaged({}) is True  # absent → deployment default
 
-    def test_no_retriever_means_never_agentic(self):
-        """Even an explicit 'agentic' cannot engage a retriever that was not built."""
+    def test_no_retriever_means_never_deep_reasoning(self):
+        """Even an explicit mode cannot engage a retriever that was not built."""
         orch, _ = _make_orchestrator(lexical_enabled=True, deployment_strategy="chunk_based_semantic")
         orch._agentic_retriever = None
-        orch._tier3_agentic_default = True
+        orch._tier3_deep_reasoning_default = True
 
-        assert orch._is_agentic_engaged({"mode": "agentic"}) is False
-        assert orch._is_agentic_engaged({}) is False
+        assert orch._is_deep_reasoning_engaged({"mode": "deep-reasoning"}) is False
+        assert orch._is_deep_reasoning_engaged({}) is False

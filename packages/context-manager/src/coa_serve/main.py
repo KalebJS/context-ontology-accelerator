@@ -280,7 +280,7 @@ async def _ensure_initialized():
         )
         # Bounded tool-use agent (iterative schema discovery → generate → execute →
         # self-correct). OPT-IN only: it runs solely when a request pins
-        # options.strategy="agentic" — never as a fallback (see
+        # options.strategy="deep-reasoning" — never as a fallback (see
         # StructuredQueryTier._strategies_for) — so registering it here does not
         # change the default nl_to_sql_first resolution path.
         agentic_strategy = AgenticStrategy(
@@ -289,7 +289,7 @@ async def _ensure_initialized():
             query_executor=query_executor,
             vector_client=opensearch_client,
             oss_ontology_index=oss_ontology_index,
-            # Backs the opt-in explore_graph tool (SERVE_AGENTIC_GRAPH_TRAVERSAL);
+            # Backs the opt-in explore_graph tool (SERVE_DEEP_REASONING_GRAPH_TRAVERSAL);
             # with the flag off the client is simply never used.
             graph_client=neptune_client,
         )
@@ -297,8 +297,9 @@ async def _ensure_initialized():
             strategies=[ontop_strategy, nl_to_sql_strategy, agentic_strategy],
         )
 
-        # Agentic Tier 3 path. Built so a deployment default (TIER3_STRATEGY=agentic)
-        # OR a per-request options.mode="agentic" can engage it; construction is
+        # Deep-reasoning Tier 3 path. Built so a deployment default
+        # (TIER3_STRATEGY=deep-reasoning) OR a per-request
+        # options.mode="deep-reasoning" can engage it; construction is
         # cheap and keeps the graphrag_toolkit import lazy (the registry's
         # strategy/graph tools defer toolkit access to first invoke). Imported here
         # (not at module load) so the serve module import stays graphrag-free. A
@@ -358,7 +359,7 @@ async def _ensure_initialized():
             vector_client=opensearch_client,
             oss_ontology_index=oss_ontology_index,
             agentic_retriever=agentic_retriever,
-            tier3_agentic_default=(config.tier3_strategy == "agentic"),
+            tier3_deep_reasoning_default=(config.tier3_strategy == "deep-reasoning"),
         )
         _config = config
         logger.info(

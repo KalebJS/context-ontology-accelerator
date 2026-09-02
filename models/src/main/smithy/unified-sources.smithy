@@ -266,20 +266,23 @@ structure GlueConfiguration {
 /// there is no catalogId and no cross-account IAM role to assume: the customer
 /// grants access on the connector Lambda's own resource policy instead. There
 /// is also no region member — the connector must live in this deployment's
-/// region (see metadataFunctionArn).
+/// region (see connectorFunctionArn).
 structure AthenaConfiguration {
-    /// ARN of the connector Lambda that handles metadata requests — and record
-    /// requests too when recordFunctionArn is omitted, i.e. a composite
-    /// handler. The ARN's region must equal this deployment's own region,
-    /// because Athena can only invoke a data-source connector co-located with
-    /// the query.
+    /// ARN of the connector Lambda. ONE Lambda serves both metadata and record
+    /// requests — what Athena calls a composite handler. The ARN's region must
+    /// equal this deployment's own region, because Athena can only invoke a
+    /// data-source connector co-located with the query.
+    ///
+    /// Athena also accepts a split metadata/record PAIR of Lambdas, which this
+    /// member was once one half of. The pair is deliberately not modelled: the
+    /// reference connector and the CDK template customers are given both deploy a
+    /// single composite Lambda, so a second ARN asked every customer to reason
+    /// about a distinction almost none of them would make — and an ARN placed in
+    /// the wrong one of two adjacent members fails at query time rather than at
+    /// onboarding. Restoring it is purely additive (one optional member, plus the
+    /// record-function catalog parameter) if a customer ever needs the split form.
     @required
-    metadataFunctionArn: LambdaFunctionArn
-
-    /// ARN of a separate record-handler Lambda, for a connector deployed as a
-    /// split metadata/record pair. Omit for the common composite connector, in
-    /// which case metadataFunctionArn serves both paths.
-    recordFunctionArn: LambdaFunctionArn
+    connectorFunctionArn: LambdaFunctionArn
 
     /// The single database inside the connector's catalog that this source
     /// exposes. Exactly one database is resolved per source, so a connector
@@ -911,17 +914,23 @@ structure DatabaseSourceDetail {
     /// for examples.
     glueConnectionName: String
 
-    /// Name of the managed Glue federated catalog registered for this
-    /// source. Read-only and system-managed. Populated only for JDBC
-    /// sub-types (null for S3/Iceberg). It is a nested catalog under
-    /// Athena's default `AwsDataCatalog`, so query it as:
+    /// Name of the Athena data catalog registered for this source. Read-only
+    /// and system-managed, derived from `{resource-prefix}ds_{sourceId}`. Null
+    /// for S3/Iceberg-backed Glue databases, which are queried through Athena's
+    /// native `AwsDataCatalog`.
     ///
-    ///     SELECT * FROM "AwsDataCatalog"."<athenaDataCatalogName>"."<schema>"."<table>"
+    /// The addressing differs by sub-type, because the two catalogs are not the
+    /// same kind of object:
+    ///
+    /// - JDBC sub-types: a managed Glue federated catalog, NESTED under
+    ///   `AwsDataCatalog`, and equal to `glueConnectionName`. Query it as
+    ///   `AwsDataCatalog.<athenaDataCatalogName>.<schema>.<table>`.
+    /// - ATHENA_CONNECTOR: a LAMBDA-type Athena catalog bound to the customer's
+    ///   connector Lambda. It is a TOP-LEVEL catalog, not nested, so query it as
+    ///   `<athenaDataCatalogName>.<databaseName>.<table>`.
     ///
     /// Run the query inside the namespace's Athena workgroup (see
-    /// NamespaceDetail.athenaWorkgroupName). This catalog name equals
-    /// the `glueConnectionName`; both are derived from
-    /// `{resource-prefix}ds_{sourceId}`.
+    /// NamespaceDetail.athenaWorkgroupName).
     athenaDataCatalogName: String
 }
 
@@ -1606,4 +1615,26 @@ structure GetSourceScanJobOutput {
 
     /// Error message if the scan job failed.
     errorMessage: String
+
+    /// Number of tables the scan listed but could not read.
+    ///
+    /// Absent when none failed, rather than zero, so it can be used directly to
+    /// filter for degraded scans. A non-zero value means the scan SUCCEEDED but
+    /// is incomplete: those tables carry no columns, no comments, and no declared
+    /// keys, and AI enrichment will have generated descriptions over the gap — so
+    /// a reviewer must not read the result as complete. Only connectors that read
+    /// each table separately can report this; one that returns a table's schema in
+    /// the same call that lists it cannot partially fail.
+    tablesFailed: Integer
+
+    /// The unreadable tables as `database.table`, capped in length.
+    ///
+    /// A signal for diagnosis, not an inventory — `tablesFailed` is the exact
+    /// figure and this list may be shorter than it.
+    failedTables: FailedTableList
+}
+
+/// Qualified `database.table` names of tables a scan listed but could not read.
+list FailedTableList {
+    member: String
 }

@@ -245,6 +245,12 @@ describe("SourceList", () => {
               sourceType: "DOCUMENTS",
               sourceSubType: "LOCAL_UPLOAD",
             }),
+            makeSource({
+              sourceId: "s5",
+              name: "e",
+              sourceType: "DATABASE",
+              sourceSubType: "ATHENA_CONNECTOR",
+            }),
           ]),
         ],
       },
@@ -255,6 +261,8 @@ describe("SourceList", () => {
     expect(screen.getByText("Database · JDBC")).toBeInTheDocument();
     expect(screen.getByText("Documents · S3")).toBeInTheDocument();
     expect(screen.getByText("Documents · Upload")).toBeInTheDocument();
+    // Must be a human label, not the raw enum ("Database · ATHENA_CONNECTOR").
+    expect(screen.getByText("Database · Athena connector")).toBeInTheDocument();
   });
 
   it("shows item count in header", () => {

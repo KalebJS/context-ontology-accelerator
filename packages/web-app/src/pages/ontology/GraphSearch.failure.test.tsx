@@ -35,18 +35,18 @@ const CLASSES: GraphSearchHit[] = [
 const CLASS_PAGE: GraphSearchResult = { hits: CLASSES, total_count: 1 };
 const ONTOLOGY_RECORDS: OntologyRecord[] = [
   {
-    ontology_id: "o",
+    ontologyId: "o",
     uri: "o",
     title: "Insurance",
-    ontology_type: "induced",
+    ontologyType: "induced",
     format: "turtle",
-    domain_tags: [],
-    class_count: 1,
-    property_count: 0,
-    axiom_count: 0,
-    embedding_count: 1,
-    created_at: "2026-07-01T00:00:00Z",
-    updated_at: "2026-07-01T00:00:00Z",
+    domainTags: [],
+    classCount: 1,
+    propertyCount: 0,
+    axiomCount: 0,
+    embeddingCount: 1,
+    createdAt: "2026-07-01T00:00:00Z",
+    updatedAt: "2026-07-01T00:00:00Z",
   },
 ];
 // The overview seeds a PARTIAL vertex for Claim — this is what makes the page

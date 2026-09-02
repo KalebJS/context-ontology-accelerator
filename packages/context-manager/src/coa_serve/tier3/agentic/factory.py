@@ -32,9 +32,9 @@ gating registers it process-wide; composition gating hides it per request).
 The Ontology_Lookup_Tool is ALWAYS registered (Req 12.4 / the design table): the
 file source reads a local ``.ttl`` and needs no endpoint, and the graph source
 reuses the already-required serve-layer graph client. Its backing
-:class:`OntologySource` is selected from ``config.agentic_ontology_source``
+:class:`OntologySource` is selected from ``config.deep_reasoning_ontology_source``
 (``file`` — the in-scope default for this increment — vs ``graph``, whose live
-wiring is follow-up task 21), with ``config.agentic_ontology_file`` supplying the
+wiring is follow-up task 21), with ``config.deep_reasoning_ontology_file`` supplying the
 file source path.
 
 Import discipline (Requirement 12.3): module load of this module MUST NOT import
@@ -92,20 +92,20 @@ def build_budget_config(config: ServiceConfig) -> AgenticBudgetConfig:
         per-tool timeout, and fan-out cap.
     """
     return AgenticBudgetConfig(
-        time_budget_s=float(config.agentic_time_budget_s),
-        max_steps=config.agentic_max_steps,
-        per_tool_timeout_s=float(config.agentic_per_tool_timeout_s),
-        max_fanout=config.agentic_max_fanout,
-        synthesis_reserve_s=float(config.agentic_synthesis_reserve_s),
+        time_budget_s=float(config.deep_reasoning_time_budget_s),
+        max_steps=config.deep_reasoning_max_steps,
+        per_tool_timeout_s=float(config.deep_reasoning_per_tool_timeout_s),
+        max_fanout=config.deep_reasoning_max_fanout,
+        synthesis_reserve_s=float(config.deep_reasoning_synthesis_reserve_s),
     )
 
 
 def build_ontology_source(config: ServiceConfig, clients: ClientSet) -> OntologySource:
     """Select the :class:`OntologySource` for the Ontology_Lookup_Tool (Req 3.2, 12.7).
 
-    Honors ``config.agentic_ontology_source``: ``file`` (the in-scope default for
+    Honors ``config.deep_reasoning_ontology_source``: ``file`` (the in-scope default for
     this increment) builds an :class:`OntologyFileSource` over
-    ``config.agentic_ontology_file``; ``graph`` builds an
+    ``config.deep_reasoning_ontology_file``; ``graph`` builds an
     :class:`OntologyGraphSource` over the shared serve-layer graph client (its live
     use is wired/verified in follow-up task 21). The config value is already
     validated/normalized at load, so any unrecognized value would have fallen back
@@ -123,10 +123,10 @@ def build_ontology_source(config: ServiceConfig, clients: ClientSet) -> Ontology
     # CWD (IsADirectoryError on every lookup), so fall back to the graph source.
     # config.load_config already normalizes this, but the factory must not build a
     # structurally-broken source if constructed with a raw config elsewhere.
-    if config.agentic_ontology_source == "file" and config.agentic_ontology_file:
-        logger.info("agentic_ontology_source_selected", source="file", path=config.agentic_ontology_file)
-        return OntologyFileSource(config.agentic_ontology_file)
-    if config.agentic_ontology_source == "file":
+    if config.deep_reasoning_ontology_source == "file" and config.deep_reasoning_ontology_file:
+        logger.info("agentic_ontology_source_selected", source="file", path=config.deep_reasoning_ontology_file)
+        return OntologyFileSource(config.deep_reasoning_ontology_file)
+    if config.deep_reasoning_ontology_source == "file":
         logger.warning("agentic_ontology_file_unset_using_graph_source")
     logger.info("agentic_ontology_source_selected", source="graph")
     return OntologyGraphSource(clients.graph)
@@ -181,7 +181,7 @@ def build_tool_registry(
     # 15.0s" → scored no-progress → wasted escalation step). The controller still
     # enforces the real deadline, so this only stops the adapter from cutting the
     # tool short first.
-    lexical = build_lexical_retriever(config, timeout_s=float(config.agentic_per_tool_timeout_s))
+    lexical = build_lexical_retriever(config, timeout_s=float(config.deep_reasoning_per_tool_timeout_s))
     if lexical is not None:
         build_strategy_tools(registry, lexical)
     else:
@@ -329,8 +329,8 @@ def build_agentic_retriever(
     controller = ReasoningController(
         step_planner,
         per_tool_timeout_s=budget.per_tool_timeout_s,
-        max_no_progress_steps=config.agentic_max_no_progress_steps,
-        ontology_edge_mode=config.agentic_ontology_edge_mode,
+        max_no_progress_steps=config.deep_reasoning_max_no_progress_steps,
+        ontology_edge_mode=config.deep_reasoning_ontology_edge_mode,
     )
 
     logger.info(
