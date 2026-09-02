@@ -1,14 +1,24 @@
 # Build context: monorepo root ($CI_PROJECT_DIR)
 #   docker build -f packages/ontology-engine/Dockerfile .
-# Pin to digest to prevent supply-chain attacks via tag mutation.
-# python:3.12-slim built 2026-05-19 — includes glibc deb13u3, systemd/sed/libcap2 deb13u1 CVE fixes.
-FROM --platform=linux/amd64 public.ecr.aws/docker/library/python:3.12-slim@sha256:7a8b475003c4fe15a2cd4e55e5cfc2f3560bdc9333d624f24cdd6d4340fd7a17
+# Pin to digest to prevent supply-chain attacks via tag mutation. The pin is for
+# supply-chain integrity only, NOT patch currency: the previous digest sat at
+# openssl 3.5.6-1~deb13u2 and Inspector flagged 10 CVEs against it. Patch level
+# now comes from the apt-get upgrade below, so a stale pin can no longer hold
+# back an OS security fix.
+# python:3.12-slim, digest resolved from the tag on 2026-09-01.
+FROM --platform=linux/amd64 public.ecr.aws/docker/library/python:3.12-slim@sha256:e5c9fa26ffb76e11e0f054f30dc2523a2f9693f0c36c0cf1e39b27e152d899fc
 
 WORKDIR /app
 
-# Java runtime for owlready2 HermiT reasoner (tier-1 validation)
+# Java runtime for owlready2 HermiT reasoner (tier-1 validation).
+# `upgrade` runs after our own installs so it also patches what we just pulled
+# in. Debian has no apt equivalent of `dnf update --security`, but on a stable
+# release the configured suites are trixie + trixie-updates + trixie-security,
+# so a plain `upgrade` is security/point-release only. Use `upgrade`, never
+# `dist-upgrade` — the latter may remove packages to satisfy dependencies.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends default-jre-headless curl && \
+    apt-get upgrade -y && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --no-create-home --shell /bin/false appuser

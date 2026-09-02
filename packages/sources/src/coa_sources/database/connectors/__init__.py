@@ -5,6 +5,7 @@
 
 from coa_control_plane_server.models.source_sub_type import SourceSubType
 
+from .athena_connector import AthenaConnector
 from .base import (
     ConnectionCheck,
     ConnectionTestResult,
@@ -14,6 +15,7 @@ from .glue_catalog import GlueCatalogConnector
 from .jdbc import JdbcConnector
 
 __all__ = [
+    "AthenaConnector",
     "ConnectionCheck",
     "ConnectionTestResult",
     "GlueCatalogConnector",
@@ -25,6 +27,7 @@ __all__ = [
 CONNECTOR_REGISTRY: dict[str, type[MetadataConnector]] = {
     SourceSubType.GLUE_DATABASE: GlueCatalogConnector,
     SourceSubType.JDBC_DATABASE: JdbcConnector,
+    SourceSubType.ATHENA_CONNECTOR: AthenaConnector,
 }
 
 

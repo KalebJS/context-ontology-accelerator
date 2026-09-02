@@ -109,6 +109,46 @@ def async_boto_config(
     )
 
 
+# --- Throttle classification -------------------------------------------------
+
+# Error codes that mean "an AWS service is asking us to slow down". Spans the
+# spelling variants AWS uses across services (Glue, Lake Formation, STS, Athena,
+# S3), because there is no single canonical name: the same condition arrives as
+# ThrottlingException from one service and RequestThrottled from another.
+#
+# Lives here rather than in a caller because a partial copy is worse than no
+# copy: a missing code means a retryable condition is treated as fatal, which
+# reads as an unexplained failure rather than as a throttle.
+THROTTLE_ERROR_CODES = frozenset(
+    {
+        "ThrottlingException",
+        "Throttling",
+        "ThrottledException",
+        "TooManyRequestsException",
+        "RequestLimitExceeded",
+        "RequestThrottled",
+        "RequestThrottledException",
+        "SlowDown",
+    }
+)
+
+
+def is_throttling_error(exc: BaseException | None) -> bool:
+    """Whether ``exc`` is an AWS throttle.
+
+    Accepts ``BaseException | None`` so callers can pass ``__cause__`` directly.
+    Falls back to the HTTP status when the code is unrecognised — 429 is
+    unambiguous, and it catches a service whose code spelling is not in the set
+    above.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    if (response.get("Error") or {}).get("Code") in THROTTLE_ERROR_CODES:
+        return True
+    return (response.get("ResponseMetadata") or {}).get("HTTPStatusCode") == 429
+
+
 def apply_default_client_config(botocore_session: Any) -> None:
     """Ensure a botocore session has a default client config with our timeouts.
 

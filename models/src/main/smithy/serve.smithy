@@ -534,10 +534,12 @@ operation Query {
         /// Pin resolution to a specific tier, bypassing automatic routing.
         tierOverride: Integer
 
-        /// Execution mode: "standard" (single-shot) or "agentic" (multi-step
+        /// Execution mode: "standard" (single-shot) or "deep-reasoning" (multi-step
         /// reasoning loop). Orthogonal to the tier cascade. Absent = the serve
-        /// deployment default. Agentic is higher-recall but much slower (p50 ~90s),
-        /// so a caller behind a short client timeout should send "standard".
+        /// deployment default. Deep reasoning is higher-recall but much slower
+        /// (p50 ~90s), so a caller behind a short client timeout should send
+        /// "standard". "agentic" is the deprecated pre-rename spelling of
+        /// "deep-reasoning" and is still accepted.
         mode: String
 
         /// Dimension filters to constrain the query.

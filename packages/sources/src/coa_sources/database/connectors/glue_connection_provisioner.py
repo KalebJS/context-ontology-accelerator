@@ -38,6 +38,7 @@ import time
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from coa_common.aws_config import is_throttling_error
 
 from coa_sources.database.metrics import emit_metric
 
@@ -104,20 +105,6 @@ _IPV4_RE = re.compile(r"^(\d{1,3}\.){3}\d{1,3}$")
 _DATABASE_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 _IAM_ROLE_ARN_RE = re.compile(r"^arn:(aws|aws-us-gov|aws-cn):iam::\d+:role/.+$")
 
-# Terminal throttle codes across Glue / Lake Formation / STS.
-_THROTTLE_CODES = frozenset(
-    {
-        "ThrottlingException",
-        "Throttling",
-        "ThrottledException",
-        "TooManyRequestsException",
-        "RequestLimitExceeded",
-        "RequestThrottled",
-        "RequestThrottledException",
-        "SlowDown",
-    }
-)
-
 
 def _count_if_throttle(exc: ClientError, api: str) -> None:
     """Emit ``GlueApiThrottles`` when ``exc`` is a terminal throttle.
@@ -128,7 +115,7 @@ def _count_if_throttle(exc: ClientError, api: str) -> None:
     on ``needs-retry.*``, which is not worth the wiring until this metric shows
     real pressure.
     """
-    if exc.response.get("Error", {}).get("Code") in _THROTTLE_CODES:
+    if is_throttling_error(exc):
         emit_metric("GlueApiThrottles", 1, "Count", Api=api)
 
 
@@ -192,10 +179,14 @@ def _partition(region: str) -> str:
     return "aws"
 
 
-def _build_catalog_name(resource_prefix: str, datasource_id: str) -> str:
+def build_catalog_name(resource_prefix: str, datasource_id: str) -> str:
     """Deterministic, lowercase, collision-resistant name (<=41 chars).
 
-    Used as the Glue connection name, federated catalog name, and identifier.
+    Used as the Glue connection name, federated catalog name, and identifier for
+    a federated JDBC source, and — via ``athena_catalog`` — as the Athena
+    data-catalog name for a custom-connector source. Shared deliberately: the
+    ``{sanitizedPrefix}ds_*`` shape is what lets one prefix-scoped IAM statement
+    cover every catalog this deployment creates, so the two paths must not drift.
     """
     digest = hashlib.sha256(datasource_id.encode("utf-8")).hexdigest()[:16]
     safe_prefix = re.sub(r"[^a-z0-9]", "", resource_prefix.lower())
@@ -252,7 +243,7 @@ def provision_federated_catalog(
     if not _DATABASE_RE.match(public_schema_name):
         raise RuntimeError(f"Invalid public_schema_name: {public_schema_name!r}")
 
-    name = _build_catalog_name(resource_prefix, datasource_id.replace("DS#", ""))
+    name = build_catalog_name(resource_prefix, datasource_id.replace("DS#", ""))
     conn_arn = f"arn:{_partition(AWS_REGION)}:glue:{AWS_REGION}:{_get_account_id()}:connection/{name}"
     glue = _get_glue()
 

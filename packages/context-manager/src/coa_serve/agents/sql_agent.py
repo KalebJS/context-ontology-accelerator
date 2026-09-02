@@ -41,13 +41,13 @@ therefore not offered — see the note on ``invoke_async`` below.
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
 
+from ..config import env_with_legacy_name
 from ..exceptions import AccessDeniedError
 from ..sql_execution import SqlExecutionService, SqlExecutionStatus
 from ..tier2.tools import (
@@ -91,21 +91,24 @@ _PREFETCH_PREVIEW_CHARS = 160
 
 def _resolve_prefetch_schemas() -> int:
     try:
-        return max(0, int(os.environ.get("SERVE_AGENTIC_PREFETCH_SCHEMAS", str(_DEFAULT_PREFETCH_SCHEMAS))))
+        return max(
+            0,
+            int(env_with_legacy_name("SERVE_DEEP_REASONING_PREFETCH_SCHEMAS", str(_DEFAULT_PREFETCH_SCHEMAS))),
+        )
     except (TypeError, ValueError):
         return _DEFAULT_PREFETCH_SCHEMAS
 
 
 def _resolve_exec_timeout() -> int:
     try:
-        return max(5, int(os.environ.get("SERVE_AGENTIC_EXEC_TIMEOUT_S", str(_DEFAULT_EXEC_TIMEOUT_S))))
+        return max(5, int(env_with_legacy_name("SERVE_DEEP_REASONING_EXEC_TIMEOUT_S", str(_DEFAULT_EXEC_TIMEOUT_S))))
     except (TypeError, ValueError):
         return _DEFAULT_EXEC_TIMEOUT_S
 
 
 def _intent_review_enabled() -> bool:
-    """True when SERVE_AGENTIC_INTENT_REVIEW is set to a truthy value (env-only)."""
-    return os.environ.get("SERVE_AGENTIC_INTENT_REVIEW", "").strip().lower() in ("1", "true", "on", "yes")
+    """True when SERVE_DEEP_REASONING_INTENT_REVIEW is set to a truthy value (env-only)."""
+    return env_with_legacy_name("SERVE_DEEP_REASONING_INTENT_REVIEW").strip().lower() in ("1", "true", "on", "yes")
 
 
 AGENT_SYSTEM_PROMPT = """\
@@ -135,7 +138,7 @@ share a real foreign key. Ignore irrelevant candidates.
 - Output the final verified SQL in <sql>...</sql>."""
 
 
-# Appended to the system prompt ONLY when SERVE_AGENTIC_INTENT_REVIEW is on. Targets
+# Appended to the system prompt ONLY when SERVE_DEEP_REASONING_INTENT_REVIEW is on. Targets
 # the confidently-wrong-on-plausible-rows failure mode: the agent runs SQL, sees
 # non-empty rows, and finalizes without questioning whether its reading of the
 # question's ambiguous terms is the intended one. This adds a mandatory
@@ -179,7 +182,7 @@ def build_system_prompt(intent_review: bool | None = None) -> str:
 
     Args:
         intent_review: Force the interpretation-reconciliation block on/off;
-            ``None`` reads ``SERVE_AGENTIC_INTENT_REVIEW``.
+            ``None`` reads ``SERVE_DEEP_REASONING_INTENT_REVIEW``.
     """
     enabled = _intent_review_enabled() if intent_review is None else intent_review
     return AGENT_SYSTEM_PROMPT + (INTENT_REVIEW_BLOCK if enabled else "")
@@ -278,11 +281,11 @@ class SqlAgent:
             region: Bedrock region for the agent's own model provider.
             model_id: Model the agent reasons with; None uses the provider default.
             exec_timeout_s: Per-statement execution timeout; None reads
-                ``SERVE_AGENTIC_EXEC_TIMEOUT_S``.
+                ``SERVE_DEEP_REASONING_EXEC_TIMEOUT_S``.
             intent_review: Force the intent-review prompt block; None reads
-                ``SERVE_AGENTIC_INTENT_REVIEW``.
+                ``SERVE_DEEP_REASONING_INTENT_REVIEW``.
             prefetch_schemas: Table schemas to inline before the first turn;
-                None reads ``SERVE_AGENTIC_PREFETCH_SCHEMAS``, 0 disables.
+                None reads ``SERVE_DEEP_REASONING_PREFETCH_SCHEMAS``, 0 disables.
         """
         self._catalog = catalog
         self._authoring = authoring

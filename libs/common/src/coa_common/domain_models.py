@@ -176,6 +176,17 @@ class DiscoveredMetadata:
     """Output of a connector's discover_metadata call."""
 
     tables: list[Table] = field(default_factory=list)
+    failed_tables: list[str] = field(default_factory=list)
+    """Tables the connector listed but could not read, as ``database.table``.
+
+    Stays empty for connectors that read a table's schema in the same call that
+    lists it, since those cannot partially fail. It is populated by connectors
+    that read each table separately and degrade per table — losing that table's
+    columns, comments, and keys while the scan as a whole still succeeds. Because
+    the source still advances to PENDING_REVIEW and enrichment then backfills
+    AI-generated descriptions over the gap, a steward would otherwise review a
+    silently incomplete ontology as if it were complete. The pipeline therefore
+    records this as a scan-level signal rather than a log line."""
 
     @property
     def total_columns(self) -> int:
