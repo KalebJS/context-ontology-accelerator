@@ -144,11 +144,11 @@ class TestExecuteQuery:
             "ns",
             profile,
             "tok",
-            mode="agentic",
+            mode="deep-reasoning",
             dimensions=[{"name": "region", "value": "us-east"}],
         )
         payload = mock_cm.invoke.call_args[0][0]
-        assert payload["options"]["mode"] == "agentic"
+        assert payload["options"]["mode"] == "deep-reasoning"
         assert payload["options"]["dimensions"] == {"region": "us-east"}
         assert "timeoutMs" not in payload["options"]
 

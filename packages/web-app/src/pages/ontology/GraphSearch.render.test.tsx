@@ -35,9 +35,9 @@ const CLASS_PAGE: GraphSearchResult = { hits: CLASSES, total_count: 2 };
 // set of ontology ids), not a capped wildcard class fetch.
 const ONTOLOGY_RECORDS: OntologyRecord[] = [
   {
-    ontology_id: "o",
+    ontologyId: "o",
     title: "Insurance",
-    ontology_type: "induced",
+    ontologyType: "induced",
   } as OntologyRecord,
 ];
 const OVERVIEW: OntologyOverviewResult = {
@@ -242,7 +242,7 @@ describe("GraphSearchPage — List view ontology filter", () => {
     // The selector shows the induced ontology's title as the default.
     expect(filterTrigger).toHaveTextContent("Insurance");
 
-    // Switch to "All ontologies" → the query re-runs without an ontology_id.
+    // Switch to "All ontologies" → the query re-runs without an ontologyId.
     searchEntitiesPaged.mockClear();
     await userEvent.click(filterTrigger);
     await userEvent.click(screen.getByText("All ontologies"));
@@ -268,7 +268,7 @@ describe("GraphSearchPage — List view paging across chunks", () => {
       uri: `http://ex.org/o#C${i}`,
       label: `C${String(i).padStart(3, "0")}`,
       kind: "class",
-      graph_uri: "wb/ns/o",
+      graph_uris: ["wb/ns/o"],
     }),
   );
   // Total spans exactly one extra display page (chunk1 + 20 → 6 pages of 20).
@@ -280,13 +280,13 @@ describe("GraphSearchPage — List view paging across chunks", () => {
       uri: `http://ex.org/o#C${CLASS_FETCH_CHUNK_SIZE + i}`,
       label: `C${String(CLASS_FETCH_CHUNK_SIZE + i).padStart(3, "0")}`,
       kind: "class",
-      graph_uri: "wb/ns/o",
+      graph_uris: ["wb/ns/o"],
     }),
   );
   const CHUNK1: GraphSearchResult = { hits: CHUNK1_ROWS, total_count: TOTAL };
   const CHUNK2: GraphSearchResult = { hits: CHUNK2_ROWS, total_count: TOTAL };
   const PAGED_RECORDS: OntologyRecord[] = [
-    { ontology_id: "o", title: "Insurance", ontology_type: "induced" },
+    { ontologyId: "o", title: "Insurance", ontologyType: "induced" },
   ] as OntologyRecord[];
   const PAGED_OVERVIEW: OntologyOverviewResult = {
     ontology_id: "o",
@@ -389,9 +389,21 @@ describe("GraphSearchPage — List view paging across chunks", () => {
     // The empty text appears and STAYS (loading resolves to empty, not the
     // false-empty spinner). waitFor rather than a single-instant assertion so a
     // slow initial-load frame under parallel test load isn't read as a failure.
-    await view.findByText("No classes found in this namespace yet.");
-    await waitFor(() =>
-      expect(view.queryByText("Loading classes…")).toBeNull(),
+    //
+    // The explicit timeout matters: findByText defaults to 1000ms, which the
+    // shared CI runner exceeds on the first paint (the suite takes ~2m there vs
+    // ~12s locally), so this failed in CI while passing 11/11 locally. Matches
+    // the 5000ms the paging test above already uses.
+    await view.findByText(
+      "No classes found in this namespace yet.",
+      undefined,
+      {
+        timeout: 5000,
+      },
+    );
+    await waitFor(
+      () => expect(view.queryByText("Loading classes…")).toBeNull(),
+      { timeout: 5000 },
     );
     expect(
       view.getByText("No classes found in this namespace yet."),

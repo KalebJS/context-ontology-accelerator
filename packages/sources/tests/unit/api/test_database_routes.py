@@ -82,6 +82,7 @@ def _make_glue_db_req(athena_data_catalog_name=None, execution_engine=None, reds
     req.glue_configuration.execution_engine = execution_engine
     req.glue_configuration.redshift_workgroup = redshift_workgroup
     req.jdbc_configuration = None
+    req.custom_connector_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -93,6 +94,7 @@ def _make_jdbc_db_req(engine="POSTGRESQL"):
     req.jdbc_configuration.engine = engine
     req.jdbc_configuration.to_dict.return_value = {"jdbcUrl": "jdbc:mysql://host/db"}
     req.glue_configuration = None
+    req.custom_connector_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -477,6 +479,232 @@ class TestCreateDatabaseSource:
 
 
 # ===================================================================
+# _create_database_source — CUSTOM_CONNECTOR (custom connector)
+# ===================================================================
+
+
+def _make_athena_db_req(
+    metadata_arn="arn:aws:lambda:us-east-1:111122223333:function:acme-connector",
+    database_name="widgets",
+):
+    req = MagicMock()
+    req.name = "my-connector"
+    req.glue_configuration = None
+    req.jdbc_configuration = None
+    req.custom_connector_configuration = MagicMock()
+    req.custom_connector_configuration.connector_function_arn = metadata_arn
+    req.custom_connector_configuration.database_name = database_name
+    req.custom_connector_configuration.to_dict.return_value = {
+        "connectorFunctionArn": metadata_arn,
+        "databaseName": database_name,
+    }
+    req.metadata_enrichment_enabled = None
+    return req
+
+
+@pytest.mark.unit
+class TestCreateCustomConnectorSource:
+    """Creating a source backed by a customer-authored Athena federation
+    connector. The load-bearing parts are the ORDER (DynamoDB row before the
+    catalog, because every delete path keys off the row) and the rollbacks, since
+    a catalog nobody has a record of cannot be found again."""
+
+    def _create(self, req, *, register=None, delete=None, sqs=None, dao=None):
+        mock_dao = dao or MagicMock()
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_DR}._get_sqs", return_value=sqs or MagicMock()),
+            patch(f"{_DR}.register_lambda_catalog", register or MagicMock()) as reg,
+            patch(f"{_DR}.delete_lambda_catalog", delete or MagicMock()) as dele,
+        ):
+            status, body = _parse(_dr._create_database_source(req, _NAMESPACE_ID))
+        return status, body, mock_dao, reg, dele
+
+    def test_derives_the_custom_connector_sub_type(self):
+        status, _, mock_dao, _, _ = self._create(_make_athena_db_req())
+        assert status == 202
+        assert mock_dao.put.call_args[0][0]["sourceSubType"] == "CUSTOM_CONNECTOR"
+
+    def test_the_catalog_name_is_derived_from_the_source_id(self):
+        """Not caller-supplied, and not arbitrary. Two properties rest on this: a
+        1:1 source-to-catalog mapping (so teardown removes only this source's
+        catalog), and the `{sanitizedPrefix}ds_*` shape the IAM policy is scoped
+        to — any other derivation fails closed as AccessDenied."""
+        from coa_sources.database.connectors.athena_catalog import derive_catalog_name
+
+        _, _, mock_dao, reg, _ = self._create(_make_athena_db_req())
+        item = mock_dao.put.call_args[0][0]
+        expected = derive_catalog_name(item["sourceId"])
+        assert item["athenaDataCatalogName"] == expected
+        assert reg.call_args.kwargs["catalog_name"] == expected
+
+    def test_persists_the_query_layer_attributes(self):
+        _, _, mock_dao, _, _ = self._create(_make_athena_db_req(database_name="sales"))
+        item = mock_dao.put.call_args[0][0]
+        # queryEngine is ATHENA because there is no direct adapter for an
+        # arbitrary customer connector.
+        assert item["queryEngine"] == "ATHENA"
+        # Serve routes on the PRESENCE of athenaDataCatalogName, so this is what
+        # makes the source addressable at all.
+        assert item["athenaDataCatalogName"]
+        assert item["athenaCatalog"] == item["athenaDataCatalogName"]
+        # Recorded up front rather than waiting for discovery, so serve has the
+        # right namespace even when a scan discovers zero tables.
+        assert item["athenaDatabase"] == "sales"
+        assert item["queryable"] is False
+        assert item["region"] == _dr._AWS_REGION
+
+    def test_registers_the_catalog_with_the_derived_name(self):
+        _, _, mock_dao, reg, _ = self._create(_make_athena_db_req())
+        item = mock_dao.put.call_args[0][0]
+        assert reg.call_args.kwargs["catalog_name"] == item["athenaDataCatalogName"]
+        assert reg.call_args.kwargs["connector_function_arn"].endswith("acme-connector")
+        # One ARN reaches the catalog registrar, because the shape models one. A
+        # `record_function_arn` kwarg would not be ignored here — it no longer exists.
+        assert "record_function_arn" not in reg.call_args.kwargs
+
+    # A catalog registered before the row would be orphaned: every delete path
+    # finds the catalog through the source record.
+    def test_registers_the_catalog_after_the_dynamodb_put(self):
+        order: list[str] = []
+        mock_dao = MagicMock()
+        mock_dao.put.side_effect = lambda item: order.append("put")
+        self._create(
+            _make_athena_db_req(),
+            dao=mock_dao,
+            register=MagicMock(side_effect=lambda **kw: order.append("register")),
+        )
+        assert order == ["put", "register"]
+
+    def test_rolls_back_the_row_when_registration_fails(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        status, _, mock_dao, _, _ = self._create(
+            _make_athena_db_req(),
+            register=MagicMock(side_effect=AthenaCatalogError("nope")),
+        )
+        assert status == 500
+        # A source with no catalog could never be discovered, so it must not
+        # survive the failed create.
+        mock_dao.delete.assert_called_once()
+
+    # A read timeout after Athena committed the create is indistinguishable from a
+    # failure, so the catalog may exist — and the row that names it is about to go.
+    def test_deletes_the_catalog_when_registration_reports_failure(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        _, _, mock_dao, _, dele = self._create(
+            _make_athena_db_req(),
+            register=MagicMock(side_effect=AthenaCatalogError("timeout")),
+        )
+        item = mock_dao.put.call_args[0][0]
+        dele.assert_called_once_with(catalog_name=item["athenaDataCatalogName"])
+
+    # ...but NOT on a conflict: that catalog demonstrably belongs to something
+    # else, and deleting it would destroy a resource we did not create.
+    def test_does_not_delete_a_conflicting_catalog(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogConflictError
+
+        status, _, mock_dao, _, dele = self._create(
+            _make_athena_db_req(),
+            register=MagicMock(side_effect=AthenaCatalogConflictError("someone else's")),
+        )
+        assert status == 500
+        dele.assert_not_called()
+        mock_dao.delete.assert_called_once()
+
+    # REGISTERED is an active status, so a row that survives a failed rollback is
+    # undeletable (409), un-rescannable, and blocks namespace deletion — and no
+    # reaper sweeps it, because no Step Functions execution ever started.
+    def test_marks_the_source_recoverable_when_the_rollback_delete_fails(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        mock_dao = MagicMock()
+        mock_dao.delete.side_effect = ClientError({"Error": {"Code": "ThrottlingException"}}, "DeleteItem")
+        status, _, _, _, _ = self._create(
+            _make_athena_db_req(),
+            dao=mock_dao,
+            register=MagicMock(side_effect=AthenaCatalogError("nope")),
+        )
+        assert status == 500
+        # SCAN_FAILED is what makes it both deletable and re-scannable again.
+        assert mock_dao.update.call_args.kwargs["update_fields"]["status"] == "SCAN_FAILED"
+
+    def test_registration_failure_enqueues_no_scan(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        mock_sqs = MagicMock()
+        self._create(
+            _make_athena_db_req(),
+            sqs=mock_sqs,
+            register=MagicMock(side_effect=AthenaCatalogError("nope")),
+        )
+        mock_sqs.send_message.assert_not_called()
+
+    # The row is about to be removed, and it is the only handle on the catalog.
+    def test_deletes_the_catalog_when_the_scan_enqueue_fails(self):
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "SendMessage")
+        status, _, mock_dao, _, dele = self._create(_make_athena_db_req(), sqs=mock_sqs)
+        assert status == 500
+        item = mock_dao.put.call_args[0][0]
+        dele.assert_called_once_with(catalog_name=item["athenaDataCatalogName"])
+
+    # Failing the rollback must not turn a retryable create failure into an
+    # unretryable one, so the 500 is still returned.
+    def test_a_failed_rollback_delete_still_returns_500(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "SendMessage")
+        status, _, _, _, _ = self._create(
+            _make_athena_db_req(),
+            sqs=mock_sqs,
+            delete=MagicMock(side_effect=AthenaCatalogError("still there")),
+        )
+        assert status == 500
+
+    # A cross-region connector registers fine — registration only records a
+    # name → ARN mapping — and then fails every statement with an AccessDenied
+    # that says nothing about the region, because the IAM grant is region-pinned.
+    def test_rejects_a_connector_arn_in_another_region(self):
+        req = _make_athena_db_req(metadata_arn="arn:aws:lambda:eu-west-1:111122223333:function:acme")
+        status, body, _, reg, _ = self._create(req)
+        assert status == 400
+        assert "eu-west-1" in body["error"]
+        reg.assert_not_called()
+
+    # The config member selects the sub-type, so two of them is ambiguous rather
+    # than additive — silently preferring one would persist a record whose stored
+    # blob does not match its sourceSubType.
+    def test_rejects_more_than_one_configuration(self):
+        req = _make_athena_db_req()
+        req.jdbc_configuration = MagicMock()
+        status, body, _, reg, _ = self._create(req)
+        assert status == 400
+        assert "exactly one" in body["error"]
+        reg.assert_not_called()
+
+    def test_error_names_custom_connector_configuration_when_no_config_is_given(self):
+        req = _make_athena_db_req()
+        req.custom_connector_configuration = None
+        status, body, _, _, _ = self._create(req)
+        assert status == 400
+        assert "customConnectorConfiguration" in body["error"]
+
+    # Glue and JDBC sources must not acquire a catalog registration.
+    def test_a_glue_source_registers_no_catalog(self):
+        _, _, mock_dao, reg, _ = self._create(_make_glue_db_req())
+        reg.assert_not_called()
+        assert "athenaDataCatalogName" not in mock_dao.put.call_args[0][0]
+
+    def test_a_jdbc_source_registers_no_catalog(self):
+        _, _, _, reg, _ = self._create(_make_jdbc_db_req())
+        reg.assert_not_called()
+
+
+# ===================================================================
 # _create_database_source — namespace sourceCount maintenance
 # ===================================================================
 
@@ -685,6 +913,203 @@ class TestHandleGetScanJob:
         assert status == 200
         assert mock_scan_dao.get.call_args[0][0]["SK"] == "2026-01-01T00:00:00Z"
         assert body["scanJobId"] == "2026-01-01T00:00:00Z"
+
+
+@pytest.mark.unit
+class TestUpdateCustomConnectorConfiguration:
+    """The connector Lambda ARN is baked into the registered Athena data catalog at
+    create, and nothing re-registers it afterwards — so accepting a new ARN here
+    would leave every read path reporting it while the catalog still invoked the old
+    Lambda."""
+
+    _ARN = "arn:aws:lambda:us-east-1:111122223333:function:acme-connector"
+
+    def _item(self, **config_overrides):
+        config = {"connectorFunctionArn": self._ARN, "databaseName": "widgets"}
+        config.update(config_overrides)
+        return {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceId": _SOURCE_ID,
+            "sourceType": "DATABASE",
+            "sourceSubType": "CUSTOM_CONNECTOR",
+            "status": "APPROVED",
+            "athenaDatabase": "widgets",
+            "configuration": json.dumps(config),
+            "updatedAt": "2026-01-01T00:00:00Z",
+        }
+
+    def _update(self, body, item=None):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item or self._item()
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            status, resp = _parse(_dr._handle_update_metadata({"body": json.dumps(body)}, _NAMESPACE_ID, _SOURCE_ID))
+        return status, resp, mock_dao
+
+    def test_rejects_a_changed_connector_function_arn(self):
+        status, body, mock_dao = self._update(
+            {
+                "customConnectorConfiguration": {
+                    "connectorFunctionArn": "arn:aws:lambda:us-east-1:111122223333:function:acme-v2",
+                    "databaseName": "widgets",
+                }
+            }
+        )
+        assert status == 400
+        assert "cannot be changed after creation" in body["error"]
+        mock_dao.update.assert_not_called()
+
+    def test_ignores_an_unmodelled_record_function_arn(self):
+        """A stray recordFunctionArn is not an immutable-field change — it is not a field.
+
+        The member was removed from CustomConnectorConfiguration, so a client still sending it is
+        sending something the shape does not define. That must not be mistaken for an
+        attempt to change an immutable ARN: the immutability check iterates the members
+        that exist, and an unknown key is simply not one of them.
+        """
+        status, _, mock_dao = self._update(
+            {
+                "customConnectorConfiguration": {
+                    "connectorFunctionArn": self._ARN,
+                    "recordFunctionArn": "arn:aws:lambda:us-east-1:111122223333:function:acme-record",
+                    "databaseName": "widgets",
+                }
+            }
+        )
+        assert status == 200
+        mock_dao.update.assert_called_once()
+
+    # Serve prefers discoveredSchemas[0] and falls back to athenaDatabase only when
+    # that list is empty. Discovery writes it on every successful scan, so writing
+    # athenaDatabase retargets nothing: the update would return 200 while serve kept
+    # querying the old database, and a re-scan cannot reconcile it because
+    # _handle_rescan 409s any DATABASE source that is not SCAN_FAILED.
+    def test_rejects_a_changed_database_name(self):
+        status, body, mock_dao = self._update(
+            {"customConnectorConfiguration": {"connectorFunctionArn": self._ARN, "databaseName": "gadgets"}}
+        )
+        assert status == 400
+        assert "databaseName cannot be changed after creation" in body["error"]
+        # Names the target, so the message is actionable without reading the source.
+        assert "gadgets" in body["error"]
+        mock_dao.update.assert_not_called()
+
+    # Rejecting a CHANGE must not reject an echo: the shape is shared with create,
+    # where databaseName is required, so a client editing a filter sends the whole
+    # configuration back including the unchanged database.
+    def test_allows_an_unchanged_database_name(self):
+        status, _, mock_dao = self._update(
+            {"customConnectorConfiguration": {"connectorFunctionArn": self._ARN, "databaseName": "widgets"}}
+        )
+        assert status == 200
+        mock_dao.update.assert_called_once()
+
+    # A source whose athenaDatabase attribute was never written still gets one:
+    # mirroring an unchanged value does not move where the source points.
+    def test_mirrors_the_database_name_when_the_attribute_is_absent(self):
+        item = self._item()
+        del item["athenaDatabase"]
+        status, _, mock_dao = self._update(
+            {"customConnectorConfiguration": {"connectorFunctionArn": self._ARN, "databaseName": "widgets"}}, item=item
+        )
+        assert status == 200
+        assert mock_dao.update.call_args[0][1]["athenaDatabase"] == "widgets"
+
+    def test_filters_can_be_updated_freely(self):
+        status, _, mock_dao = self._update(
+            {
+                "customConnectorConfiguration": {
+                    "connectorFunctionArn": self._ARN,
+                    "databaseName": "widgets",
+                    "tableFilter": "dim_*",
+                }
+            }
+        )
+        assert status == 200
+        fields = mock_dao.update.call_args[0][1]
+        assert json.loads(fields["configuration"])["tableFilter"] == "dim_*"
+        # Unchanged database must not be rewritten needlessly.
+        assert "athenaDatabase" not in fields
+
+    # A Glue config on a CUSTOM_CONNECTOR row would leave the blob and the
+    # sub-type disagreeing, and GET then 500s on GlueConfiguration's required
+    # members rather than mislabelling anything.
+    def test_rejects_a_mismatched_configuration_shape(self):
+        status, body, mock_dao = self._update(
+            {"glueConfiguration": {"catalogId": "123456789012", "region": "us-east-1", "databaseName": "x"}}
+        )
+        assert status == 400
+        assert "customConnectorConfiguration" in body["error"]
+        mock_dao.update.assert_not_called()
+
+
+@pytest.mark.unit
+class TestScanJobDegradationSignal:
+    """A scan can SUCCEED while individual tables were unreadable. Unsurfaced, the
+    result is indistinguishable from a complete one, so a reviewer would approve a
+    silently incomplete ontology."""
+
+    _SOURCE = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}", "sourceType": "DATABASE"}
+
+    def _get(self, scan_item):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = dict(self._SOURCE)
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.get.return_value = scan_item
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            return _parse(_dr._handle_get_scan_job(_NAMESPACE_ID, _SOURCE_ID, "2026-01-01T00:00:00Z"))
+
+    def test_reports_unreadable_tables(self):
+        status, body = self._get(
+            {
+                "status": "COMPLETED",
+                "tablesDiscovered": 3,
+                "tablesFailed": 2,
+                "failedTables": ["widgets.bad", "widgets.worse"],
+            }
+        )
+        assert status == 200
+        assert body["tablesFailed"] == 2
+        assert body["failedTables"] == ["widgets.bad", "widgets.worse"]
+
+    # Decimal, not int, because that is what DynamoDB actually returns through
+    # boto3's resource interface — and api_response serialises with
+    # `default=str`, so an uncoerced Decimal ships as the JSON STRING "2". The
+    # only consumer requires `typeof x === "number"`, so the whole degraded-scan
+    # signal would be silently dropped. Mocking this with a native int (as the
+    # test above does) cannot catch that.
+    def test_numeric_fields_survive_json_as_numbers_not_strings(self):
+        from decimal import Decimal
+
+        status, body = self._get(
+            {
+                "status": "COMPLETED",
+                "tablesDiscovered": Decimal("40"),
+                "columnsDiscovered": Decimal("312"),
+                "tablesFailed": Decimal("2"),
+                "failedTables": ["widgets.bad", "widgets.worse"],
+            }
+        )
+        assert status == 200
+        # `body` is the round-tripped JSON, so these assertions cover serialisation.
+        for field, expected in (
+            ("tablesFailed", 2),
+            ("tablesDiscovered", 40),
+            ("columnsDiscovered", 312),
+        ):
+            assert body[field] == expected, field
+            assert isinstance(body[field], int), f"{field} shipped as {type(body[field]).__name__}"
+            assert not isinstance(body[field], str), f"{field} shipped as a string"
+
+    # Absent rather than zero, so the field can be used directly to filter for
+    # degraded scans — and so a clean scan's response is byte-for-byte unchanged.
+    def test_a_clean_scan_omits_the_fields(self):
+        _, body = self._get({"status": "COMPLETED", "tablesDiscovered": 3})
+        assert "tablesFailed" not in body
+        assert "failedTables" not in body
 
 
 @pytest.mark.unit

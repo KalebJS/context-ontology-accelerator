@@ -362,6 +362,9 @@ class TestHandleUploadUrls:
         assert len(body["uploadUrls"]) == 1
         assert body["uploadUrls"][0]["filename"] == "doc.pdf"
         assert "uploadUrl" in body["uploadUrls"][0]
+        # Regression: never sign ContentLength — under SigV4 it forces the
+        # browser to PUT exactly that many bytes or get a 403 (see !1018).
+        assert "ContentLength" not in mock_s3.generate_presigned_url.call_args.kwargs["Params"]
 
     def test_upload_urls_multiple_files(self):
         mock_s3 = MagicMock()

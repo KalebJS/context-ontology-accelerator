@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>dev.coa</groupId>
+  <artifactId>connectors</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <name>COA Athena federation connectors</name>
+
+  <!-- The toolkit first, then every connector. A connector module inherits this pom, so
+       adding one means a short pom, some handlers and its own CDK app - see the README. -->
+  <modules>
+    <module>toolkit</module>
+    <module>example</module>
+    <module>databricks</module>
+  </modules>
+
+  <properties>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <athena.federation.sdk.version>2025.15.1</athena.federation.sdk.version>
+    <junit.version>5.10.2</junit.version>
+    <surefire.version>3.2.5</surefire.version>
+    <shade.version>3.5.1</shade.version>
+  </properties>
+
+  <!-- Versions live here so a connector's pom names dependencies without pinning them,
+       and the SDK is bumped in one place for the toolkit and every connector at once. -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>dev.coa</groupId>
+        <artifactId>coa-connector-toolkit</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.amazonaws</groupId>
+        <artifactId>aws-athena-federation-sdk</artifactId>
+        <version>${athena.federation.sdk.version}</version>
+        <!-- Arrow is NOT a transitive dependency of the SDK; the with-arrow classifier
+             bundles it. -->
+        <classifier>with-arrow</classifier>
+      </dependency>
+      <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>${junit.version}</version>
+        <scope>test</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <!-- Surefire 2.x cannot run JUnit 5; 3.x is required for the platform provider. -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>${surefire.version}</version>
+          <configuration>
+            <!-- The same flag the Lambda needs at runtime. Today's tests only build Arrow
+                 POJOs, so they pass without it; the first test to allocate a vector fails
+                 with "Failed to initialize MemoryUtil" and gives no hint that a JVM flag
+                 is missing. Set now, while it costs nothing. -->
+            <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+            <systemPropertyVariables>
+              <!-- Any test that constructs a handler builds AWS SDK clients, and the SDK
+                   resolves a region at build time from AWS_REGION, the profile, or EC2
+                   metadata. A developer with AWS_REGION exported passes; CI has none of
+                   the three and every such test errors with "Unable to load region from
+                   any of the providers in the chain". Pinned so the result does not
+                   depend on the machine. No call is made, so the value is arbitrary. -->
+              <aws.region>us-east-1</aws.region>
+            </systemPropertyVariables>
+          </configuration>
+        </plugin>
+
+        <!-- Shade into a fat jar: Lambda needs the toolkit, the SDK and Arrow bundled.
+             Configured here so every connector gets an identical, correct fat jar by
+             declaring the plugin with no configuration of its own. -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-shade-plugin</artifactId>
+          <version>${shade.version}</version>
+          <executions>
+            <execution>
+              <phase>package</phase>
+              <goals><goal>shade</goal></goals>
+              <configuration>
+                <createDependencyReducedPom>false</createDependencyReducedPom>
+                <filters>
+                  <filter>
+                    <artifact>*:*</artifact>
+                    <excludes>
+                      <exclude>META-INF/*.SF</exclude>
+                      <exclude>META-INF/*.DSA</exclude>
+                      <exclude>META-INF/*.RSA</exclude>
+                      <exclude>module-info.class</exclude>
+                    </excludes>
+                  </filter>
+                </filters>
+                <transformers>
+                  <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                </transformers>
+              </configuration>
+            </execution>
+          </executions>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

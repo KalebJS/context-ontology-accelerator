@@ -457,11 +457,11 @@ class TestQueryTool:
             "hi",
             "sales",
             execute=False,
-            mode="agentic",
+            mode="deep-reasoning",
             dimensions=[{"name": "region", "value": "us-east"}],
         )
         assert captured["execute"] is False
-        assert captured["mode"] == "agentic"
+        assert captured["mode"] == "deep-reasoning"
         assert captured["dimensions"] == [{"name": "region", "value": "us-east"}]
         assert "timeout_ms" not in captured
 

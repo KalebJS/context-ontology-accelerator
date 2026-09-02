@@ -67,8 +67,31 @@ import { S3_ARN_RE, validateS3Prefix } from "@utils/helpers";
 
 // ── Source type options ───────────────────────────────────────────────────────
 
-// Three-way selection shown in step 1
-type SourceKind = "GLUE_DATABASE" | "JDBC_DATABASE" | "DOCUMENTS";
+// Four-way selection shown in step 1
+type SourceKind =
+  | "GLUE_DATABASE"
+  | "JDBC_DATABASE"
+  | "CUSTOM_CONNECTOR"
+  | "DOCUMENTS";
+
+/** Narrow a Tiles selection to a SourceKind. Cloudscape hands back a plain
+ *  string, and a guard keeps that boundary honest without a cast. */
+function isSourceKind(value: string): value is SourceKind {
+  return (
+    value === "GLUE_DATABASE" ||
+    value === "JDBC_DATABASE" ||
+    value === "CUSTOM_CONNECTOR" ||
+    value === "DOCUMENTS"
+  );
+}
+
+// Labels for the step-1 tiles, reused by the review step's summary.
+const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
+  GLUE_DATABASE: "Glue database",
+  JDBC_DATABASE: "JDBC database",
+  CUSTOM_CONNECTOR: "Custom connector",
+  DOCUMENTS: "Documents",
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -179,6 +202,15 @@ interface Model {
   dbRole: string;
   jdbcCrossAccountRoleArn: string;
   jdbcExternalId: string;
+  // Custom Athena Query Federation connector config. The connector is a Lambda
+  // the customer authors and deploys in their own account; there is no Glue
+  // database and no cross-account role to assume, so this config carries only
+  // the function ARNs, the one database to expose, and the table filters.
+  customConnectorName: string;
+  customConnectorFunctionArn: string;
+  customConnectorDatabaseName: string;
+  customConnectorTableFilter: string;
+  customConnectorTableExcludeFilter: string;
   // Shared database enrichment toggle — when false, the backend skips the
   // AI metadata enrichment step entirely and only persists discovered
   // technical metadata for steward review.
@@ -223,6 +255,11 @@ const initialModel: Model = {
   dbRole: "",
   jdbcCrossAccountRoleArn: "",
   jdbcExternalId: "",
+  customConnectorName: "",
+  customConnectorFunctionArn: "",
+  customConnectorDatabaseName: "",
+  customConnectorTableFilter: "",
+  customConnectorTableExcludeFilter: "",
   metadataEnrichmentEnabled: true,
   docUploadName: "",
   docUploadFiles: [],
@@ -253,6 +290,24 @@ function validateCrossAccountRoleArn(arn: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Validate a connector Lambda function ARN.
+ * Mirrors the LambdaFunctionArn shape the backend accepts: a full ARN,
+ * optionally qualified with a version, an alias, or $LATEST. Lambda's partial
+ * ARN and name-only forms are rejected — the connector runs in the customer's
+ * account, so an unqualified name would resolve against this deployment's
+ * account instead.
+ */
+function validateLambdaFunctionArn(arn: string): string | undefined {
+  if (!arn.trim()) return undefined; // callers decide whether the field is required
+  const lambdaArnPattern =
+    /^arn:aws[a-z-]*:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9_-]+(:(\$LATEST|[a-zA-Z0-9_-]+))?$/;
+  if (!lambdaArnPattern.test(arn.trim())) {
+    return "Must be a full Lambda function ARN: arn:aws:lambda:REGION:ACCOUNT:function:NAME";
+  }
+  return undefined;
+}
+
 interface ValidationErrors {
   step1?: string;
   dbName?: string;
@@ -267,11 +322,29 @@ interface ValidationErrors {
   dbDatabaseName?: string;
   dbSecretArn?: string;
   jdbcCrossAccountRoleArn?: string;
+  customConnectorName?: string;
+  customConnectorFunctionArn?: string;
+  customConnectorDatabaseName?: string;
   docUploadName?: string;
   docFiles?: string;
   docS3Name?: string;
   docS3BucketArn?: string;
   docS3Prefixes?: Record<number, string>;
+}
+
+/** The name field that belongs to the selected source kind. A switch rather
+ *  than a ternary chain so a new kind cannot silently inherit another's name. */
+function sourceNameFor(model: Model, docTab: "upload" | "s3"): string {
+  switch (model.sourceKind) {
+    case "GLUE_DATABASE":
+      return model.dbName;
+    case "JDBC_DATABASE":
+      return model.jdbcName;
+    case "CUSTOM_CONNECTOR":
+      return model.customConnectorName;
+    case "DOCUMENTS":
+      return docTab === "upload" ? model.docUploadName : model.docS3Name;
+  }
 }
 
 function validateStep2(
@@ -306,6 +379,19 @@ function validateStep2(
       errs.dbSecretArn = "Secrets Manager ARN is required.";
     const roleErr = validateCrossAccountRoleArn(model.jdbcCrossAccountRoleArn);
     if (roleErr) errs.jdbcCrossAccountRoleArn = roleErr;
+  } else if (model.sourceKind === "CUSTOM_CONNECTOR") {
+    if (!model.customConnectorName.trim())
+      errs.customConnectorName = "Name is required.";
+    if (!model.customConnectorFunctionArn.trim())
+      errs.customConnectorFunctionArn = "Connector function ARN is required.";
+    else {
+      const arnErr = validateLambdaFunctionArn(
+        model.customConnectorFunctionArn,
+      );
+      if (arnErr) errs.customConnectorFunctionArn = arnErr;
+    }
+    if (!model.customConnectorDatabaseName.trim())
+      errs.customConnectorDatabaseName = "Database name is required.";
   } else {
     // DOCUMENTS
     if (docTab === "upload") {
@@ -359,7 +445,8 @@ export const ConnectSource: React.FC = () => {
 
   const isDatabase =
     model.sourceKind === "GLUE_DATABASE" ||
-    model.sourceKind === "JDBC_DATABASE";
+    model.sourceKind === "JDBC_DATABASE" ||
+    model.sourceKind === "CUSTOM_CONNECTOR";
 
   // ── Mutations ──────────────────────────────────────────────────────
   const {
@@ -488,6 +575,30 @@ export const ConnectSource: React.FC = () => {
       return;
     }
 
+    if (model.sourceKind === "CUSTOM_CONNECTOR") {
+      createSource({
+        namespaceId: namespaceId!,
+        body: {
+          sourceType: SourceType.DATABASE,
+          databaseSource: {
+            name: model.customConnectorName.trim(),
+            metadataEnrichmentEnabled: model.metadataEnrichmentEnabled,
+            // customConnectorConfiguration only: the backend rejects a payload carrying
+            // more than one of glue/jdbc/athena configuration, since the
+            // configuration present is what selects the sub-type.
+            customConnectorConfiguration: {
+              connectorFunctionArn: model.customConnectorFunctionArn.trim(),
+              databaseName: model.customConnectorDatabaseName.trim(),
+              tableFilter: model.customConnectorTableFilter.trim() || undefined,
+              tableExcludeFilter:
+                model.customConnectorTableExcludeFilter.trim() || undefined,
+            },
+          },
+        },
+      });
+      return;
+    }
+
     // DOCUMENTS — s3 mode
     if (docTab === "s3") {
       createSource({
@@ -589,24 +700,31 @@ export const ConnectSource: React.FC = () => {
         <Container header={<Header variant="h2">Source type</Header>}>
           <Tiles
             value={model.sourceKind}
-            onChange={({ detail }) =>
-              setField("sourceKind", detail.value as SourceKind)
-            }
+            onChange={({ detail }) => {
+              if (isSourceKind(detail.value))
+                setField("sourceKind", detail.value);
+            }}
             items={[
               {
                 value: "GLUE_DATABASE",
-                label: "Glue database",
+                label: SOURCE_KIND_LABELS.GLUE_DATABASE,
                 description:
                   "Connect to an existing AWS Glue Data Catalog database. Covers S3/Iceberg tables, DynamoDB, and Athena-federated JDBC sources.",
               },
               {
                 value: "JDBC_DATABASE",
-                label: "JDBC database",
+                label: SOURCE_KIND_LABELS.JDBC_DATABASE,
                 description: `Connect directly to a relational database. Schema is discovered from information_schema. Supported engines: ${ENGINE_LABELS}.`,
               },
               {
+                value: "CUSTOM_CONNECTOR",
+                label: SOURCE_KIND_LABELS.CUSTOM_CONNECTOR,
+                description:
+                  "Bring your own data source: register an Athena Query Federation SDK connector you built and deployed as a Lambda in your own AWS account. Schema and rows are read through Athena against that connector.",
+              },
+              {
                 value: "DOCUMENTS",
-                label: "Documents",
+                label: SOURCE_KIND_LABELS.DOCUMENTS,
                 description:
                   "Ingest unstructured documents from an S3 bucket or by uploading files directly.",
               },
@@ -1071,6 +1189,117 @@ export const ConnectSource: React.FC = () => {
           </SpaceBetween>
         ),
       };
+    } else if (model.sourceKind === "CUSTOM_CONNECTOR") {
+      step2 = {
+        title: "Configure connection",
+        description:
+          "Point at the Athena Query Federation connector you deployed.",
+        errorText: step2Errs.step1,
+        content: (
+          <SpaceBetween size="l">
+            <Container header={<Header variant="h2">Source details</Header>}>
+              <FormField
+                label={
+                  <>
+                    Source name{" "}
+                    <Box variant="span" color="text-status-error">
+                      *
+                    </Box>
+                  </>
+                }
+                description="A unique name for this source within the namespace."
+                errorText={step2Errs.customConnectorName}
+              >
+                <Input
+                  value={model.customConnectorName}
+                  onChange={({ detail }) =>
+                    setField("customConnectorName", detail.value)
+                  }
+                  placeholder="My Custom Connector"
+                />
+              </FormField>
+            </Container>
+            <Container header={<Header variant="h2">Connector</Header>}>
+              <SpaceBetween size="l">
+                <FormField
+                  label={
+                    <>
+                      Connector function ARN{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description="The connector Lambda. It serves both metadata and record requests. It must live in the same AWS Region as Context Ontology Accelerator; a connector in another Region is rejected, because Athena can only invoke a data source connector co-located with the query."
+                  errorText={step2Errs.customConnectorFunctionArn}
+                >
+                  <Input
+                    value={model.customConnectorFunctionArn}
+                    onChange={({ detail }) =>
+                      setField("customConnectorFunctionArn", detail.value)
+                    }
+                    placeholder="arn:aws:lambda:us-east-1:123456789012:function:my-connector"
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      Database name{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description="The single database inside the connector's catalog that this source exposes. A connector serving several databases is onboarded once per database."
+                  errorText={step2Errs.customConnectorDatabaseName}
+                >
+                  <Input
+                    value={model.customConnectorDatabaseName}
+                    onChange={({ detail }) =>
+                      setField("customConnectorDatabaseName", detail.value)
+                    }
+                    placeholder="my_connector_db"
+                  />
+                </FormField>
+              </SpaceBetween>
+            </Container>
+            <ExpandableSection
+              headerText="Advanced configuration"
+              variant="container"
+            >
+              <SpaceBetween size="l">
+                <FormField
+                  label="Table filter"
+                  description="Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,."
+                >
+                  <Input
+                    value={model.customConnectorTableFilter}
+                    onChange={({ detail }) =>
+                      setField("customConnectorTableFilter", detail.value)
+                    }
+                    placeholder="orders|customers"
+                  />
+                </FormField>
+                <FormField
+                  label="Table exclude filter"
+                  description="Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,."
+                >
+                  <Input
+                    value={model.customConnectorTableExcludeFilter}
+                    onChange={({ detail }) =>
+                      setField(
+                        "customConnectorTableExcludeFilter",
+                        detail.value,
+                      )
+                    }
+                    placeholder="tmp_*|staging_*"
+                  />
+                </FormField>
+              </SpaceBetween>
+            </ExpandableSection>
+          </SpaceBetween>
+        ),
+      };
     } else {
       // DOCUMENTS
       step2 = {
@@ -1379,23 +1608,11 @@ export const ConnectSource: React.FC = () => {
               items={[
                 {
                   label: "Category",
-                  value:
-                    model.sourceKind === "GLUE_DATABASE"
-                      ? "Glue database"
-                      : model.sourceKind === "JDBC_DATABASE"
-                        ? "JDBC database"
-                        : "Documents",
+                  value: SOURCE_KIND_LABELS[model.sourceKind],
                 },
                 {
                   label: "Source name",
-                  value:
-                    model.sourceKind === "GLUE_DATABASE"
-                      ? model.dbName
-                      : model.sourceKind === "JDBC_DATABASE"
-                        ? model.jdbcName
-                        : docTab === "upload"
-                          ? model.docUploadName
-                          : model.docS3Name,
+                  value: sourceNameFor(model, docTab),
                 },
               ]}
             />
@@ -1441,6 +1658,27 @@ export const ConnectSource: React.FC = () => {
                   {
                     label: "Authentication",
                     value: "AWS Secrets Manager",
+                  },
+                ]}
+              />
+            </Container>
+          )}
+          {model.sourceKind === "CUSTOM_CONNECTOR" && (
+            <Container header={<Header variant="h2">Connection</Header>}>
+              <KeyValuePairs
+                columns={2}
+                items={[
+                  {
+                    label: "Connector function ARN",
+                    value: model.customConnectorFunctionArn,
+                  },
+                  {
+                    label: "Database",
+                    value: model.customConnectorDatabaseName,
+                  },
+                  {
+                    label: "Table filter",
+                    value: model.customConnectorTableFilter || "(none)",
                   },
                 ]}
               />

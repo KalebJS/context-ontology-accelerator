@@ -388,7 +388,7 @@ class TestOntologyCatalogClient:
 
     def test_get_ontology_by_uri_raises_when_missing(self) -> None:
         client = OntologyCatalogClient("http://oc:8001")
-        mock_client = _mock_httpx_client(_resp([]))
+        mock_client = _mock_httpx_client(_resp({"ontologies": []}))
         with (
             patch.object(httpx, "Client", return_value=mock_client),
             pytest.raises(ValueError, match="not found"),
@@ -397,9 +397,28 @@ class TestOntologyCatalogClient:
 
     def test_get_ontology_by_uri_returns_first(self) -> None:
         client = OntologyCatalogClient("http://oc:8001")
-        mock_client = _mock_httpx_client(_resp([{"id": "a"}, {"id": "b"}]))
+        mock_client = _mock_httpx_client(_resp({"ontologies": [{"ontologyId": "a"}, {"ontologyId": "b"}]}))
         with patch.object(httpx, "Client", return_value=mock_client):
-            assert client.get_ontology_by_uri("http://x") == {"id": "a"}
+            assert client.get_ontology_by_uri("http://x") == {"ontologyId": "a"}
+
+    def test_get_ontology_by_uri_unwraps_before_the_emptiness_check(self) -> None:
+        """A populated envelope must not be indexed as if it were the list.
+
+        ``{"ontologies": [...]}`` is truthy, so an implementation that checks
+        emptiness first and then does ``results[0]`` raises ``KeyError: 0``
+        rather than returning the record.
+        """
+        client = OntologyCatalogClient("http://oc:8001")
+        mock_client = _mock_httpx_client(_resp({"ontologies": [{"ontologyId": "only"}]}))
+        with patch.object(httpx, "Client", return_value=mock_client):
+            assert client.get_ontology_by_uri("http://x") == {"ontologyId": "only"}
+
+    def test_get_ontology_by_uri_accepts_a_legacy_bare_array(self) -> None:
+        """Deployments predating the envelope answered with a bare array."""
+        client = OntologyCatalogClient("http://oc:8001")
+        mock_client = _mock_httpx_client(_resp([{"ontology_id": "legacy"}]))
+        with patch.object(httpx, "Client", return_value=mock_client):
+            assert client.get_ontology_by_uri("http://x") == {"ontology_id": "legacy"}
 
     def test_upload_ontology_file_posts_multipart(self) -> None:
         client = OntologyCatalogClient("http://oc:8001")
