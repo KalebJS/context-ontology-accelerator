@@ -1,6 +1,10 @@
 # VKG Translation Service - Ontop 5.x, translation-only mode
 # Uses Amazon Corretto 17 on AL2023 (public ECR, no Docker Hub dependency, actively patched)
-FROM public.ecr.aws/amazoncorretto/amazoncorretto:17-al2023@sha256:c6558af083e5dec620ce676223ea4af24a0bae366c4418325047d00ab0af2077
+# Digest re-resolved from the 17-al2023 tag on 2026-09-01 to clear AL2023 CVEs
+# Inspector flagged against the prior build; the `yum update --security` below
+# runs against current AL2023 repos once this layer rebuilds. Renovate keeps
+# this digest current (dockerfile manager + pinDigests, held to the 17 line).
+FROM public.ecr.aws/amazoncorretto/amazoncorretto:17-al2023@sha256:17d4c3cf7bc84b6417f4c228bb77aeb97fda215b4b26b2ee8a53baace4aaada8
 
 ARG ONTOP_VERSION=5.5.0
 ARG ONTOP_SHA256=430dff312e68e8ad41d26e6113160ca2365c28c4fe911926193000a33299458f

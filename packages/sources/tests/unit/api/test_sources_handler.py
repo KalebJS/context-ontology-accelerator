@@ -544,7 +544,7 @@ _JDBC_CONFIG = {
     "databaseName": "claims",
 }
 _ATHENA_CONFIG = {
-    "metadataFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:widgets-connector",
+    "connectorFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:widgets-connector",
     "databaseName": "widgets",
 }
 
@@ -555,7 +555,7 @@ class TestDatabaseDetailConfigurationDispatch:
     `configuration` column, so sourceSubType is the only thing that says which
     response member the blob belongs under — and the shapes are not
     interchangeable. GlueConfiguration requires catalogId + region, so reporting
-    an ATHENA_CONNECTOR config as Glue fails GetSourceOutput validation and
+    a CUSTOM_CONNECTOR config as Glue fails GetSourceOutput validation and
     turns GET into a 500 rather than a cosmetic mislabel.
     """
 
@@ -574,13 +574,13 @@ class TestDatabaseDetailConfigurationDispatch:
         )
         return _parse_response(aws_env["handler"](event, None))
 
-    def test_athena_connector_config_returned_under_athena_key(self, aws_env):
-        """The regression: an ATHENA_CONNECTOR config read as Glue 500s."""
-        status, body = self._get(aws_env, "ATHENA_CONNECTOR", _ATHENA_CONFIG)
+    def test_custom_connector_config_returned_under_athena_key(self, aws_env):
+        """The regression: a CUSTOM_CONNECTOR config read as Glue 500s."""
+        status, body = self._get(aws_env, "CUSTOM_CONNECTOR", _ATHENA_CONFIG)
 
         assert status == 200
         details = body["databaseDetails"]
-        assert details["athenaConfiguration"] == _ATHENA_CONFIG
+        assert details["customConnectorConfiguration"] == _ATHENA_CONFIG
         assert "glueConfiguration" not in details
         assert "jdbcConfiguration" not in details
 
@@ -590,7 +590,7 @@ class TestDatabaseDetailConfigurationDispatch:
         assert status == 200
         details = body["databaseDetails"]
         assert details["glueConfiguration"] == _GLUE_CONFIG
-        assert "athenaConfiguration" not in details
+        assert "customConnectorConfiguration" not in details
 
     def test_jdbc_config_returned_under_jdbc_key(self, aws_env):
         status, body = self._get(aws_env, "JDBC_DATABASE", _JDBC_CONFIG)
@@ -599,7 +599,7 @@ class TestDatabaseDetailConfigurationDispatch:
         details = body["databaseDetails"]
         assert details["jdbcConfiguration"]["host"] == _JDBC_CONFIG["host"]
         assert "glueConfiguration" not in details
-        assert "athenaConfiguration" not in details
+        assert "customConnectorConfiguration" not in details
 
     # A row whose sourceSubType is absent or unrecognised cannot be asserted
     # end-to-end: GetSourceOutput (and SourceSummary) declare sourceSubType
@@ -622,7 +622,7 @@ class TestDatabaseDetailConfigurationDispatch:
 
         assert detail is not None
         assert detail["glueConfiguration"] == _GLUE_CONFIG
-        assert "athenaConfiguration" not in detail
+        assert "customConnectorConfiguration" not in detail
 
     def test_every_detail_configuration_member_is_reachable(self):
         """Fail loudly when a configuration member is added to the response
@@ -643,7 +643,7 @@ class TestDatabaseDetailConfigurationDispatch:
         new DATABASE sub-type that reuses an existing one — say an
         AURORA_DATABASE carrying a JdbcConfiguration — adds no member, so it
         would pass that check while its blob lands in the Glue fallback and GET
-        500s exactly as ATHENA_CONNECTOR did. Every sub-type must therefore be
+        500s exactly as CUSTOM_CONNECTOR did. Every sub-type must therefore be
         either mapped or explicitly declared as belonging to DOCUMENTS.
         """
         from coa_control_plane_server.models.source_sub_type import SourceSubType
@@ -666,13 +666,13 @@ class TestListIsUnaffectedBySubType:
     """SourceSummary carries no configuration member (only the sourceSubType
     string), so LIST projects every sub-type cleanly and needs no dispatch."""
 
-    def test_athena_connector_source_lists_without_configuration(self, aws_env):
+    def test_custom_connector_source_lists_without_configuration(self, aws_env):
         _put_source(
             aws_env["table"],
             _NAMESPACE_ID,
             "src-athena",
             name="widgets-connector",
-            source_sub_type="ATHENA_CONNECTOR",
+            source_sub_type="CUSTOM_CONNECTOR",
             configuration=_ATHENA_CONFIG,
         )
         event = _make_event("GET", _LIST_RESOURCE, path_params={"namespaceId": _NAMESPACE_ID})
@@ -680,8 +680,8 @@ class TestListIsUnaffectedBySubType:
 
         assert status == 200
         item = body["items"][0]
-        assert item["sourceSubType"] == "ATHENA_CONNECTOR"
-        for field in ("glueConfiguration", "jdbcConfiguration", "athenaConfiguration", "configuration"):
+        assert item["sourceSubType"] == "CUSTOM_CONNECTOR"
+        for field in ("glueConfiguration", "jdbcConfiguration", "customConnectorConfiguration", "configuration"):
             assert field not in item
 
 
@@ -730,3 +730,15 @@ class TestGetSourceMetricsBestEffort:
         doc_details = body.get("documentDetails", {})
         for field in ("documentsProcessed", "chunksLLM", "chunksEmbed", "chunksGraph"):
             assert field not in doc_details
+
+
+class TestPresignS3ClientConfig:
+    """Regression: presign client must use SigV4. A no-Config client falls back
+    to the deprecated SigV2 presigner in pre-2014 regions and can't presign at
+    all in SigV4-only regions (us-east-2, eu-*, ap-*, ca-*, me-*, af-*)."""
+
+    def test_get_s3_pins_sigv4(self):
+        from coa_sources.api import sources_handler
+
+        sources_handler._s3 = None  # reset cold-start singleton
+        assert sources_handler._get_s3().meta.config.signature_version == "s3v4"

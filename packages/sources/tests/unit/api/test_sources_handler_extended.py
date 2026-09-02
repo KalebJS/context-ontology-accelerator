@@ -288,6 +288,110 @@ class TestHandleDelete:
         assert status == 500
         mock_dao.delete.assert_not_called()
 
+    def test_delete_custom_connector_source_removes_the_data_catalog(self):
+        """A custom-connector source owns a top-level LAMBDA-type Athena data
+        catalog. That is a plain athena:DeleteDataCatalog on this role — no Glue
+        object and no Lake Formation grants, so nothing to assume the federation
+        provisioner's admin role for."""
+        item = _db_source_item("APPROVED")
+        item["sourceSubType"] = "CUSTOM_CONNECTOR"
+        item["athenaDataCatalogName"] = f"{RESOURCE_PREFIX}devds_abc123"
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_sts = MagicMock()
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._FEDERATION_PROVISIONER_ROLE_ARN", "arn:aws:iam::123:role/fed"),
+            patch(f"{_SH}._get_sts", return_value=mock_sts),
+            patch(f"{_SH}.delete_lambda_catalog") as mock_delete_catalog,
+            patch(f"{_SH}.cleanup_federated_resources") as mock_cleanup,
+        ):
+            status, _ = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        mock_delete_catalog.assert_called_once_with(catalog_name=f"{RESOURCE_PREFIX}devds_abc123")
+        # A Lambda catalog also populates athenaDataCatalogName, so without the
+        # sub-type gate it would match the federated-teardown block, assume the
+        # LF-admin role, and call glue.delete_catalog — a no-op for a Lambda
+        # catalog — reporting success while leaking the registration.
+        mock_cleanup.assert_not_called()
+        mock_sts.assume_role.assert_not_called()
+        mock_dao.delete.assert_called_once()
+
+    def test_delete_custom_connector_source_derives_the_catalog_name_when_absent(self):
+        """Defence in depth. The attribute is written in the same put as the row,
+        so no row this service creates can lack it — but the name is derivable from
+        the source id alone, so a hand-written or migrated row is still cleaned up
+        rather than silently leaving its catalog behind."""
+        item = _db_source_item("APPROVED")
+        item["sourceSubType"] = "CUSTOM_CONNECTOR"
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}.delete_lambda_catalog") as mock_delete_catalog,
+            patch(f"{_SH}.derive_catalog_name", return_value="derived-name") as mock_derive,
+        ):
+            status, _ = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        mock_derive.assert_called_once_with(_SOURCE_ID)
+        mock_delete_catalog.assert_called_once_with(catalog_name="derived-name")
+
+    def test_delete_custom_connector_source_blocks_when_catalog_delete_fails(self):
+        """The source row is the only handle on the catalog, so dropping the row
+        after a failed teardown orphans it permanently."""
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        item = _db_source_item("APPROVED")
+        item["sourceSubType"] = "CUSTOM_CONNECTOR"
+        item["athenaDataCatalogName"] = f"{RESOURCE_PREFIX}devds_abc123"
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}.delete_lambda_catalog", side_effect=AthenaCatalogError("denied")),
+        ):
+            status, _ = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 500
+        mock_dao.delete.assert_not_called()
+
+    def test_delete_jdbc_source_still_runs_federated_teardown(self):
+        """The sub-type gate must not divert a real federated JDBC source away
+        from the Glue/Lake Formation teardown it does need."""
+        item = _db_source_item("APPROVED")
+        item["sourceSubType"] = "JDBC_DATABASE"
+        item["glueConnectionName"] = f"{RESOURCE_PREFIX}-dev-ds-abc"
+        item["athenaDataCatalogName"] = f"{RESOURCE_PREFIX}-dev-ds-abc"
+
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item
+        mock_sts = MagicMock()
+        mock_sts.assume_role.return_value = {
+            "Credentials": {"AccessKeyId": "k", "SecretAccessKey": "s", "SessionToken": "t"}
+        }
+
+        with (
+            patch(f"{_SH}._get_dao", return_value=mock_dao),
+            patch(f"{_SH}._FEDERATION_PROVISIONER_ROLE_ARN", "arn:aws:iam::123:role/fed"),
+            patch(f"{_SH}._get_sts", return_value=mock_sts),
+            patch(f"{_SH}.boto3.Session"),
+            patch(f"{_SH}.delete_lambda_catalog") as mock_delete_catalog,
+            patch(f"{_SH}.cleanup_federated_resources") as mock_cleanup,
+        ):
+            status, _ = _parse(_current_sh()._handle_delete(_NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        mock_cleanup.assert_called_once()
+        mock_delete_catalog.assert_not_called()
+
     def test_delete_database_source_cleans_up_datazone_assets_and_scan_jobs(self):
         """DATABASE delete must invoke DataZone asset cleanup and scan-job
         cleanup before deleting the sources-table row."""
@@ -1203,3 +1307,119 @@ class TestHandlerRouting:
         )
         status, _ = _parse(_current_sh().handler(event, None))
         assert status == 400
+
+
+class TestPathParameterDecoding:
+    """The router must percent-decode path parameters before dispatching.
+
+    REST API Gateway proxy integration passes ``pathParameters`` exactly as
+    they appear in the URL — still percent-encoded. Smithy-generated clients
+    encode every httpLabel per RFC 3986, so a non-ASCII table name reaches the
+    Lambda as ``db.%E5%95%86%E5%93%81...`` and, without decoding, never
+    matches the stored asset name (observed as a 404 whose message echoes the
+    still-encoded id). These tests pin the single decoding point in
+    ``_route`` through representative routes.
+    """
+
+    _TABLE = "coa_blog_ja.商品マスタ"
+
+    @staticmethod
+    def _encoded(value):
+        from urllib.parse import quote
+
+        return quote(value, safe="")
+
+    def test_get_table_receives_decoded_table_id(self):
+        handler_mock = MagicMock(return_value={"statusCode": 200, "body": json.dumps({})})
+
+        with patch(f"{_SH}._handle_get_table", handler_mock):
+            event = _make_event(
+                "GET",
+                "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}",
+                path_params={
+                    "namespaceId": _NAMESPACE_ID,
+                    "sourceId": _SOURCE_ID,
+                    "tableId": self._encoded(self._TABLE),
+                },
+            )
+            status, _ = _parse(_current_sh().handler(event, None))
+
+        assert status == 200
+        handler_mock.assert_called_once_with(_NAMESPACE_ID, _SOURCE_ID, self._TABLE)
+
+    def test_review_table_receives_decoded_table_id(self):
+        handler_mock = MagicMock(return_value={"statusCode": 200, "body": json.dumps({})})
+
+        with patch(f"{_SH}._handle_review_table", handler_mock):
+            event = _make_event(
+                "PUT",
+                "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/review",
+                path_params={
+                    "namespaceId": _NAMESPACE_ID,
+                    "sourceId": _SOURCE_ID,
+                    "tableId": self._encoded(self._TABLE),
+                },
+                body={"reviewStatus": "APPROVED"},
+            )
+            status, _ = _parse(_current_sh().handler(event, None))
+
+        assert status == 200
+        assert handler_mock.call_args.args[1:] == (_NAMESPACE_ID, _SOURCE_ID, self._TABLE)
+
+    def test_column_route_receives_decoded_column_name(self):
+        handler_mock = MagicMock(return_value={"statusCode": 200, "body": json.dumps({})})
+        column = "商品コード"
+
+        with patch(f"{_SH}._handle_review_column", handler_mock):
+            event = _make_event(
+                "PUT",
+                "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}/columns/{columnName}/review",
+                path_params={
+                    "namespaceId": _NAMESPACE_ID,
+                    "sourceId": _SOURCE_ID,
+                    "tableId": self._encoded(self._TABLE),
+                    "columnName": self._encoded(column),
+                },
+                body={"reviewStatus": "APPROVED"},
+            )
+            status, _ = _parse(_current_sh().handler(event, None))
+
+        assert status == 200
+        assert handler_mock.call_args.args[1:] == (_NAMESPACE_ID, _SOURCE_ID, self._TABLE, column)
+
+    def test_plain_ascii_table_id_passes_through_unchanged(self):
+        handler_mock = MagicMock(return_value={"statusCode": 200, "body": json.dumps({})})
+
+        with patch(f"{_SH}._handle_get_table", handler_mock):
+            event = _make_event(
+                "GET",
+                "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}",
+                path_params={
+                    "namespaceId": _NAMESPACE_ID,
+                    "sourceId": _SOURCE_ID,
+                    "tableId": "sales.orders",
+                },
+            )
+            status, _ = _parse(_current_sh().handler(event, None))
+
+        assert status == 200
+        handler_mock.assert_called_once_with(_NAMESPACE_ID, _SOURCE_ID, "sales.orders")
+
+    def test_literal_percent_in_table_id_decodes_exactly_once(self):
+        # A client must send a literal "%" as "%25"; one decode restores it.
+        handler_mock = MagicMock(return_value={"statusCode": 200, "body": json.dumps({})})
+
+        with patch(f"{_SH}._handle_get_table", handler_mock):
+            event = _make_event(
+                "GET",
+                "/namespaces/{namespaceId}/sources/{sourceId}/tables/{tableId}",
+                path_params={
+                    "namespaceId": _NAMESPACE_ID,
+                    "sourceId": _SOURCE_ID,
+                    "tableId": "sales.discount%2550",
+                },
+            )
+            status, _ = _parse(_current_sh().handler(event, None))
+
+        assert status == 200
+        handler_mock.assert_called_once_with(_NAMESPACE_ID, _SOURCE_ID, "sales.discount%50")

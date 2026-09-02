@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>dev.coa</groupId>
+    <artifactId>connectors</artifactId>
+    <version>1.0.0</version>
+  </parent>
+
+  <artifactId>coa-connector-toolkit</artifactId>
+  <packaging>jar</packaging>
+  <name>COA connector toolkit</name>
+  <description>
+    The parts of an Athena federation connector that are the same for every source: the
+    @pk/@fk constraint-tag encoder (ColumnComment) and the Arrow schema assembler that puts
+    column comments where Athena actually reads them (TableSchema).
+  </description>
+
+  <dependencies>
+    <!-- Compile scope, not provided: a connector then needs exactly one dependency, this
+         one, and inherits the SDK and Arrow transitively. The trade-off is that the toolkit
+         pins the SDK version for its consumers, which for a set of samples bumped together
+         is what we want. -->
+    <dependency>
+      <groupId>com.amazonaws</groupId>
+      <artifactId>aws-athena-federation-sdk</artifactId>
+      <classifier>with-arrow</classifier>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

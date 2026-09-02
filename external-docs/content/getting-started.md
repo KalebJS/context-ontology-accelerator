@@ -202,5 +202,6 @@ pnpm dev        # opens at http://localhost:5173
 ## Next Steps
 
 - See the **[API Reference](#/api-reference)** for the full Control Plane and Data Layer API contracts (sources, metrics, ontologies, namespaces, grants, and the Serve/query endpoints).
+- See the [Structured Data Source Guide](sources.md) for every source type COA supports — Glue, the JDBC engines, and custom connectors including the ready-made Databricks SQL Warehouse connector — and how to register each one.
 - See the [Package Guide](package-guide.md) for how to add or implement a package.
 - See `CONTRIBUTING.md` for coding standards and PR process.
