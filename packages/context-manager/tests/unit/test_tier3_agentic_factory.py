@@ -13,7 +13,7 @@ Covers ``coa_serve.tier3.agentic.factory``:
   ``strategy:<value>`` tools plus ``graph_traversal``, ``vector_search``, and
   ``ontology_lookup`` — is registered (Req 2.2, 2.3).
 - Ontology source selection (Req 3.2, 12.7): the file source is selected when
-  ``agentic_ontology_source="file"`` and the graph source when ``"graph"``.
+  ``deep_reasoning_ontology_source="file"`` and the graph source when ``"graph"``.
 - ``build_agentic_retriever`` composes the registry, controller, decomposer,
   synthesizer, and budget into an :class:`AgenticRetriever`.
 - The Req 12.3 lazy-import invariant: importing ``factory`` does not import
@@ -227,21 +227,21 @@ class TestFullRegistration:
 @pytest.mark.unit
 class TestOntologySourceSelection:
     def test_file_source_selected_when_configured(self):
-        """``agentic_ontology_source="file"`` → OntologyFileSource over the file path."""
-        config = make_config(agentic_ontology_source="file", agentic_ontology_file="/tmp/onto.ttl")
+        """``deep_reasoning_ontology_source="file"`` → OntologyFileSource over the file path."""
+        config = make_config(deep_reasoning_ontology_source="file", deep_reasoning_ontology_file="/tmp/onto.ttl")
         source = build_ontology_source(config, make_clients())
         assert isinstance(source, OntologyFileSource)
 
     def test_file_source_is_what_the_registry_wires(self):
         """The registry's ontology tool is backed by the file source when configured."""
-        config = make_config(agentic_ontology_source="file", agentic_ontology_file="/tmp/onto.ttl")
+        config = make_config(deep_reasoning_ontology_source="file", deep_reasoning_ontology_file="/tmp/onto.ttl")
         registry = build_tool_registry(config, make_clients())
         tool = registry.get(ONTOLOGY_TOOL)
         assert isinstance(tool._source, OntologyFileSource)
 
     def test_graph_source_selected_when_configured(self):
-        """``agentic_ontology_source="graph"`` → OntologyGraphSource over the graph client."""
-        config = make_config(agentic_ontology_source="graph")
+        """``deep_reasoning_ontology_source="graph"`` → OntologyGraphSource over the graph client."""
+        config = make_config(deep_reasoning_ontology_source="graph")
         source = build_ontology_source(config, make_clients())
         assert isinstance(source, OntologyGraphSource)
 
@@ -249,7 +249,7 @@ class TestOntologySourceSelection:
         """Defense-in-depth: a 'file' source with an empty path would make rdflib
         parse the CWD (IsADirectoryError); the factory falls back to the graph
         source rather than build a source that fails every lookup."""
-        config = make_config(agentic_ontology_source="file", agentic_ontology_file="")
+        config = make_config(deep_reasoning_ontology_source="file", deep_reasoning_ontology_file="")
         source = build_ontology_source(config, make_clients())
         assert isinstance(source, OntologyGraphSource)
 
@@ -261,10 +261,10 @@ class TestOntologySourceSelection:
 class TestBudgetConfig:
     def test_budget_built_from_config_fields(self):
         config = make_config(
-            agentic_time_budget_s=45,
-            agentic_max_steps=12,
-            agentic_per_tool_timeout_s=20,
-            agentic_max_fanout=7,
+            deep_reasoning_time_budget_s=45,
+            deep_reasoning_max_steps=12,
+            deep_reasoning_per_tool_timeout_s=20,
+            deep_reasoning_max_fanout=7,
         )
         budget = build_budget_config(config)
         assert budget.time_budget_s == 45.0

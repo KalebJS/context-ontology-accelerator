@@ -170,13 +170,20 @@ def check_backends() -> bool:
 
 
 def _find_existing_ontology(uri: str) -> dict | None:
-    """Return the catalog entry for an ontology URI, or None if not registered."""
+    """Return the catalog entry for an ontology URI, or None if not registered.
+
+    ``GET /ontologies/`` answers with a camelCase ``{"ontologies": [...]}``
+    envelope (its Smithy contract), while ``POST /ontologies/`` answers with a
+    snake_case ``OntologyResponse``. Callers use the two interchangeably, so the
+    listing row is normalised onto the POST shape for the keys they read.
+    """
     resp = httpx.get(f"{CATALOG_URL}/ontologies/", params={"uri": uri}, timeout=10)
     resp.raise_for_status()
-    rows = resp.json()
+    payload = resp.json()
+    rows = payload.get("ontologies") or [] if isinstance(payload, dict) else payload
     for row in rows:
         if row.get("uri") == uri:
-            return row
+            return {**row, "ontology_id": row.get("ontologyId") or row.get("ontology_id")}
     return None
 
 
@@ -188,7 +195,7 @@ def _register_ontology(entry: dict) -> dict | None:
     """
     existing = _find_existing_ontology(entry["uri"])
     if existing:
-        console.print(f"    [yellow]already registered[/] → id={existing['id']}")
+        console.print(f"    [yellow]already registered[/] → id={existing['ontology_id']}")
         return existing
 
     body = {
@@ -348,7 +355,7 @@ def load_ontologies(config: dict) -> list[dict]:
             default_extract_all = tier == "customer"
             extract_all = bool(entry.get("extract_all_properties", default_extract_all))
             fetch_result = _server_side_fetch(
-                record["id"],
+                record["ontology_id"],
                 source_url,
                 extract_properties_for_classes=class_uris or None,
                 known_ontology_uris=known_uris,
@@ -554,7 +561,7 @@ def generate_embeddings(registered: list[dict]):
         sample_classes = cfg.get("sample_classes", [])
         console.print(f"  [bold]{cfg.get('title', record['uri'])}[/] — {len(sample_classes)} sample classes")
         n = _embed_and_post(
-            ontology_id=record["id"],
+            ontology_id=record["ontology_id"],
             entity_type="class",
             entries=sample_classes,
             uri_key="class_uri",
@@ -623,7 +630,7 @@ def generate_property_embeddings(registered: list[dict]):
             f"(curated={len(curated)}, auto-extracted={len(auto_extracted)})"
         )
         n = _embed_and_post(
-            ontology_id=record["id"],
+            ontology_id=record["ontology_id"],
             entity_type="property",
             entries=all_props,
             uri_key="property_uri",

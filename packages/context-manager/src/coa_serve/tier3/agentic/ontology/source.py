@@ -23,16 +23,18 @@ source, not a parallel reimplementation.
   executes the same SPARQL as the graph source via rdflib's in-memory engine, it
   produces a byte-for-byte identical :class:`Ontology`.
 - :class:`OntologyGraphSource` — the live SPARQL/RDF backend. It queries the RDF
-  **ontology graph** over the ``urn:orion:{namespace}:published`` named graph
-  through the existing serve-layer :class:`GraphClient` (the same client
-  ``GraphTraverser`` uses), wrapping the shared SPARQL bodies in a
-  ``GRAPH <urn:orion:{ns}:published> { ... }`` block. Its live use is DEFERRED to
-  follow-up task 21, which will issue targeted, query-shaped lookups against the
-  ontology graph instead of copying it wholesale; the shape it returns is already
-  identical to the file source's so that switch is a drop-in. This is the
-  SPARQL/RDF side — a different dataset and query language from the
-  graphrag-toolkit property graph the strategy/traversal tools use (see the
-  design's "Two graphs").
+  **ontology graph(s)** for the namespace through the existing serve-layer
+  :class:`GraphClient` (the same client ``GraphTraverser`` uses), wrapping the
+  shared SPARQL bodies in a ``GRAPH ?g { ... }`` block and filtering
+  ``STRSTARTS(STR(?g), <prefix>)`` — where the prefix comes from
+  ``get_graph_uri_template()`` (default ``urn:coa:{namespace}:published``), the
+  same helper ``GraphTraverser`` uses — so it unions every per-ontology named
+  graph in the namespace. Its live use is DEFERRED to follow-up task 21, which
+  will issue targeted, query-shaped lookups against the ontology graph instead of
+  copying it wholesale; the shape it returns is already identical to the file
+  source's so that switch is a drop-in. This is the SPARQL/RDF side — a different
+  dataset and query language from the graphrag-toolkit property graph the
+  strategy/traversal tools use (see the design's "Two graphs").
 
 Import discipline (Requirement 12.3): this module imports only the dependency-
 free serve-layer helpers, ``structlog``, ``asyncio``, and ``textwrap`` at load.
@@ -107,8 +109,10 @@ class OntologySource(Protocol):
 # The SELECT projections and the WHERE *bodies* (triple patterns) below are the
 # single source of truth for the ontology queries. The only per-source difference
 # is the execution target and how the body is wrapped:
-#   - the NDB graph source wraps each body in ``GRAPH <urn:orion:{ns}:published>``
-#     and ships it to the serve-layer GraphClient;
+#   - the NDB graph source wraps each body in ``GRAPH ?g { ... }`` and filters
+#     ``STRSTARTS(STR(?g), <prefix>)`` (prefix from ``get_graph_uri_template()``,
+#     default ``urn:coa:{ns}:published``) to union the namespace's per-ontology
+#     graphs, then ships it to the serve-layer GraphClient;
 #   - the file source runs each body unchanged against the default graph of an
 #     in-memory rdflib graph parsed from a ``.ttl``.
 # Both feed the resulting binding rows into the shared :func:`_build_ontology`.

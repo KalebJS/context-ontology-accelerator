@@ -45,6 +45,12 @@ structure OntologyRecord {
     /// Category of the ontology (foundational, induced, or user_created).
     ontologyType: String
 
+    /// Ingest lifecycle marker set by the async parse/embed worker: "pending"
+    /// while ingesting, "ok" once parsed, "parse_error" on failure. Absent on
+    /// legacy rows persisted before this field existed, for which a positive
+    /// embeddingCount means the ingest completed.
+    parseStatus: String
+
     /// Lifecycle status of the registry row. Set to "deleting" while an async
     /// ontology delete tears down its graph + embeddings (the row stays listed
     /// as "Delete in progress" until teardown completes, then is removed).

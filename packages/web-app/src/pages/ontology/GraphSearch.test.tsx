@@ -274,7 +274,7 @@ describe("filterClassHits", () => {
 });
 
 describe("ontologyIdFromGraphUri", () => {
-  it("decodes the last path segment as the ontology_id", () => {
+  it("decodes the last path segment as the ontologyId", () => {
     expect(
       ontologyIdFromGraphUri(
         "https://ontology-workbench.local/ns1/http%3A%2F%2Fex%2Fsales",
@@ -289,16 +289,16 @@ describe("ontologyIdFromGraphUri", () => {
 
 describe("resolveOntologyInfo", () => {
   const rec = (id: string, title: string, type: string): OntologyRecord => ({
-    ontology_id: id,
+    ontologyId: id,
     uri: id,
     title,
-    ontology_type: type,
+    ontologyType: type,
     format: "turtle",
-    domain_tags: [],
-    class_count: null,
-    property_count: null,
-    axiom_count: null,
-    embedding_count: null,
+    domainTags: [],
+    classCount: null,
+    propertyCount: null,
+    axiomCount: null,
+    embeddingCount: null,
   });
   const gUri = (id: string) =>
     `https://ontology-workbench.local/ns1/${encodeURIComponent(id)}`;
@@ -328,16 +328,16 @@ describe("resolveOntologyInfo", () => {
 
 describe("resolveVertexSources", () => {
   const rec = (id: string, title: string, type: string): OntologyRecord => ({
-    ontology_id: id,
+    ontologyId: id,
     uri: id,
     title,
-    ontology_type: type,
+    ontologyType: type,
     format: "turtle",
-    domain_tags: [],
-    class_count: null,
-    property_count: null,
-    axiom_count: null,
-    embedding_count: null,
+    domainTags: [],
+    classCount: null,
+    propertyCount: null,
+    axiomCount: null,
+    embeddingCount: null,
   });
   const gUri = (id: string) =>
     `https://ontology-workbench.local/ns1/${encodeURIComponent(id)}`;
@@ -404,16 +404,16 @@ describe("buildClassRows", () => {
     ],
   });
   const rec = (id: string, title: string, type: string): OntologyRecord => ({
-    ontology_id: id,
+    ontologyId: id,
     uri: id,
     title,
-    ontology_type: type,
+    ontologyType: type,
     format: "turtle",
-    domain_tags: [],
-    class_count: null,
-    property_count: null,
-    axiom_count: null,
-    embedding_count: null,
+    domainTags: [],
+    classCount: null,
+    propertyCount: null,
+    axiomCount: null,
+    embeddingCount: null,
   });
 
   const classes = [
@@ -511,16 +511,16 @@ describe("buildClassRows", () => {
 
 describe("ontology filter selector", () => {
   const rec = (id: string, title: string, type: string): OntologyRecord => ({
-    ontology_id: id,
+    ontologyId: id,
     uri: id,
     title,
-    ontology_type: type,
+    ontologyType: type,
     format: "turtle",
-    domain_tags: [],
-    class_count: null,
-    property_count: null,
-    axiom_count: null,
-    embedding_count: null,
+    domainTags: [],
+    classCount: null,
+    propertyCount: null,
+    axiomCount: null,
+    embeddingCount: null,
   });
 
   describe("buildOntologyFilterOptions", () => {

@@ -67,6 +67,60 @@ class TestLoadConfig:
         config = load_config()
         assert config.guardrail_id == ""
 
+    @patch("coa_serve.config.boto3")
+    def test_the_disable_switch_clears_both_guardrails(self, mock_boto3):
+        """Both, not one: "was the guardrail on for this request?" needs one answer.
+
+        The primary guardrail masks PII in the question and the retrieval one screens
+        chunks, so a benchmark that turned off only the first would still be measuring
+        a screened corpus on any Tier-3 arm.
+        """
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-12345"}}
+        mock_boto3.client.return_value = mock_ssm
+
+        with patch.dict("os.environ", {"SERVE_GUARDRAILS_DISABLED": "true"}):
+            config = load_config()
+
+        assert config.guardrail_id == ""
+        assert config.retrieval_guardrail_id == ""
+
+    @patch("coa_serve.config.boto3")
+    def test_disabling_guardrails_is_reported_at_error(self, mock_boto3):
+        # The only trace a stack leaves that it is serving unguarded traffic, so it
+        # has to be loud enough to alarm on rather than filed under info.
+        import structlog
+
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-12345"}}
+        mock_boto3.client.return_value = mock_ssm
+
+        with (
+            patch.dict("os.environ", {"SERVE_GUARDRAILS_DISABLED": "1"}),
+            structlog.testing.capture_logs() as logs,
+        ):
+            load_config()
+
+        disabled = [log for log in logs if log["event"] == "guardrails_disabled_by_configuration"]
+        assert len(disabled) == 1
+        assert disabled[0]["log_level"] == "error"
+        assert disabled[0]["guardrail_id_ignored"] is True
+
+    @patch("coa_serve.config.boto3")
+    def test_guardrails_stay_on_unless_explicitly_disabled(self, mock_boto3):
+        # Absent, empty and unrecognised all leave the guardrail ON: this switch may
+        # only ever be turned on deliberately, so anything short of a recognised
+        # truthy value is not a request to serve unguarded traffic.
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-12345"}}
+        mock_boto3.client.return_value = mock_ssm
+
+        for value in ("", "false", "no", "0", "off", "maybe", "TRUE-ish"):
+            with patch.dict("os.environ", {"SERVE_GUARDRAILS_DISABLED": value}):
+                assert load_config().guardrail_id == "gr-12345", value
+        with patch.dict("os.environ", {}, clear=True):
+            assert load_config().guardrail_id == "gr-12345"
+
     @patch.dict(
         "os.environ",
         {
@@ -110,24 +164,24 @@ class TestLoadConfig:
 
 
 @pytest.mark.unit
-class TestAgenticBudgetConfig:
-    """Agentic Tier-3 budget knobs, including the P0 synthesis reserve."""
+class TestDeepReasoningBudgetConfig:
+    """Deep-reasoning Tier-3 budget knobs, including the P0 synthesis reserve."""
 
     @patch("coa_serve.config.boto3")
-    def test_agentic_budget_defaults(self, mock_boto3):
+    def test_deep_reasoning_budget_defaults(self, mock_boto3):
         mock_ssm = MagicMock()
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
 
-        assert config.agentic_time_budget_s == 30
-        assert config.agentic_max_steps == 10
-        assert config.agentic_per_tool_timeout_s == 30
-        assert config.agentic_max_fanout == 5
-        assert config.agentic_synthesis_reserve_s == 8
+        assert config.deep_reasoning_time_budget_s == 30
+        assert config.deep_reasoning_max_steps == 10
+        assert config.deep_reasoning_per_tool_timeout_s == 30
+        assert config.deep_reasoning_max_fanout == 5
+        assert config.deep_reasoning_synthesis_reserve_s == 8
 
-    @patch.dict("os.environ", {"AGENTIC_SYNTHESIS_RESERVE_S": "12"})
+    @patch.dict("os.environ", {"DEEP_REASONING_SYNTHESIS_RESERVE_S": "12"})
     @patch("coa_serve.config.boto3")
     def test_synthesis_reserve_env_override(self, mock_boto3):
         mock_ssm = MagicMock()
@@ -135,9 +189,9 @@ class TestAgenticBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_synthesis_reserve_s == 12
+        assert config.deep_reasoning_synthesis_reserve_s == 12
 
-    @patch.dict("os.environ", {"AGENTIC_SYNTHESIS_RESERVE_S": "9999"})
+    @patch.dict("os.environ", {"DEEP_REASONING_SYNTHESIS_RESERVE_S": "9999"})
     @patch("coa_serve.config.boto3")
     def test_synthesis_reserve_out_of_range_falls_back(self, mock_boto3):
         """Out-of-range (>120) reserve warns and falls back to the default."""
@@ -146,7 +200,51 @@ class TestAgenticBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_synthesis_reserve_s == 8
+        assert config.deep_reasoning_synthesis_reserve_s == 8
+
+    @patch.dict("os.environ", {"AGENTIC_SYNTHESIS_RESERVE_S": "12"})
+    @patch("coa_serve.config.boto3")
+    def test_deprecated_agentic_env_var_still_honored(self, mock_boto3):
+        """A deployment on the pre-rename env var name keeps its tuned value.
+
+        Fails if the ``AGENTIC_*`` fallback is dropped: the value would silently
+        revert to the 8s default rather than erroring, quietly changing the budget
+        a tuned deployment depends on.
+        """
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
+        mock_boto3.client.return_value = mock_ssm
+
+        config = load_config()
+        assert config.deep_reasoning_synthesis_reserve_s == 12
+
+    @patch.dict(
+        "os.environ",
+        {"DEEP_REASONING_SYNTHESIS_RESERVE_S": "20", "AGENTIC_SYNTHESIS_RESERVE_S": "12"},
+    )
+    @patch("coa_serve.config.boto3")
+    def test_new_env_var_wins_over_deprecated(self, mock_boto3):
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
+        mock_boto3.client.return_value = mock_ssm
+
+        config = load_config()
+        assert config.deep_reasoning_synthesis_reserve_s == 20
+
+    @patch.dict("os.environ", {"TIER3_STRATEGY": "agentic"})
+    @patch("coa_serve.config.boto3")
+    def test_deprecated_tier3_strategy_value_normalizes(self, mock_boto3):
+        """``TIER3_STRATEGY=agentic`` must still select the reasoning loop.
+
+        Without the alias it falls into the invalid-value branch and reverts to
+        lexical-baseline, silently turning a deep-reasoning deployment single-shot.
+        """
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
+        mock_boto3.client.return_value = mock_ssm
+
+        config = load_config()
+        assert config.tier3_strategy == "deep-reasoning"
 
     @patch("coa_serve.config.boto3")
     def test_ontology_edge_mode_defaults_to_soft_prior(self, mock_boto3):
@@ -155,9 +253,9 @@ class TestAgenticBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_ontology_edge_mode == "soft_prior"
+        assert config.deep_reasoning_ontology_edge_mode == "soft_prior"
 
-    @patch.dict("os.environ", {"AGENTIC_ONTOLOGY_EDGE_MODE": "strict"})
+    @patch.dict("os.environ", {"DEEP_REASONING_ONTOLOGY_EDGE_MODE": "strict"})
     @patch("coa_serve.config.boto3")
     def test_ontology_edge_mode_strict_honored(self, mock_boto3):
         mock_ssm = MagicMock()
@@ -165,9 +263,9 @@ class TestAgenticBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_ontology_edge_mode == "strict"
+        assert config.deep_reasoning_ontology_edge_mode == "strict"
 
-    @patch.dict("os.environ", {"AGENTIC_ONTOLOGY_EDGE_MODE": "bogus"})
+    @patch.dict("os.environ", {"DEEP_REASONING_ONTOLOGY_EDGE_MODE": "bogus"})
     @patch("coa_serve.config.boto3")
     def test_ontology_edge_mode_invalid_falls_back(self, mock_boto3):
         mock_ssm = MagicMock()
@@ -175,7 +273,7 @@ class TestAgenticBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_ontology_edge_mode == "soft_prior"
+        assert config.deep_reasoning_ontology_edge_mode == "soft_prior"
 
     @patch("coa_serve.config.boto3")
     def test_ontology_source_defaults_to_graph(self, mock_boto3):
@@ -184,21 +282,24 @@ class TestAgenticBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_ontology_source == "graph"
+        assert config.deep_reasoning_ontology_source == "graph"
 
-    @patch.dict("os.environ", {"AGENTIC_ONTOLOGY_SOURCE": "file"})
+    @patch.dict("os.environ", {"DEEP_REASONING_ONTOLOGY_SOURCE": "file"})
     @patch("coa_serve.config.boto3")
     def test_ontology_source_file_without_path_falls_back_to_graph(self, mock_boto3):
-        """A 'file' source with no AGENTIC_ONTOLOGY_FILE is a misconfig (rdflib would
+        """A 'file' source with no DEEP_REASONING_ONTOLOGY_FILE is a misconfig (rdflib would
         parse the CWD → IsADirectoryError). load_config falls back to 'graph'."""
         mock_ssm = MagicMock()
         mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "gr-test"}}
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_ontology_source == "graph"
+        assert config.deep_reasoning_ontology_source == "graph"
 
-    @patch.dict("os.environ", {"AGENTIC_ONTOLOGY_SOURCE": "file", "AGENTIC_ONTOLOGY_FILE": "/nonexistent/onto.ttl"})
+    @patch.dict(
+        "os.environ",
+        {"DEEP_REASONING_ONTOLOGY_SOURCE": "file", "DEEP_REASONING_ONTOLOGY_FILE": "/nonexistent/onto.ttl"},
+    )
     @patch("coa_serve.config.boto3")
     def test_ontology_source_file_with_missing_path_falls_back_to_graph(self, mock_boto3):
         mock_ssm = MagicMock()
@@ -206,7 +307,7 @@ class TestAgenticBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_ontology_source == "graph"
+        assert config.deep_reasoning_ontology_source == "graph"
 
     @patch("coa_serve.config.boto3")
     def test_max_no_progress_steps_default(self, mock_boto3):
@@ -215,9 +316,9 @@ class TestAgenticBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_max_no_progress_steps == 3
+        assert config.deep_reasoning_max_no_progress_steps == 3
 
-    @patch.dict("os.environ", {"AGENTIC_MAX_NO_PROGRESS_STEPS": "5"})
+    @patch.dict("os.environ", {"DEEP_REASONING_MAX_NO_PROGRESS_STEPS": "5"})
     @patch("coa_serve.config.boto3")
     def test_max_no_progress_steps_env_override(self, mock_boto3):
         mock_ssm = MagicMock()
@@ -225,7 +326,7 @@ class TestAgenticBudgetConfig:
         mock_boto3.client.return_value = mock_ssm
 
         config = load_config()
-        assert config.agentic_max_no_progress_steps == 5
+        assert config.deep_reasoning_max_no_progress_steps == 5
 
 
 @pytest.mark.unit

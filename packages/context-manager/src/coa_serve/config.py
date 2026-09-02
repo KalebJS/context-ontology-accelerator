@@ -88,28 +88,30 @@ class ServiceConfig:
     # Standard-mode Tier-3 engine. "lexical-baseline" + topic_beam is the default
     # because topic_beam is the strongest single-shot strategy on the SEC-10-Q
     # benchmark (45.13% strict vs 34.36% for hand-rolled, 195 questions).
-    tier3_strategy: Literal["hand-rolled", "lexical-baseline", "agentic"] = "lexical-baseline"
+    tier3_strategy: Literal["hand-rolled", "lexical-baseline", "deep-reasoning"] = "lexical-baseline"
     lexical_retriever_strategy: str = "topic_beam"
-    # Agentic Tier-3 budgets (used only when tier3_strategy == "agentic" or a
-    # per-request options.mode=agentic). Range-validated at load; see load_config.
-    agentic_time_budget_s: int = 30
-    agentic_max_steps: int = 10
-    agentic_per_tool_timeout_s: int = 30
-    agentic_max_fanout: int = 5
+    # Deep-reasoning Tier-3 budgets (used only when tier3_strategy == "deep-reasoning"
+    # or a per-request options.mode=deep-reasoning). Range-validated at load; see
+    # load_config.
+    deep_reasoning_time_budget_s: int = 30
+    deep_reasoning_max_steps: int = 10
+    deep_reasoning_per_tool_timeout_s: int = 30
+    deep_reasoning_max_fanout: int = 5
     # Wall-clock seconds reserved at session end for the final synthesis call, so
     # a late tool invocation cannot push synthesis past the time budget.
-    agentic_synthesis_reserve_s: int = 8
+    deep_reasoning_synthesis_reserve_s: int = 8
     # Consecutive no-progress steps a sub-question loop tolerates before stopping
     # with no_new_information. Higher = more escalation attempts (switch tool,
     # reframe, switch modality) before giving up. 1 restores stop-on-first.
-    agentic_max_no_progress_steps: int = 3
-    # Where the agentic Ontology_Lookup_Tool reads the per-namespace ontology.
+    deep_reasoning_max_no_progress_steps: int = 3
+    # Where the deep-reasoning Ontology_Lookup_Tool reads the per-namespace ontology.
     # "graph" (default) queries the live published RDF graph in Neptune via the
     # serve graph client — correct for document-induced namespaces, which have no
-    # standalone .ttl file. "file" reads a serialized .ttl at agentic_ontology_file
-    # (dev/test convenience); it requires a non-empty, readable path.
-    agentic_ontology_source: Literal["graph", "file"] = "graph"
-    agentic_ontology_file: str = ""
+    # standalone .ttl file. "file" reads a serialized .ttl at
+    # deep_reasoning_ontology_file (dev/test convenience); it requires a non-empty,
+    # readable path.
+    deep_reasoning_ontology_source: Literal["graph", "file"] = "graph"
+    deep_reasoning_ontology_file: str = ""
     # How the ontology constrains edge-typed graph traversal. "soft_prior"
     # (default) treats the ontology's edge types as a PREFERENCE — ontology edges
     # are ordered first, but edge types the planner proposes beyond the ontology
@@ -117,11 +119,39 @@ class ServiceConfig:
     # graph's predicate vocabulary, so a hard allowlist starves traversal and drops
     # the majority of real edges). "strict" restores the allowlist (ontology edges
     # only), guarded so it never strips the request down to nothing.
-    agentic_ontology_edge_mode: Literal["soft_prior", "strict"] = "soft_prior"
+    deep_reasoning_ontology_edge_mode: Literal["soft_prior", "strict"] = "soft_prior"
 
 
 class ConfigurationError(Exception):
     """Raised when required configuration cannot be loaded."""
+
+
+def env_with_legacy_name(name: str, default: str = "") -> str:
+    """Read env var ``name``, honoring its pre-rename ``AGENTIC`` spelling.
+
+    Both "agentic" features were rebranded to "deep reasoning", renaming two env
+    families by substring:
+
+    * Tier-3 execution mode — ``AGENTIC_*`` → ``DEEP_REASONING_*``
+    * Tier-2 NL→SQL agent   — ``SERVE_AGENTIC_*`` → ``SERVE_DEEP_REASONING_*``
+
+    Substituting ``DEEP_REASONING`` → ``AGENTIC`` covers both, since the ``SERVE_``
+    prefix is untouched. A deployment that still sets an old name keeps working (with
+    a warning) rather than silently reverting to the default — a silent revert would
+    quietly change budgets and timeouts a tuned deployment depends on. Shared with
+    :mod:`coa_serve.agents.sql_agent` so the deprecation policy lives in one place.
+    Remove this fallback once no deployment sets the old names.
+    """
+    raw = os.environ.get(name, "")
+    if raw:
+        return raw
+    legacy = name.replace("DEEP_REASONING", "AGENTIC", 1)
+    if legacy != name:
+        raw = os.environ.get(legacy, "")
+        if raw:
+            logger.warning("deprecated_env_var", deprecated=legacy, use=name)
+            return raw
+    return default
 
 
 def _parse_int_in_range(name: str, default: int, low: int, high: int) -> int:
@@ -130,7 +160,7 @@ def _parse_int_in_range(name: str, default: int, low: int, high: int) -> int:
     A malformed or out-of-range value logs a warning and returns ``default`` rather
     than raising, so a bad env var can never crash service startup.
     """
-    raw = os.environ.get(name, "")
+    raw = env_with_legacy_name(name)
     if not raw:
         return default
     try:
@@ -144,6 +174,38 @@ def _parse_int_in_range(name: str, default: int, low: int, high: int) -> int:
     return value
 
 
+_GUARDRAILS_DISABLED_ENV = "SERVE_GUARDRAILS_DISABLED"
+
+
+def _guardrails_disabled() -> bool:
+    """Whether this deployment has opted out of both serve-side Bedrock guardrails.
+
+    Exists for benchmarking, and the reason is measurable rather than a matter of
+    taste: the primary guardrail anonymizes PII on INPUT (NAME/EMAIL/PHONE →
+    ``{NAME}``), and in a text-to-SQL question the literals ARE the query. "What is
+    the border color of card 'Ancestor's Chosen'?" reaches the model as ``'{NAME}'``,
+    so the generated ``WHERE`` clause matches no row. Measured over the Tier-2
+    benchmark campaign: 1.6-3.2% of BIRD questions per run end up with a placeholder
+    in their FINAL SQL, and 306 of those 313 questions (97.8%) scored wrong against a
+    47-55% base wrong rate — worth roughly 1pp of execution accuracy per run
+    (0.7-1.6pp across five runs), charged to the system under test but caused by the
+    guardrail. Blocks are a smaller, separate effect: 944 of 18,305 guardrailed
+    Converse calls came back BLOCK, and questions that saw one still scored 52.1% EX
+    against 55.5% for those that did not.
+
+    Deployment-scoped on purpose, and deliberately NOT a request option: the primary
+    guardrail is the prompt-attack boundary, and a per-request bypass would let any
+    caller drop it. Turning it off is a decision for whoever owns the account, taken
+    at deploy time (``-c serve_guardrails_disabled=true``) where it is reviewable.
+
+    Setting the SSM parameter ``<prefix>/bedrock/guardrail-id`` to ``none`` has a
+    similar effect, but it is not the same thing: that parameter is also read by the
+    ingestion and ontology tasks, and ``cdk deploy`` of the guardrail stack writes
+    the real id back over it. This flag is serve-only and survives a deploy.
+    """
+    return os.environ.get(_GUARDRAILS_DISABLED_ENV, "").strip().lower() in ("1", "true", "on", "yes")
+
+
 def load_config() -> ServiceConfig:
     """Load config from env vars and SSM. Called once at startup."""
     environment = os.environ.get("ENVIRONMENT", "local")
@@ -155,43 +217,75 @@ def load_config() -> ServiceConfig:
     retrieval_guardrail_version = (
         _get_ssm_parameter(f"{ssm_prefix}/bedrock/retrieval-guardrail-version", required=False) or "DRAFT"
     )
+    guardrails_disabled = _guardrails_disabled()
+    if guardrails_disabled:
+        # ERROR, not warning: a stack serving unguarded traffic must not be
+        # something you have to go looking for, and this is the one line that says
+        # so. Both ids are cleared rather than one, so there is a single answer to
+        # "was the guardrail on?" for any given request.
+        logger.error(
+            "guardrails_disabled_by_configuration",
+            reason=f"{_GUARDRAILS_DISABLED_ENV} is set",
+            guardrail_id_ignored=bool(guardrail_id),
+            retrieval_guardrail_id_ignored=bool(retrieval_guardrail_id),
+            environment=environment,
+        )
+        guardrail_id = ""
+        retrieval_guardrail_id = ""
     logger.info(
         "config_loaded",
         guardrail_configured=bool(guardrail_id),
         retrieval_guardrail_configured=bool(retrieval_guardrail_id),
+        guardrails_disabled=guardrails_disabled,
         environment=environment,
     )
 
     tier3_strategy = os.environ.get("TIER3_STRATEGY", "lexical-baseline")
-    if tier3_strategy not in ("hand-rolled", "lexical-baseline", "agentic"):
+    if tier3_strategy == "agentic":
+        # Pre-rename spelling of "deep-reasoning". Accepted so an existing deployment
+        # that opted into the loop deployment-wide does not silently fall back to the
+        # single-shot default on upgrade.
+        logger.warning("deprecated_tier3_strategy", deprecated="agentic", use="deep-reasoning")
+        tier3_strategy = "deep-reasoning"
+    if tier3_strategy not in ("hand-rolled", "lexical-baseline", "deep-reasoning"):
         logger.warning("invalid_tier3_strategy", value=tier3_strategy, fallback="lexical-baseline")
         tier3_strategy = "lexical-baseline"
 
-    # Agentic Tier-3 budgets: validate-or-fallback within the documented ranges.
-    agentic_time_budget_s = _parse_int_in_range("AGENTIC_TIME_BUDGET_S", 30, 1, 300)
-    agentic_max_steps = _parse_int_in_range("AGENTIC_MAX_STEPS", 10, 1, 50)
-    agentic_per_tool_timeout_s = _parse_int_in_range("AGENTIC_PER_TOOL_TIMEOUT_S", 30, 1, 120)
-    agentic_max_fanout = _parse_int_in_range("AGENTIC_MAX_FANOUT", 5, 1, 20)
-    agentic_synthesis_reserve_s = _parse_int_in_range("AGENTIC_SYNTHESIS_RESERVE_S", 8, 0, 120)
-    agentic_max_no_progress_steps = _parse_int_in_range("AGENTIC_MAX_NO_PROGRESS_STEPS", 3, 1, 20)
-    agentic_ontology_source = os.environ.get("AGENTIC_ONTOLOGY_SOURCE", "graph")
-    if agentic_ontology_source not in ("graph", "file"):
-        logger.warning("invalid_agentic_ontology_source", value=agentic_ontology_source, fallback="graph")
-        agentic_ontology_source = "graph"
-    agentic_ontology_file = os.environ.get("AGENTIC_ONTOLOGY_FILE", "")
+    # Deep-reasoning Tier-3 budgets: validate-or-fallback within the documented ranges.
+    deep_reasoning_time_budget_s = _parse_int_in_range("DEEP_REASONING_TIME_BUDGET_S", 30, 1, 300)
+    deep_reasoning_max_steps = _parse_int_in_range("DEEP_REASONING_MAX_STEPS", 10, 1, 50)
+    deep_reasoning_per_tool_timeout_s = _parse_int_in_range("DEEP_REASONING_PER_TOOL_TIMEOUT_S", 30, 1, 120)
+    deep_reasoning_max_fanout = _parse_int_in_range("DEEP_REASONING_MAX_FANOUT", 5, 1, 20)
+    deep_reasoning_synthesis_reserve_s = _parse_int_in_range("DEEP_REASONING_SYNTHESIS_RESERVE_S", 8, 0, 120)
+    deep_reasoning_max_no_progress_steps = _parse_int_in_range("DEEP_REASONING_MAX_NO_PROGRESS_STEPS", 3, 1, 20)
+    deep_reasoning_ontology_source = env_with_legacy_name("DEEP_REASONING_ONTOLOGY_SOURCE", "graph")
+    if deep_reasoning_ontology_source not in ("graph", "file"):
+        logger.warning(
+            "invalid_deep_reasoning_ontology_source",
+            value=deep_reasoning_ontology_source,
+            fallback="graph",
+        )
+        deep_reasoning_ontology_source = "graph"
+    deep_reasoning_ontology_file = env_with_legacy_name("DEEP_REASONING_ONTOLOGY_FILE", "")
     # A "file" source with no readable path is a misconfiguration (an empty path
     # makes rdflib parse the CWD → IsADirectoryError at invoke time). Fall back to
     # the graph source rather than ship a source that fails every lookup.
-    if agentic_ontology_source == "file" and (not agentic_ontology_file or not Path(agentic_ontology_file).is_file()):
+    if deep_reasoning_ontology_source == "file" and (
+        not deep_reasoning_ontology_file or not Path(deep_reasoning_ontology_file).is_file()
+    ):
         logger.warning(
-            "agentic_ontology_file_invalid_falling_back_to_graph",
-            path=agentic_ontology_file or "(unset)",
+            "deep_reasoning_ontology_file_invalid_falling_back_to_graph",
+            path=deep_reasoning_ontology_file or "(unset)",
         )
-        agentic_ontology_source = "graph"
-    agentic_ontology_edge_mode = os.environ.get("AGENTIC_ONTOLOGY_EDGE_MODE", "soft_prior")
-    if agentic_ontology_edge_mode not in ("soft_prior", "strict"):
-        logger.warning("invalid_agentic_ontology_edge_mode", value=agentic_ontology_edge_mode, fallback="soft_prior")
-        agentic_ontology_edge_mode = "soft_prior"
+        deep_reasoning_ontology_source = "graph"
+    deep_reasoning_ontology_edge_mode = env_with_legacy_name("DEEP_REASONING_ONTOLOGY_EDGE_MODE", "soft_prior")
+    if deep_reasoning_ontology_edge_mode not in ("soft_prior", "strict"):
+        logger.warning(
+            "invalid_deep_reasoning_ontology_edge_mode",
+            value=deep_reasoning_ontology_edge_mode,
+            fallback="soft_prior",
+        )
+        deep_reasoning_ontology_edge_mode = "soft_prior"
 
     # Default topic_beam: the strongest single-shot strategy on the SEC-10-Q
     # benchmark (45.13% strict vs 34.36% hand-rolled, 195 questions).
@@ -227,15 +321,15 @@ def load_config() -> ServiceConfig:
         session_metadata_table=os.environ.get("SESSION_METADATA_TABLE", ""),
         tier3_strategy=tier3_strategy,
         lexical_retriever_strategy=lexical_retriever_strategy,
-        agentic_time_budget_s=agentic_time_budget_s,
-        agentic_max_steps=agentic_max_steps,
-        agentic_per_tool_timeout_s=agentic_per_tool_timeout_s,
-        agentic_max_fanout=agentic_max_fanout,
-        agentic_synthesis_reserve_s=agentic_synthesis_reserve_s,
-        agentic_max_no_progress_steps=agentic_max_no_progress_steps,
-        agentic_ontology_source=agentic_ontology_source,
-        agentic_ontology_file=agentic_ontology_file,
-        agentic_ontology_edge_mode=agentic_ontology_edge_mode,
+        deep_reasoning_time_budget_s=deep_reasoning_time_budget_s,
+        deep_reasoning_max_steps=deep_reasoning_max_steps,
+        deep_reasoning_per_tool_timeout_s=deep_reasoning_per_tool_timeout_s,
+        deep_reasoning_max_fanout=deep_reasoning_max_fanout,
+        deep_reasoning_synthesis_reserve_s=deep_reasoning_synthesis_reserve_s,
+        deep_reasoning_max_no_progress_steps=deep_reasoning_max_no_progress_steps,
+        deep_reasoning_ontology_source=deep_reasoning_ontology_source,
+        deep_reasoning_ontology_file=deep_reasoning_ontology_file,
+        deep_reasoning_ontology_edge_mode=deep_reasoning_ontology_edge_mode,
     )
 
 

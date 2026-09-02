@@ -10,6 +10,8 @@ import math
 from coa_common.constants import MAX_QUERY_CODEPOINTS, validate_query_text
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
+from .mode import LEGACY_MODE_ALIASES
+
 _MAX_DETAIL_LENGTH = 500  # Matches trace.py centralized truncation
 
 # Cap on how much of a rejected value is echoed back in a validation message.
@@ -148,19 +150,23 @@ class InvokeRequest(BaseModel):
         executed, not which answer-shape wins), so the field is ``mode``, not
         ``tier3Mode``. Accepted values:
 
-        * ``"agentic"``  — force the multi-step reasoning loop for this request.
+        * ``"deep-reasoning"`` — force the multi-step reasoning loop for this request.
         * ``"standard"`` — force the original single-shot path
           (``KnowledgeRetriever``: parallel retrieve + one synthesis).
 
+        ``"agentic"`` is the pre-rename spelling of ``"deep-reasoning"`` and is still
+        accepted (see ``mode.LEGACY_MODE_ALIASES``) so callers pinned to it do not
+        start getting a 400 on upgrade. It is not advertised in the error message.
+
         Absence follows the deployment default (``TIER3_STRATEGY``), which ships as
-        ``lexical-baseline`` — so standard is the default and agentic is opt-in.
+        ``lexical-baseline`` — so standard is the default and deep reasoning is opt-in.
         ``"standard"`` stays an explicit opt-OUT for deployments that set
-        ``TIER3_STRATEGY=agentic``.
+        ``TIER3_STRATEGY=deep-reasoning``.
         """
         if "mode" in options:
             value = options["mode"]
-            if value not in ("agentic", "standard"):
-                raise ValueError(f"Invalid mode {value!r}; must be 'agentic' or 'standard'")
+            if value not in ("deep-reasoning", "standard", *LEGACY_MODE_ALIASES):
+                raise ValueError(f"Invalid mode {value!r}; must be 'deep-reasoning' or 'standard'")
         return options
 
     @field_validator("options", mode="after")

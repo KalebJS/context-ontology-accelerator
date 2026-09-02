@@ -34,9 +34,11 @@ export const STEP_LABELS: Record<string, string> = {
   "t3.synthesize": "Synthesizing answer",
   "t3.guardrail": "Applying guardrail",
   "response.assemble": "Assembling response",
-  // Agentic mode (options.mode="agentic"). These IDs are emitted bare — without a
-  // `t1./t2./t3.` prefix — by the agentic reasoning loop, so they must be listed
-  // explicitly or the whole agentic trace renders unlabeled.
+  // Deep-reasoning mode (options.mode="deep-reasoning"). These IDs are emitted bare
+  // — without a `t1./t2./t3.` prefix — by the reasoning loop, so they must be listed
+  // explicitly or the whole deep-reasoning trace renders unlabeled. The IDs keep
+  // their `agentic_` prefix: they are the backend's own step taxonomy, not a
+  // user-facing label.
   agentic_session_start: "Planning approach",
   decompose: "Breaking down the question",
   subquestion_start: "Working on a sub-question",

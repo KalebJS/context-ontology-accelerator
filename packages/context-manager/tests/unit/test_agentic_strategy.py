@@ -127,7 +127,7 @@ class TestAgenticStrategy:
         res = await strat.resolve("how many orders", "ns1", ctx)
 
         assert res is not None
-        assert res.strategy_name == StrategyOption.AGENTIC
+        assert res.strategy_name == StrategyOption.DEEP_REASONING
         assert res.sql == GEN_SQL and res.row_count == 3 and res.confidence == 0.9
         assert res.rows == [{"count": 42}] and res.columns == ["count"]
         assert res.retrieved_tables == ["orders"] and res.expanded_tables == ["orders"]
@@ -139,7 +139,7 @@ class TestAgenticStrategy:
         assert record.kwargs["detail"] == {
             "rowCount": 3,
             "tables": ["orders"],
-            "agentic": True,
+            "deepReasoning": True,
             "confidence": 0.9,
         }
 
@@ -273,9 +273,9 @@ class TestAgenticStrategy:
             ("true", graph_client, True),
         ):
             if env is None:
-                monkeypatch.delenv("SERVE_AGENTIC_GRAPH_TRAVERSAL", raising=False)
+                monkeypatch.delenv("SERVE_DEEP_REASONING_GRAPH_TRAVERSAL", raising=False)
             else:
-                monkeypatch.setenv("SERVE_AGENTIC_GRAPH_TRAVERSAL", env)
+                monkeypatch.setenv("SERVE_DEEP_REASONING_GRAPH_TRAVERSAL", env)
             vector, firewall, executor = self._clients()
             install_fake_strands(_solve)
 
@@ -292,15 +292,20 @@ class TestAgenticStrategy:
         # opts in per request.
         from . import strands_fake
 
-        monkeypatch.delenv("SERVE_AGENTIC_GRAPH_TRAVERSAL", raising=False)
+        monkeypatch.delenv("SERVE_DEEP_REASONING_GRAPH_TRAVERSAL", raising=False)
         graph_client = MagicMock()
         graph_client.query = AsyncMock(return_value=[])
 
         for options, expected in (
+            ({"deepReasoningGraphTraversal": True}, True),
+            ({"deepReasoningGraphTraversal": "true"}, True),
+            # Pre-rename spelling: still enables the tool, so a benchmark script
+            # pinned to it does not silently measure the no-traversal arm.
             ({"agenticGraphTraversal": True}, True),
-            ({"agenticGraphTraversal": "true"}, True),
+            ({"agenticGraphTraversal": "yes"}, True),
             ({}, False),
             # excludeTools is a veto: it beats the per-request enable.
+            ({"deepReasoningGraphTraversal": True, "excludeTools": ["explore_graph"]}, False),
             ({"agenticGraphTraversal": True, "excludeTools": ["explore_graph"]}, False),
         ):
             vector, firewall, executor = self._clients()
@@ -320,7 +325,7 @@ class TestAgenticStrategy:
     async def test_exclude_tools_withholds_the_graph_tool_for_one_request(self, monkeypatch):
         from . import strands_fake
 
-        monkeypatch.setenv("SERVE_AGENTIC_GRAPH_TRAVERSAL", "1")
+        monkeypatch.setenv("SERVE_DEEP_REASONING_GRAPH_TRAVERSAL", "1")
         graph_client = MagicMock()
         graph_client.query = AsyncMock(return_value=[])
 
@@ -342,7 +347,7 @@ class TestAgenticStrategy:
     async def test_graph_tool_is_scoped_to_the_request_namespace(self, monkeypatch):
         from . import strands_fake
 
-        monkeypatch.setenv("SERVE_AGENTIC_GRAPH_TRAVERSAL", "1")
+        monkeypatch.setenv("SERVE_DEEP_REASONING_GRAPH_TRAVERSAL", "1")
         monkeypatch.setenv("GRAPH_URI_TEMPLATE", "https://graphs.local/{namespace}")
         graph_client = MagicMock()
         graph_client.query = AsyncMock(return_value=[])

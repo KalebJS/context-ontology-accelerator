@@ -27,6 +27,7 @@ nav:
   - Data Source Guides:
     - Structured Data Sources: guides/structured-data/index.md
     - Cross-Account Data Sources: guides/structured-data/cross-account-sources.md
+    - Custom Connector Sources: guides/structured-data/custom-connector-sources.md
   - Developer:
     - Getting Started: getting-started.md
     - Package Guide: package-guide.md

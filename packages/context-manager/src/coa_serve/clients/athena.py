@@ -20,6 +20,7 @@ import asyncio
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 import boto3
@@ -53,6 +54,30 @@ _POLL_INITIAL_DELAY = 0.5
 _POLL_MAX_DELAY = 5.0
 _POLL_BACKOFF = 2.0
 _DEFAULT_TIMEOUT = 120
+
+
+# Sub-type of a source backed by a customer-authored Athena federation connector.
+# Compared as a string rather than importing the control-plane enum: serve does not
+# depend on that package, and the value is the DynamoDB attribute's own contract.
+_CUSTOM_CONNECTOR_SUB_TYPE = "CUSTOM_CONNECTOR"
+
+
+@dataclass(frozen=True)
+class _CatalogContext:
+    """Where a query runs, and whether the crawled-name rewrite applies to it."""
+
+    catalog: str
+    """Athena ``QueryExecutionContext.Catalog``; empty for the Glue-native path."""
+    database: str
+    """Athena ``QueryExecutionContext.Database``."""
+    rewrite_crawled_names: bool = True
+    """Whether to apply :meth:`AthenaQueryExecutor._rewrite_table_names_for_federation`.
+
+    True for the federated-JDBC path, whose R2RML names come from a Glue crawler
+    and carry a ``{schema}_`` prefix the connector does not know. False for a
+    custom connector, where the same substring strip would corrupt a legitimate
+    table name that happens to start with its database name.
+    """
 
 
 class AthenaQueryError(RuntimeError):
@@ -155,8 +180,14 @@ class AthenaQueryExecutor:
         # Mirrors the JDBC path's sqlglot LIMIT injection (source_db._inject_limit).
         sql = self._inject_limit(sql, max_rows)
 
-        resolved_catalog, resolved_db = await self._resolve_catalog_and_database(namespace, data_source_id, database)
-        if resolved_catalog:
+        # Applied to every dialect-Trino query, not just federated ones: the alias
+        # collision is a property of the SQL Ontop generates, not of the catalog
+        # it runs against.
+        sql = self._disambiguate_table_aliases(sql)
+
+        context = await self._resolve_catalog_and_database(namespace, data_source_id, database)
+        resolved_catalog, resolved_db = context.catalog, context.database
+        if resolved_catalog and context.rewrite_crawled_names:
             original_sql = sql
             sql = self._rewrite_table_names_for_federation(sql, resolved_db)
             logger.info(
@@ -167,7 +198,10 @@ class AthenaQueryExecutor:
             )
         workgroup = self._fixed_workgroup or await self._resolve_workgroup(namespace)
         query_id = await self._start_query(sql, resolved_db, workgroup, catalog=resolved_catalog)
-        await self._wait_for_completion(query_id, timeout_seconds)
+        try:
+            await self._wait_for_completion(query_id, timeout_seconds)
+        except AthenaQueryError as exc:
+            raise self._explain_federation_failure(exc, resolved_catalog) from exc
         rows, columns, has_more = await self._get_results(query_id, max_rows)
 
         duration_ms = int((time.perf_counter() - start) * 1000)
@@ -355,6 +389,132 @@ class AthenaQueryExecutor:
             return _append_limit(sql, max_rows)
 
     @staticmethod
+    def _explain_federation_failure(exc: AthenaQueryError, catalog: str) -> AthenaQueryError:
+        """Append the actionable cause to Athena's opaque federation failures.
+
+        Athena collapses both grants a connector needs into messages that name
+        neither the grant nor the principal. A denied ``lambda:InvokeFunction``
+        surfaces only as ``Insufficient permissions to execute the query``, and a
+        denied spill read as a bare S3 ``403``. Both are customer-side resource
+        policies in the connector's own account, so the operator reading this
+        message is the only person who can act on it — and without the principal
+        ARN they cannot.
+
+        This matters more than a usual error-message tidy-up because these two
+        failures are invisible until first query. Registration probes the
+        connector with ``SHOW DATABASES`` as the *discovery* role, so a source
+        granted discovery but not serve passes registration, approval and
+        induction cleanly, then fails here.
+
+        Returns a new error rather than raising so the caller keeps the original
+        as ``__cause__``; the untouched Athena text stays in the traceback.
+        """
+        if not catalog:
+            return exc
+
+        message = str(exc)
+        hint = ""
+        if "Insufficient permissions to execute the query" in message:
+            hint = (
+                "The connector Lambda most likely does not allow this deployment to invoke it. "
+                "Add a lambda:InvokeFunction resource-policy statement on the connector naming "
+                "the serve runtime role (see the runtime-role-arn SSM parameter). Also check the "
+                "function carries the tag 'coa:connector=true' — the identity policy on this side "
+                "is scoped to that tag, so an untagged connector is not invocable."
+            )
+        elif "Access Denied" in message and "Amazon S3" in message:
+            hint = (
+                "The connector's spill bucket most likely does not allow this deployment to read it. "
+                "The bucket must use SSE-KMS with a customer-managed key tagged "
+                "'coa:connector-spill=true', its key policy must grant kms:Decrypt to the serve "
+                "runtime role with kms:ViaService, and its bucket policy must grant that role "
+                "s3:GetObject. The connector must also spill under "
+                "'connectors/<connectorId>/spills/' — the grant is scoped to that key prefix."
+            )
+        if not hint:
+            return exc
+
+        return AthenaQueryError(f"{message} — catalog {catalog!r}. {hint}")
+
+    @staticmethod
+    def _disambiguate_table_aliases(sql: str) -> str:
+        """Rename table aliases that collide with a projection alias.
+
+        Ontop emits two independent alias families into one query: ``V1``, ``V2``
+        for tables and ``v0``, ``v1`` for computed projections. When the numbers
+        meet — a table aliased ``V1`` alongside a projection aliased ``v1`` —
+        Trino fails the query with::
+
+            TYPE_MISMATCH: Expression V1 is not of type ROW
+
+        because ``ORDER BY`` resolves output aliases *before* FROM-clause aliases,
+        so ``V1."total_amount"`` is read as dereferencing the ``v1`` output column
+        (a scalar) rather than the table. ``SELECT`` and ``WHERE`` are unaffected —
+        output aliases are not in scope there — which is why the same alias works
+        in every clause except the one that sorts.
+
+        Quoting cannot fix this. Trino folds identifiers to lower case whether or
+        not they are quoted, so ``"V1"`` and ``"v1"`` stay the same name; verified
+        against a live LAMBDA catalog, where the quoted form failed identically.
+        Renaming the table alias is the repair that holds, and it is invisible
+        outside the query because the alias is local to it.
+
+        Not specific to custom connectors: any Athena-backed VKG query that sorts
+        on a computed value can hit this. A no-op when nothing collides, so
+        queries that work today pass through unchanged.
+        """
+        try:
+            parsed = sqlglot.parse_one(sql, dialect="trino")
+        except Exception:
+            return sql
+
+        # Output aliases from the whole tree, folded the way Trino folds them.
+        # Tree-wide rather than per-scope: a rename is safe either way, and scope
+        # analysis would add failure modes for no benefit.
+        projection_aliases = {
+            alias.lower()
+            for select in parsed.find_all(sqlglot.exp.Select)
+            for projection in select.expressions
+            if (alias := projection.alias_or_name)
+        }
+        if not projection_aliases:
+            return sql
+
+        tables = [t for t in parsed.find_all(sqlglot.exp.Table) if t.alias]
+        colliding = [t for t in tables if t.alias.lower() in projection_aliases]
+        if not colliding:
+            return sql
+
+        taken = {t.alias.lower() for t in tables} | projection_aliases
+        renamed: dict[str, str] = {}
+        for table in colliding:
+            old = table.alias
+            candidate = f"{old}_t"
+            suffix = 0
+            while candidate.lower() in taken:
+                suffix += 1
+                candidate = f"{old}_t{suffix}"
+            taken.add(candidate.lower())
+            renamed[old.lower()] = candidate
+            table.set("alias", sqlglot.exp.TableAlias(this=sqlglot.exp.to_identifier(candidate)))
+
+        # Requalify every column that pointed at a renamed alias. Matching is
+        # case-insensitive because the collision itself is: the qualifier may be
+        # spelled ``V1`` while the projection spells it ``v1``.
+        for column in parsed.find_all(sqlglot.exp.Column):
+            qualifier = column.args.get("table")
+            if qualifier is None:
+                continue
+            new_name = renamed.get(qualifier.name.lower())
+            if new_name:
+                column.set("table", sqlglot.exp.to_identifier(new_name))
+
+        try:
+            return parsed.sql(dialect="trino")
+        except Exception:
+            return sql
+
+    @staticmethod
     def _rewrite_table_names_for_federation(sql: str, schema: str) -> str:
         """Rewrite VKG-generated table names for federated catalog queries.
 
@@ -362,7 +522,12 @@ class AthenaQueryExecutor:
         BIRD_PUBLIC_INCOME) but the federated PostgreSQL connector expects
         the actual PG table name (income). When VKG provides physical names
         via datasourceRouting, this becomes a no-op.
-        Only called for federated JDBC sources (athenaDataCatalogName set).
+
+        Only called for federated JDBC sources. Custom-connector sources are
+        excluded (see ``_CatalogContext.rewrite_crawled_names``) because for them
+        this is not a no-op but a corruption: a real table named ``sales_orders``
+        in database ``sales`` would be rewritten to ``orders``, a name its
+        connector has never heard of.
         """
         if not schema:
             return sql
@@ -392,23 +557,23 @@ class AthenaQueryExecutor:
 
     async def _resolve_catalog_and_database(
         self, namespace: str, data_source_id: str, explicit_database: str
-    ) -> tuple[str, str]:
-        """Resolve Athena catalog and database for query execution.
+    ) -> _CatalogContext:
+        """Resolve the Athena catalog and database for query execution.
 
         For federated JDBC sources (athenaDataCatalogName set), the catalog is
         the nested Glue catalog name and database is the first discovered schema.
-        For native Glue sources, catalog is from athenaCatalog (usually
-        AwsDataCatalog) and database is athenaDatabase.
+        For custom-connector sources the catalog is the Lambda-backed catalog
+        registered at onboarding. For native Glue sources, catalog is from
+        athenaCatalog (usually AwsDataCatalog) and database is athenaDatabase.
 
-        Returns ("", db) when no federated catalog is needed (Glue-native path).
-        Returns (catalog, schema) for federated JDBC sources.
+        Returns an empty catalog when none is needed (the Glue-native path).
         Skips sources where queryable is explicitly False.
         """
         if explicit_database:
-            return "", explicit_database
+            return _CatalogContext(catalog="", database=explicit_database)
 
         if not self._sources.available:
-            return "", self._default_database
+            return _CatalogContext(catalog="", database=self._default_database)
 
         if not data_source_id or data_source_id == "default":
             # Fallback: no routing info available — scan DDB for any DATABASE source.
@@ -419,34 +584,59 @@ class AthenaQueryExecutor:
             source = await self._sources.get_source(namespace, data_source_id)
 
         if not source:
-            return "", self._default_database
+            return _CatalogContext(catalog="", database=self._default_database)
 
         if source.get("queryable") is False:
             logger.warning("source_not_queryable", namespace=namespace, source_id=data_source_id)
-            return "", self._default_database
+            return _CatalogContext(catalog="", database=self._default_database)
 
-        # JDBC federated path: Catalog=nested catalog, Database=schema
         federated_catalog = source.get("athenaDataCatalogName") or ""
         if federated_catalog:
+            is_custom_connector = source.get("sourceSubType") == _CUSTOM_CONNECTOR_SUB_TYPE
             discovered = source.get("discoveredSchemas") or []
-            schema = discovered[0] if discovered else "public"
+            if discovered:
+                schema = discovered[0]
+                schema_source = "discoveredSchemas"
+            elif is_custom_connector:
+                # A custom-connector source is scoped to exactly one database and
+                # records it at onboarding, so use that rather than a hardcoded
+                # default that has nothing to do with this connector. Reachable
+                # when a scan discovered zero tables (an over-narrow table filter,
+                # or a connector exposing none).
+                schema = source.get("athenaDatabase") or self._sources.parse_configuration(source).get(
+                    "databaseName", ""
+                )
+                schema_source = "configuredDatabase"
+            else:
+                schema = "public"
+                schema_source = "default"
             logger.info(
                 "catalog_resolution",
-                path="federated",
+                path="custom_connector" if is_custom_connector else "federated",
                 catalog=federated_catalog,
                 schema=schema,
-                schema_source="discoveredSchemas" if discovered else "default",
+                schema_source=schema_source,
                 namespace=namespace,
             )
-            return federated_catalog, schema
+            return _CatalogContext(
+                catalog=federated_catalog,
+                database=schema,
+                # The crawled-name rewrite exists for R2RML names produced by a
+                # Glue crawler on the federated-JDBC path. It substring-strips a
+                # `{schema}_` prefix from every table name, which for a custom
+                # connector is not a no-op but a corruption: a genuine table named
+                # `sales_orders` in database `sales` would be rewritten to
+                # `orders`, a table its connector has never heard of.
+                rewrite_crawled_names=not is_custom_connector,
+            )
 
         # Glue-native path: use athenaCatalog/athenaDatabase if available
         athena_db = source.get("athenaDatabase") or source.get("glueDatabaseName") or ""
         if athena_db:
             logger.info("catalog_resolution", path="glue_native", database=athena_db, namespace=namespace)
-            return "", athena_db
+            return _CatalogContext(catalog="", database=athena_db)
 
         config = self._sources.parse_configuration(source)
         db = config.get("databaseName", "") or self._default_database
         logger.info("catalog_resolution", path="config_fallback", database=db, namespace=namespace)
-        return "", db
+        return _CatalogContext(catalog="", database=db)
