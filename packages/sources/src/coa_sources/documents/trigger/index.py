@@ -36,6 +36,26 @@ _EXTRACTION_DEFAULTS = {
 }
 
 
+def _stringify_config_value(v: object) -> object:
+    """Coerce an extraction_config value to its SFN container-override string form.
+
+    Step Functions container-override JsonPath cannot inline a JSON object or
+    array and ECS env-var values must be strings, so: bools -> lower-case
+    ``"true"``/``"false"``, lists -> JSON (only ``preferred_entity_classifications``
+    today; the container json.loads it back at boot), ints -> ``str``. Anything
+    already a string (or an unexpected type) passes through unchanged.
+
+    NOTE: bool is checked before int because ``isinstance(True, int)`` is True.
+    """
+    if isinstance(v, bool):
+        return str(v).lower()
+    if isinstance(v, list):
+        return json.dumps(v)
+    if isinstance(v, int):
+        return str(v)
+    return v
+
+
 def handler(event: dict, context: object) -> None:
     """Lambda entry-point — process one SQS record per invocation (batchSize=1)."""
     for record in event["Records"]:
@@ -52,10 +72,11 @@ def handler(event: dict, context: object) -> None:
                 **_EXTRACTION_DEFAULTS,
                 **{k: v for k, v in body.get("extraction_config", {}).items() if v is not None},
             }
-            # ECS container environment variable values must be strings.
-            # Convert booleans to lowercase string representation.
+            # ECS container environment variable values must be strings, and
+            # Step Functions container-override JsonPath cannot inline a JSON
+            # object/array — see _stringify_config_value for the per-type rules.
             ec = body["extraction_config"]
-            body["extraction_config"] = {k: str(v).lower() if isinstance(v, bool) else v for k, v in ec.items()}
+            body["extraction_config"] = {k: _stringify_config_value(v) for k, v in ec.items()}
 
             logger.info(
                 "starting_execution",

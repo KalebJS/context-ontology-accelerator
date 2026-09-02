@@ -30,12 +30,23 @@ import structlog
 from botocore.exceptions import ClientError
 from coa_common.metadata_store import SMUSClient
 from coa_common.response import api_response, iso_to_epoch
+from coa_control_plane_server.models.custom_connector_configuration import CustomConnectorConfiguration
+from coa_control_plane_server.models.glue_configuration import GlueConfiguration
 from coa_control_plane_server.models.glue_execution_engine import GlueExecutionEngine
+from coa_control_plane_server.models.jdbc_configuration import JdbcConfiguration
 from coa_control_plane_server.models.query_engine import QueryEngine
 from coa_control_plane_server.models.source_status import SourceStatus
 from coa_control_plane_server.models.source_sub_type import SourceSubType
 from coa_control_plane_server.models.source_type import SourceType
+from pydantic import ValidationError as PydanticValidationError
 
+from coa_sources.database.connectors.athena_catalog import (
+    AthenaCatalogConflictError,
+    AthenaCatalogError,
+    delete_lambda_catalog,
+    derive_catalog_name,
+    register_lambda_catalog,
+)
 from coa_sources.database.connectors.jdbc import DIRECT_QUERY_ENGINES
 from coa_sources.database.metrics import emit_metric
 
@@ -106,6 +117,61 @@ def _resolve_glue_athena_catalog(glue_config: Any) -> str:
     return _DEFAULT_ATHENA_CATALOG
 
 
+def _optional_int(value: Any) -> int | None:
+    """Coerce a DynamoDB number to ``int``, passing ``None`` through.
+
+    Needed wherever a response is built as a raw dict rather than through a Smithy
+    model. The DAO reads via boto3's resource interface, so numbers arrive as
+    ``Decimal``, and ``api_response`` serialises with ``default=str`` — so an
+    uncoerced ``Decimal`` ships as a JSON string and a typed client hands its
+    consumer a string where the schema promised a number.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("non_numeric_dynamodb_number_ignored", value=repr(value))
+        return None
+
+
+def _arn_region(arn: str) -> str:
+    """Region segment of an ARN, or ``""`` when it has no parsable one."""
+    parts = (arn or "").split(":")
+    return parts[3] if len(parts) > 5 else ""
+
+
+def _validate_custom_connector_configuration(custom_connector_config: Any) -> dict[str, Any] | None:
+    """Reject a connector ARN outside this deployment's region.
+
+    Athena can technically invoke a connector in another region when given its
+    full ARN, but we do not support that topology: the IAM grant on both the
+    discovery and serve roles is region-pinned, so a cross-region connector
+    registers fine — registration only records a name → ARN mapping — and then
+    fails every ``SHOW``/``DESCRIBE``/``SELECT`` with an AccessDenied that says
+    nothing about the region. Catching it here turns that into a 400 that names
+    the problem.
+
+    Returns an error response, or ``None`` when the configuration is usable.
+    """
+    for field, arn in (("connectorFunctionArn", custom_connector_config.connector_function_arn),):
+        if not arn:
+            continue
+        region = _arn_region(arn)
+        if region != _AWS_REGION:
+            return api_response(
+                400,
+                {
+                    "error": (
+                        f"customConnectorConfiguration.{field} must be in region '{_AWS_REGION}' "
+                        f"(got '{region or 'none'}'). Deploy the connector Lambda in "
+                        f"'{_AWS_REGION}'; cross-region connectors are not supported."
+                    )
+                },
+            )
+    return None
+
+
 def _resolve_query_engine(glue_config: Any, jdbc_config: Any) -> QueryEngine:
     """Preferred single-source execution engine for the source.
 
@@ -114,7 +180,13 @@ def _resolve_query_engine(glue_config: Any, jdbc_config: Any) -> QueryEngine:
     source opts in to Redshift Serverless (`awsdatacatalog` auto-mount) via
     ``GlueConfiguration.executionEngine`` — else Glue defaults to Athena. JDBC
     engines without a direct path also go through Athena — so serve never routes
-    to a path that doesn't exist. Multi-source queries always use Athena.
+    to a path that doesn't exist.
+
+    A custom-connector (``CUSTOM_CONNECTOR``) source passes neither config and
+    falls through to ``ATHENA``, which is correct and the only option: there is no
+    direct adapter for an arbitrary customer connector, and serve's own gate
+    (``_fetch_jdbc_source`` requires ``queryEngine == "JDBC"``) keeps it off the
+    direct route without a route-selection change.
     """
     if jdbc_config is not None:
         engine = getattr(jdbc_config.engine, "value", jdbc_config.engine) or ""
@@ -129,6 +201,42 @@ def _resolve_query_engine(glue_config: Any, jdbc_config: Any) -> QueryEngine:
     return QueryEngine.ATHENA
 
 
+def _rollback_unscanned_source(namespace_id: str, source_id: str) -> bool:
+    """Remove a source row whose scan never started; mark it recoverable if that fails.
+
+    The row is written with ``status=REGISTERED``, which is one of
+    ``SOURCE_ACTIVE_STATUSES``. So a row that survives a failed rollback is
+    genuinely stuck: DELETE returns 409, re-scan is refused (it requires
+    ``SCAN_FAILED``), namespace deletion counts it as blocking, and the scan
+    reaper never fires because no Step Functions execution was ever started —
+    leaving DynamoDB surgery as the only exit.
+
+    Falling back to ``SCAN_FAILED`` costs one extra write and makes the row both
+    deletable and re-scannable, which is the difference between a retryable
+    failure and an operator ticket.
+
+    Returns:
+        Whether the row was actually removed. The caller uses this to keep the
+        namespace source count honest: a row that survives was never counted, but
+        its eventual delete will decrement.
+    """
+    try:
+        _get_dao().delete({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
+        return True
+    except ClientError:
+        logger.exception("rollback_source_delete_failed", source_id=source_id)
+    with contextlib.suppress(ClientError):
+        _get_dao().update(
+            key={"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"},
+            update_fields={
+                "status": SourceStatus.SCAN_FAILED,
+                "errorMessage": "Source creation failed before the scan started; delete and re-create it.",
+                "updatedAt": _now_iso(),
+            },
+        )
+    return False
+
+
 def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
     """Create a DATABASE source. db_req is a CreateDatabaseSourceInput model instance."""
     name: str = db_req.name.strip()
@@ -137,8 +245,26 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
 
     glue_config = db_req.glue_configuration
     jdbc_config = db_req.jdbc_configuration
-    if not glue_config and not jdbc_config:
-        return api_response(400, {"error": "glueConfiguration or jdbcConfiguration is required"})
+    custom_connector_config = db_req.custom_connector_configuration
+    supplied = [c for c in (glue_config, jdbc_config, custom_connector_config) if c is not None]
+    if not supplied:
+        return api_response(
+            400,
+            {"error": "glueConfiguration, jdbcConfiguration or customConnectorConfiguration is required"},
+        )
+    # The config member is what selects the sub-type, so more than one is
+    # ambiguous rather than additive — silently preferring one would persist a
+    # record whose stored blob does not match its sourceSubType.
+    if len(supplied) > 1:
+        return api_response(
+            400,
+            {"error": "Provide exactly one of glueConfiguration, jdbcConfiguration or customConnectorConfiguration"},
+        )
+
+    if custom_connector_config is not None:
+        error = _validate_custom_connector_configuration(custom_connector_config)
+        if error:
+            return error
 
     # A Glue source opting into Redshift execution must name the workgroup that
     # runs its queries — the backend cannot infer which Serverless workgroup to
@@ -154,11 +280,24 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
                 {"error": "redshiftWorkgroup is required when executionEngine is REDSHIFT"},
             )
 
-    sub_type = SourceSubType.JDBC_DATABASE if jdbc_config else SourceSubType.GLUE_DATABASE
+    if jdbc_config:
+        sub_type = SourceSubType.JDBC_DATABASE
+    elif custom_connector_config:
+        sub_type = SourceSubType.CUSTOM_CONNECTOR
+    else:
+        sub_type = SourceSubType.GLUE_DATABASE
     source_id = str(uuid.uuid4())
     now = _now_iso()
 
-    config_dict = jdbc_config.to_dict() if jdbc_config else glue_config.to_dict()
+    config_dict = supplied[0].to_dict()
+
+    # We derive the Athena data-catalog name rather than letting the caller name
+    # it: catalog names are account+region-global, so a caller-chosen name would
+    # let two sources collide, and under the get-then-create guard the second
+    # would bind to the first's connector Lambda. Deriving from the source id
+    # guarantees a 1:1 source↔catalog mapping, so teardown removes only this
+    # source's catalog.
+    athena_catalog_name = derive_catalog_name(source_id) if custom_connector_config else ""
 
     item: dict[str, Any] = {
         "PK": f"NS#{namespace_id}",
@@ -173,15 +312,21 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
         # Query-layer metadata (read by serve to build the Athena request).
         # Catalog: native Glue resolves from catalogId (AwsDataCatalog for the
         # account-root catalog, else the nested catalog name); JDBC federated
-        # catalogs are nested under AwsDataCatalog. region is where Athena/the
-        # catalog live (Glue: source region; JDBC: deployment region).
+        # catalogs are nested under AwsDataCatalog. A custom connector is neither
+        # — its catalog is a top-level Lambda-backed catalog, so it names itself.
+        # region is where Athena/the catalog live (Glue: source region; JDBC and
+        # custom connector: deployment region).
         # queryable flips true once the source is actually queryable
-        # (Glue: after first scan; JDBC: after federation provisioning).
-        "athenaCatalog": (_resolve_glue_athena_catalog(glue_config) if glue_config else _DEFAULT_ATHENA_CATALOG),
+        # (Glue: after first scan; JDBC and custom connector: after the
+        # post-discovery federation step).
+        "athenaCatalog": (
+            athena_catalog_name
+            if custom_connector_config
+            else (_resolve_glue_athena_catalog(glue_config) if glue_config else _DEFAULT_ATHENA_CATALOG)
+        ),
         # Preferred single-source execution engine. Direct JDBC only when a
         # direct dialect exists for the engine (PostgreSQL/Redshift today),
-        # otherwise Athena. Serve overrides to Athena for any multi-source
-        # query (Athena federates as the staging engine).
+        # otherwise Athena.
         "queryEngine": _resolve_query_engine(glue_config, jdbc_config),
         "region": (glue_config.region if glue_config else _AWS_REGION),
         "queryable": False,
@@ -195,6 +340,21 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
     # JDBC federated sources resolve schema per-table, so no single database.
     if glue_config:
         item["athenaDatabase"] = glue_config.database_name
+    # A custom-connector source is scoped to exactly ONE database inside its
+    # catalog (`databaseName` is required), and serve pins the query Database to a
+    # single value, so record it up front rather than waiting for discovery to
+    # report it. That also gives serve the right namespace when a scan discovers
+    # zero tables — otherwise it would fall back to a hardcoded default that has
+    # nothing to do with this connector.
+    if custom_connector_config:
+        item["athenaDatabase"] = custom_connector_config.database_name
+        # Serve routes on the PRESENCE of this attribute, so it is what makes the
+        # source addressable at all. Written before the scan because `queryable`
+        # is False until discovery succeeds, and serve skips a not-queryable
+        # source's catalog — note it retargets the query at its default catalog
+        # rather than refusing it, which is pre-existing behaviour shared by every
+        # sub-type, so this attribute is not what gates the pre-scan window.
+        item["athenaDataCatalogName"] = athena_catalog_name
     # Persist the metadata enrichment toggle whenever the caller specifies it
     # (true or false). Records that omit the field — legacy records, or
     # programmatic callers that don't set it — fall back to "enabled" at read
@@ -217,6 +377,47 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
     except ClientError:
         logger.exception("ddb_put_failed", source_id=source_id)
         return api_response(500, {"error": "Internal server error"})
+
+    # Register the Athena data catalog for a custom-connector source.
+    #
+    # AFTER the DynamoDB put, deliberately: every delete path — source delete,
+    # namespace-deletion cascade, the rollback below — keys off the source record,
+    # so a catalog registered before the record would be orphaned with nothing
+    # left able to find it. Registering after means the worst case is a recorded
+    # source with no catalog, which the rollback here removes and a retry
+    # re-creates cleanly.
+    #
+    # It has to happen at onboarding rather than in the scan pipeline: discovery
+    # for this sub-type runs Athena SQL against the catalog, so the catalog must
+    # already exist when the pipeline's first (discovery) step runs.
+    if custom_connector_config:
+        try:
+            register_lambda_catalog(
+                catalog_name=athena_catalog_name,
+                connector_function_arn=custom_connector_config.connector_function_arn,
+            )
+        except AthenaCatalogError as exc:
+            logger.exception(
+                "athena_data_catalog_registration_failed",
+                source_id=source_id,
+                catalog_name=athena_catalog_name,
+            )
+            # A read timeout after Athena committed the create is
+            # indistinguishable from a failure, so the catalog may exist. The
+            # source row is about to go away and it is the only handle on that
+            # name, so delete the catalog before dropping the row — otherwise it
+            # is orphaned with nothing able to find it again.
+            #
+            # NOT on a conflict: that catalog demonstrably belongs to something
+            # else, and deleting it would destroy a resource we did not create.
+            if not isinstance(exc, AthenaCatalogConflictError):
+                with contextlib.suppress(AthenaCatalogError):
+                    delete_lambda_catalog(catalog_name=athena_catalog_name)
+            _rollback_unscanned_source(namespace_id, source_id)
+            return api_response(
+                500,
+                {"error": "Failed to register the Athena data catalog for the connector. Please retry."},
+            )
 
     # Increment the namespace sourceCount. Best-effort: counter drift
     # is undesirable but must never block source creation.
@@ -267,12 +468,21 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
             logger.exception("sqs_send_failed", source_id=source_id)
             with contextlib.suppress(ClientError):
                 _get_scan_dao().delete({"PK": f"SRC#{source_id}", "SK": scan_job_sk})
-            source_deleted = False
-            try:
-                _get_dao().delete({"PK": f"NS#{namespace_id}", "SK": f"SRC#{source_id}"})
-                source_deleted = True
-            except ClientError:
-                logger.warning("rollback_source_delete_failed", source_id=source_id)
+            # The catalog is registered by now, and the source row is about to go
+            # away — which is what every delete path keys off — so remove it here
+            # or it is orphaned for good. Best-effort: a failure is logged and the
+            # 500 still returned, because failing the rollback must not turn a
+            # retryable create failure into an unretryable one.
+            if custom_connector_config:
+                try:
+                    delete_lambda_catalog(catalog_name=athena_catalog_name)
+                except AthenaCatalogError:
+                    logger.exception(
+                        "rollback_athena_data_catalog_delete_failed",
+                        source_id=source_id,
+                        catalog_name=athena_catalog_name,
+                    )
+            source_deleted = _rollback_unscanned_source(namespace_id, source_id)
             # Only adjust the counter if the source row was actually removed, else
             # we'd drift the count. adjust_* is itself best-effort, so the 500 below
             # is always returned.
@@ -1417,11 +1627,28 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
         "sourceId": source_id,
         "status": scan_item.get("status"),
         "scanType": scan_item.get("scanType"),
-        "tablesDiscovered": scan_item.get("tablesDiscovered"),
-        "columnsDiscovered": scan_item.get("columnsDiscovered"),
+        # Coerced to int, because this response is assembled as a raw dict with no
+        # Smithy model in the path to do it for us. The DAO reads through boto3's
+        # resource interface, so a DynamoDB number arrives as a Decimal, and
+        # api_response serialises with `json.dumps(..., default=str)` — which turns
+        # Decimal("2") into the JSON STRING "2". A typed client then deserialises a
+        # numeric member from a string and hands the consumer something that fails
+        # `typeof x === "number"`. Every other numeric field on this response has
+        # always had that defect; it was invisible only because nothing type-checked
+        # them. See _item_to_summary, which gets this right via the same int() call.
+        "tablesDiscovered": _optional_int(scan_item.get("tablesDiscovered")),
+        "columnsDiscovered": _optional_int(scan_item.get("columnsDiscovered")),
         "startedAt": iso_to_epoch(scan_item.get("startedAt")),
         "completedAt": iso_to_epoch(scan_item.get("completedAt")),
         "errorMessage": scan_item.get("errorMessage"),
+        # A scan can SUCCEED while individual tables were unreadable, leaving those
+        # tables with no columns, no comments, and no declared keys — and enrichment
+        # then generates descriptions over the gap. Unsurfaced, the result is
+        # indistinguishable from a complete one, so a reviewer would approve a
+        # silently incomplete ontology. Both keys drop out below when absent, so a
+        # clean scan's response is unchanged.
+        "tablesFailed": _optional_int(scan_item.get("tablesFailed")),
+        "failedTables": scan_item.get("failedTables"),
     }
     return api_response(200, {k: v for k, v in response.items() if v is not None})
 
@@ -1429,6 +1656,110 @@ def _handle_get_scan_job(namespace_id: str, source_id: str, job_id: str) -> dict
 # ---------------------------------------------------------------------------
 # UPDATE METADATA
 # ---------------------------------------------------------------------------
+
+
+def _validate_configuration_blob(config_key: str, blob: Any) -> dict[str, Any] | None:
+    """Validate a configuration blob against its Smithy model.
+
+    Returns an error response, or ``None`` when the blob is valid. Validating here
+    rather than trusting the caller is what keeps a stored blob loadable by the GET
+    path, which reconstructs it through the same model.
+    """
+    models = {
+        "glueConfiguration": GlueConfiguration,
+        "jdbcConfiguration": JdbcConfiguration,
+        "customConnectorConfiguration": CustomConnectorConfiguration,
+    }
+    try:
+        models[config_key].model_validate(blob)
+    except PydanticValidationError as exc:
+        return api_response(400, {"error": f"Invalid {config_key}: {exc.errors()[0]['msg']}"})
+    return None
+
+
+def _apply_custom_connector_configuration_update(
+    item: dict[str, Any],
+    new_config: dict[str, Any],
+    update_fields: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Guard and extend an ``customConnectorConfiguration`` update.
+
+    Two things in this blob are not free to change, because the stored blob is not
+    the only place their value lives:
+
+    * **The connector Lambda ARNs.** They are baked into the Athena data catalog's
+      ``Parameters`` at source-create, and nothing re-registers it afterwards — the
+      post-discovery step only flips ``queryable``. Accepting a new ARN would
+      return 200, report the new ARN on every read path, and leave the catalog
+      still invoking the OLD Lambda. Discovery and serve would then keep answering
+      from the previous connector with no error anywhere, which is the worst shape
+      a wrong answer can take: every surface agrees, and all of them are wrong.
+      Rejected rather than re-bound, because re-binding is delete-then-create with
+      no transaction around it — a failure between the two would leave the source
+      with no catalog at all, which is worse than refusing the edit.
+    * **``databaseName``.** Serve does not read ``athenaDatabase`` first — it prefers
+      ``discoveredSchemas[0]`` and falls back to ``athenaDatabase`` only when that
+      list is empty (``coa_serve.clients.athena._resolve_catalog_and_database``).
+      Discovery writes ``discoveredSchemas`` on every successful scan, so for a
+      scanned source the fallback is dead and writing ``athenaDatabase`` retargets
+      nothing: the update returns 200 while serve keeps querying the old database.
+      A re-scan cannot reconcile it either — ``_handle_rescan`` 409s any ``DATABASE``
+      source that is not ``SCAN_FAILED``.
+      Rejected rather than made to work, because the stored tables, their approved
+      metadata and the induced ontology all describe the OLD database. Retargeting
+      the query would leave every one of them describing something this source no
+      longer points at.
+
+    Both are rejected only when the value CHANGES; an update echoing the stored value
+    is allowed, so a client may PUT the whole configuration back to edit another field
+    in it. The members stay in the request shape because ``CustomConnectorConfiguration`` is
+    shared with create, where they are required — a member cannot be dropped for one
+    operation only.
+
+    Returns an error response, or ``None`` when the update may proceed.
+    """
+    try:
+        stored = json.loads(item.get("configuration") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        stored = {}
+
+    for field in ("connectorFunctionArn",):
+        stored_arn = stored.get(field) or None
+        new_arn = new_config.get(field) or None
+        if stored_arn != new_arn:
+            return api_response(
+                400,
+                {
+                    "error": (
+                        f"customConnectorConfiguration.{field} cannot be changed after creation: the connector "
+                        f"Lambda is bound into the registered Athena data catalog, which this update does not "
+                        f"re-register. Delete the source and create it again with the new ARN."
+                    )
+                },
+            )
+
+    # Compare against the blob as well as the top-level attribute: a source created
+    # before athenaDatabase was mirrored, or one whose mirror write was lost, would
+    # otherwise read as "changed" for an unchanged value and reject a valid edit.
+    stored_database = stored.get("databaseName") or item.get("athenaDatabase") or None
+    new_database = new_config.get("databaseName") or None
+    if new_database and stored_database and new_database != stored_database:
+        return api_response(
+            400,
+            {
+                "error": (
+                    "customConnectorConfiguration.databaseName cannot be changed after creation: the discovered "
+                    "tables, their approved metadata and the induced ontology all describe the current database, "
+                    "and this update does not re-discover them. Delete the source and create it again against "
+                    f"{new_database!r}."
+                )
+            },
+        )
+    # Still mirror the value when the attribute is absent, so a source whose
+    # athenaDatabase was never written gets one without changing where it points.
+    if new_database and not item.get("athenaDatabase"):
+        update_fields["athenaDatabase"] = new_database
+    return None
 
 
 def _handle_update_metadata(event: dict[str, Any], namespace_id: str, source_id: str) -> dict[str, Any]:
@@ -1468,28 +1799,59 @@ def _handle_update_metadata(event: dict[str, Any], namespace_id: str, source_id:
     if "metadataEnrichmentEnabled" in body and body["metadataEnrichmentEnabled"] is not None:
         update_fields["metadataEnrichmentEnabled"] = bool(body["metadataEnrichmentEnabled"])
 
-    glue_config = body.get("glueConfiguration")
-    jdbc_config = body.get("jdbcConfiguration")
-    if glue_config and jdbc_config:
-        return api_response(400, {"error": "Cannot update both glueConfiguration and jdbcConfiguration"})
-    if glue_config:
-        from coa_control_plane_server.models.glue_configuration import GlueConfiguration
-        from pydantic import ValidationError as PydanticValidationError
-
-        try:
-            GlueConfiguration.model_validate(glue_config)
-        except PydanticValidationError as exc:
-            return api_response(400, {"error": f"Invalid glueConfiguration: {exc.errors()[0]['msg']}"})
-        update_fields["configuration"] = json.dumps(glue_config)
-    if jdbc_config:
-        from coa_control_plane_server.models.jdbc_configuration import JdbcConfiguration
-        from pydantic import ValidationError as PydanticValidationError
-
-        try:
-            JdbcConfiguration.model_validate(jdbc_config)
-        except PydanticValidationError as exc:
-            return api_response(400, {"error": f"Invalid jdbcConfiguration: {exc.errors()[0]['msg']}"})
-        update_fields["configuration"] = json.dumps(jdbc_config)
+    # The stored `configuration` blob is untyped, so sourceSubType is the only
+    # thing that says which shape it holds — which means an update must write the
+    # shape the row's own sub-type declares. Writing a Glue config onto an
+    # CUSTOM_CONNECTOR row (or vice versa) leaves a record whose blob and sub-type
+    # disagree, and GET then 500s on the mismatched required members rather than
+    # mislabelling anything.
+    config_key_for_sub_type = {
+        SourceSubType.GLUE_DATABASE.value: "glueConfiguration",
+        SourceSubType.JDBC_DATABASE.value: "jdbcConfiguration",
+        SourceSubType.CUSTOM_CONNECTOR.value: "customConnectorConfiguration",
+    }
+    supplied_config_keys = [k for k in config_key_for_sub_type.values() if body.get(k)]
+    if len(supplied_config_keys) > 1:
+        return api_response(
+            400,
+            {"error": f"Cannot update more than one configuration at a time: {', '.join(supplied_config_keys)}"},
+        )
+    if supplied_config_keys:
+        supplied_key = supplied_config_keys[0]
+        stored_sub_type = item.get("sourceSubType", "")
+        expected_key = config_key_for_sub_type.get(stored_sub_type)
+        if expected_key is None and stored_sub_type:
+            # Recognised-but-unmapped, or an unknown value: there is no shape to
+            # check against, and guessing would be how the blob and the sub-type
+            # come apart.
+            return api_response(
+                400,
+                {"error": f"Configuration update is not supported for sub-type '{stored_sub_type}'"},
+            )
+        if expected_key is None:
+            # No sub-type at all — a legacy row. It already fails GET validation on
+            # that member alone, so refusing the update here would only remove a
+            # way to work with it. Accept whatever was supplied, as before.
+            logger.warning("update_configuration_without_sub_type", source_id=source_id, config_key=supplied_key)
+            expected_key = supplied_key
+        if supplied_key != expected_key:
+            return api_response(
+                400,
+                {
+                    "error": (
+                        f"This source is a {item['sourceSubType']} source, so its configuration must be "
+                        f"supplied as '{expected_key}', not '{supplied_key}'."
+                    )
+                },
+            )
+        error = _validate_configuration_blob(supplied_key, body[supplied_key])
+        if error:
+            return error
+        if supplied_key == "customConnectorConfiguration":
+            error = _apply_custom_connector_configuration_update(item, body[supplied_key], update_fields)
+            if error:
+                return error
+        update_fields["configuration"] = json.dumps(body[supplied_key])
 
     if not update_fields:
         return api_response(400, {"error": "No updatable fields provided"})

@@ -257,7 +257,7 @@ structure GlueConfiguration {
 }
 
 /// Custom Athena Query Federation connector configuration — the
-/// ATHENA_CONNECTOR sub-type. The connector is a Lambda the customer authors
+/// CUSTOM_CONNECTOR sub-type. The connector is a Lambda the customer authors
 /// and deploys in their own account, which this service registers as a
 /// Lambda-backed Athena data catalog in its own account; both discovery and
 /// serve-time queries run through Athena against that catalog.
@@ -266,20 +266,23 @@ structure GlueConfiguration {
 /// there is no catalogId and no cross-account IAM role to assume: the customer
 /// grants access on the connector Lambda's own resource policy instead. There
 /// is also no region member — the connector must live in this deployment's
-/// region (see metadataFunctionArn).
-structure AthenaConfiguration {
-    /// ARN of the connector Lambda that handles metadata requests — and record
-    /// requests too when recordFunctionArn is omitted, i.e. a composite
-    /// handler. The ARN's region must equal this deployment's own region,
-    /// because Athena can only invoke a data-source connector co-located with
-    /// the query.
+/// region (see connectorFunctionArn).
+structure CustomConnectorConfiguration {
+    /// ARN of the connector Lambda. ONE Lambda serves both metadata and record
+    /// requests — what Athena calls a composite handler. The ARN's region must
+    /// equal this deployment's own region, because Athena can only invoke a
+    /// data-source connector co-located with the query.
+    ///
+    /// Athena also accepts a split metadata/record PAIR of Lambdas, which this
+    /// member was once one half of. The pair is deliberately not modelled: the
+    /// reference connector and the CDK template customers are given both deploy a
+    /// single composite Lambda, so a second ARN asked every customer to reason
+    /// about a distinction almost none of them would make — and an ARN placed in
+    /// the wrong one of two adjacent members fails at query time rather than at
+    /// onboarding. Restoring it is purely additive (one optional member, plus the
+    /// record-function catalog parameter) if a customer ever needs the split form.
     @required
-    metadataFunctionArn: LambdaFunctionArn
-
-    /// ARN of a separate record-handler Lambda, for a connector deployed as a
-    /// split metadata/record pair. Omit for the common composite connector, in
-    /// which case metadataFunctionArn serves both paths.
-    recordFunctionArn: LambdaFunctionArn
+    connectorFunctionArn: LambdaFunctionArn
 
     /// The single database inside the connector's catalog that this source
     /// exposes. Exactly one database is resolved per source, so a connector
@@ -527,11 +530,57 @@ structure ExtractionConfig {
     /// Whether to extract propositions from chunks.
     enablePropositionExtraction: Boolean
 
+    /// Explicit entity-class vocabulary handed to the extraction LLM. When
+    /// non-empty, overrides both graphrag's hardcoded news/finance defaults
+    /// AND the corpus-inferred fallback — the exact labels supplied here are
+    /// the ones the extractor uses to type entities. Case-sensitive, spaced
+    /// (e.g. "Policy", "Claim", "Loss Ratio"). Leave empty to fall back to
+    /// inferEntityClassifications.
+    preferredEntityClassifications: EntityClassificationList
+
+    /// Whether to derive the entity-class vocabulary from this corpus at ingest
+    /// start rather than inheriting graphrag's hardcoded news/finance defaults
+    /// ("Company", "Sports Team", "Creative Work", …). Ignored when
+    /// preferredEntityClassifications is set. Defaults to true.
+    inferEntityClassifications: Boolean
+
+    /// Whether to route every PDF through Amazon Textract's AnalyzeDocument
+    /// with TABLES feature (instead of unstructured.partition_pdf strategy=
+    /// "fast", which does not detect tables). Preserves row/column structure
+    /// through preprocessing so a statistical table survives as facts, not
+    /// prose. Costs materially more per page than DetectDocumentText; leave
+    /// off for prose-dominant corpora. Defaults to false.
+    enableTableExtraction: Boolean
+
+    /// Chunk size (in tokens) for the SentenceSplitter that splits staged
+    /// documents into extraction/embedding units. Larger values keep more
+    /// context (a full table row + header, a full policy clause) in one
+    /// chunk. **`0` means "use the graphrag-toolkit default (256)"** — the
+    /// sentinel that survives the state-machine → ECS env-var pipe without
+    /// a special-cased missing-field state. Set a positive value (e.g. 1024
+    /// for dense/tabular corpora) to override.
+    @range(min: 0, max: 4096)
+    chunkSize: Integer
+
+    /// Overlap (in tokens) between consecutive chunks. **`0` means "use the
+    /// graphrag-toolkit default (25)"**. Ignored unless chunkSize > 0.
+    @range(min: 0, max: 512)
+    chunkOverlap: Integer
+
     /// Whether to delete previous document versions on re-ingest.
     deletePrevVersions: Boolean
 
     bedrockModelArn: BedrockModelArn
 }
+
+/// A user-supplied list of entity classifications. Members must be non-empty
+/// after trim; empty strings are dropped by the API.
+list EntityClassificationList {
+    member: EntityClassification
+}
+
+@length(min: 1, max: 128)
+string EntityClassification
 
 list S3PrefixList {
     member: S3Prefix
@@ -617,7 +666,7 @@ enum SourceSubType {
     /// Structured: customer-authored AWS Athena Query Federation SDK connector
     /// (a Lambda in the customer's account), registered as a Lambda-backed
     /// Athena data catalog and queried through Athena
-    ATHENA_CONNECTOR
+    CUSTOM_CONNECTOR
 
     /// Unstructured: S3 bucket prefix
     S3
@@ -763,7 +812,7 @@ structure CreateSourceInput {
 }
 
 /// Database source creation fields.
-/// Exactly one of glueConfiguration, jdbcConfiguration or athenaConfiguration
+/// Exactly one of glueConfiguration, jdbcConfiguration or customConnectorConfiguration
 /// must be provided — it selects the sub-type.
 structure CreateDatabaseSourceInput {
     @required
@@ -776,8 +825,8 @@ structure CreateDatabaseSourceInput {
     jdbcConfiguration: JdbcConfiguration
 
     /// Custom Athena federation connector config. Required for the
-    /// ATHENA_CONNECTOR sub-type.
-    athenaConfiguration: AthenaConfiguration
+    /// CUSTOM_CONNECTOR sub-type.
+    customConnectorConfiguration: CustomConnectorConfiguration
 
     /// Enable AI-powered business metadata enrichment (descriptions,
     /// synonyms, glossary terms, tags). Defaults to true. When false the
@@ -869,8 +918,8 @@ structure DatabaseSourceDetail {
 
     jdbcConfiguration: JdbcConfiguration
 
-    /// Populated for the ATHENA_CONNECTOR sub-type; absent otherwise.
-    athenaConfiguration: AthenaConfiguration
+    /// Populated for the CUSTOM_CONNECTOR sub-type; absent otherwise.
+    customConnectorConfiguration: CustomConnectorConfiguration
 
     /// Whether AI-powered business metadata enrichment runs for this source.
     /// Set at creation time and persisted with the source record. When false
@@ -911,17 +960,23 @@ structure DatabaseSourceDetail {
     /// for examples.
     glueConnectionName: String
 
-    /// Name of the managed Glue federated catalog registered for this
-    /// source. Read-only and system-managed. Populated only for JDBC
-    /// sub-types (null for S3/Iceberg). It is a nested catalog under
-    /// Athena's default `AwsDataCatalog`, so query it as:
+    /// Name of the Athena data catalog registered for this source. Read-only
+    /// and system-managed, derived from `{resource-prefix}ds_{sourceId}`. Null
+    /// for S3/Iceberg-backed Glue databases, which are queried through Athena's
+    /// native `AwsDataCatalog`.
     ///
-    ///     SELECT * FROM "AwsDataCatalog"."<athenaDataCatalogName>"."<schema>"."<table>"
+    /// The addressing differs by sub-type, because the two catalogs are not the
+    /// same kind of object:
+    ///
+    /// - JDBC sub-types: a managed Glue federated catalog, NESTED under
+    ///   `AwsDataCatalog`, and equal to `glueConnectionName`. Query it as
+    ///   `AwsDataCatalog.<athenaDataCatalogName>.<schema>.<table>`.
+    /// - CUSTOM_CONNECTOR: a LAMBDA-type Athena catalog bound to the customer's
+    ///   connector Lambda. It is a TOP-LEVEL catalog, not nested, so query it as
+    ///   `<athenaDataCatalogName>.<databaseName>.<table>`.
     ///
     /// Run the query inside the namespace's Athena workgroup (see
-    /// NamespaceDetail.athenaWorkgroupName). This catalog name equals
-    /// the `glueConnectionName`; both are derived from
-    /// `{resource-prefix}ds_{sourceId}`.
+    /// NamespaceDetail.athenaWorkgroupName).
     athenaDataCatalogName: String
 }
 
@@ -1122,7 +1177,7 @@ operation UpdateSourceMetadata {
 
         jdbcConfiguration: JdbcConfiguration
 
-        athenaConfiguration: AthenaConfiguration
+        customConnectorConfiguration: CustomConnectorConfiguration
 
         /// Whether AI-powered metadata enrichment runs for this source.
         metadataEnrichmentEnabled: Boolean
@@ -1606,4 +1661,26 @@ structure GetSourceScanJobOutput {
 
     /// Error message if the scan job failed.
     errorMessage: String
+
+    /// Number of tables the scan listed but could not read.
+    ///
+    /// Absent when none failed, rather than zero, so it can be used directly to
+    /// filter for degraded scans. A non-zero value means the scan SUCCEEDED but
+    /// is incomplete: those tables carry no columns, no comments, and no declared
+    /// keys, and AI enrichment will have generated descriptions over the gap — so
+    /// a reviewer must not read the result as complete. Only connectors that read
+    /// each table separately can report this; one that returns a table's schema in
+    /// the same call that lists it cannot partially fail.
+    tablesFailed: Integer
+
+    /// The unreadable tables as `database.table`, capped in length.
+    ///
+    /// A signal for diagnosis, not an inventory — `tablesFailed` is the exact
+    /// figure and this list may be shorter than it.
+    failedTables: FailedTableList
+}
+
+/// Qualified `database.table` names of tables a scan listed but could not read.
+list FailedTableList {
+    member: String
 }

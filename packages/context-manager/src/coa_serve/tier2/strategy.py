@@ -42,10 +42,38 @@ class StrategyOption(StrEnum):
     NL_TO_SQL = "nl_to_sql"  # Only NL→SQL / identifies nl_to_sql strategy
     ONTOP_FIRST = "ontop_first"  # Sequential: Ontop → NL→SQL fallback
     NL_TO_SQL_FIRST = "nl_to_sql_first"  # Sequential: NL→SQL → Ontop fallback
-    AGENTIC = "agentic"  # Only the bounded tool-use agent (opt-in; never a fallback)
+    DEEP_REASONING = "deep-reasoning"  # Only the bounded tool-use agent (opt-in; never a fallback)
 
 
 DEFAULT_STRATEGY = StrategyOption.NL_TO_SQL_FIRST
+
+LEGACY_STRATEGY_ALIASES = {"agentic": StrategyOption.DEEP_REASONING}
+"""Pre-rename ``options.strategy`` spellings still accepted.
+
+``deep-reasoning`` was called ``agentic`` before the rebrand. Dropping the old
+spelling would not 400 — it would fall out of
+``Orchestrator._EXPLICIT_STRATEGY_OPTIONS`` and silently resolve to
+``DEFAULT_STRATEGY``, running the cheap single-shot fallback chain while the caller
+believed it had pinned the agent. Remove once callers are migrated.
+
+Note ``options.mode="deep-reasoning"`` (``coa_serve.mode``) is a DIFFERENT knob on a
+different axis: it replaces the whole T1→T2→T3 cascade with the Tier-3 reasoning
+loop, whereas this selects which Tier-2 engine answers a structured query. Both were
+called "agentic" before the rebrand and both are now "deep reasoning"; ``mode``
+versus ``strategy`` is what distinguishes them.
+"""
+
+
+def normalize_strategy_option(value: object) -> object:
+    """Map a pre-rename ``options.strategy`` spelling onto its current member.
+
+    Returns ``value`` unchanged when it is not a known legacy spelling, including
+    for non-string input — ``options`` is caller-controlled, so an unhashable value
+    must not raise here.
+    """
+    if isinstance(value, str):
+        return LEGACY_STRATEGY_ALIASES.get(value, value)
+    return value
 
 
 # ── Data classes ─────────────────────────────────────────────────────────
@@ -226,17 +254,21 @@ class StructuredQueryTier:
 
     def _strategies_for(self, option: str) -> list[StructuredQueryStrategy]:
         """Select and order strategies based on the option."""
-        if option == StrategyOption.AGENTIC:
+        # Normalize here as well as in the orchestrator: a direct caller (test,
+        # benchmark harness) reaching resolve(option=...) with the pre-rename
+        # spelling must still get the agent, not the fallback chain.
+        option = normalize_strategy_option(option)
+        if option == StrategyOption.DEEP_REASONING:
             # Opt-in only: the agent runs solely when explicitly pinned, never as a
             # fallback in any of the sequential/parallel paths below.
-            return [s for s in self._strategies if s.name == StrategyOption.AGENTIC]
+            return [s for s in self._strategies if s.name == StrategyOption.DEEP_REASONING]
         if option == StrategyOption.ONTOP:
             return [s for s in self._strategies if s.name == StrategyOption.ONTOP]
         if option == StrategyOption.NL_TO_SQL:
             return [s for s in self._strategies if s.name == StrategyOption.NL_TO_SQL]
-        # AGENTIC is never part of a fallback chain — it is an expensive tool-use
+        # DEEP_REASONING is never part of a fallback chain — it is an expensive tool-use
         # loop that must not fire implicitly when a cheaper strategy misses.
-        fallback = [s for s in self._strategies if s.name != StrategyOption.AGENTIC]
+        fallback = [s for s in self._strategies if s.name != StrategyOption.DEEP_REASONING]
         if option == StrategyOption.ONTOP_FIRST:
             # Stable sort: matching strategy moves to front; others keep insertion order.
             return sorted(fallback, key=lambda s: s.name != StrategyOption.ONTOP)

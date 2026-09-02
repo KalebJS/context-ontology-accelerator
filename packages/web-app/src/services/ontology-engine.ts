@@ -11,6 +11,7 @@
  * Gateway → Lambda proxy in `infra/bin/app.ts` and
  * `packages/ontology-engine/.../api_proxy_handler.py`.
  */
+import type { OntologyRecord } from "@coa/control-plane-client";
 import type { ApiClient } from "../components/ApiClientProvider";
 
 // ─── Types ─────────────────────────────────────────────────────────────
@@ -89,32 +90,19 @@ export interface AcceptResult {
   status: string;
 }
 
-export interface OntologyRecord {
-  ontology_id: string;
-  uri: string;
-  title: string;
-  description?: string;
-  ontology_type: string;
-  format: string;
-  domain_tags: string[];
-  // Counts are ``int | None`` on the backend OntologyResponse — null while a
-  // freshly-uploaded ontology is still being parsed/embedded (ingest pending).
-  class_count: number | null;
-  property_count: number | null;
-  axiom_count: number | null;
-  embedding_count: number | null;
-  // Ingest lifecycle marker set by the async parse/embed worker:
-  // ``pending`` (ingesting) → ``ok`` (ready) | ``parse_error`` (failed).
-  // Omitted on legacy rows persisted before this field existed.
-  parse_status?: string | null;
-  // Registry-row lifecycle status. Set to ``deleting`` while an async delete
-  // tears down the ontology's graph + embeddings; the row is removed once
-  // teardown completes. Absent for normal, fully-materialized ontologies.
-  status?: string | null;
-  graph_uri?: string;
-  created_at: string;
-  updated_at: string;
-}
+/**
+ * Re-exported from the generated client rather than hand-declared.
+ *
+ * There used to be a second, snake_case `OntologyRecord` here. It drifted from
+ * the Smithy contract (which declares camelCase inside a `{ontologies: [...]}`
+ * envelope), and because the two shared a name the mismatch was invisible: the
+ * generated client deserialised `out.ontologies` to `undefined`, callers turned
+ * that into `[]`, and features silently did nothing. `ListOntologies` now
+ * serialises the declared shape (see the `by_alias` route in
+ * `catalog/routers/ontologies.py` and `test_list_ontologies_wire_shape.py`), so
+ * one type covers both the REST helper below and the react-query hook.
+ */
+export type { OntologyRecord };
 
 export interface GraphSearchHit {
   uri: string;
@@ -537,6 +525,22 @@ export async function compileConstraints(
 
 // ─── Ontology Catalog ──────────────────────────────────────────────────
 
+/**
+ * A listed ontology whose id is known to be present.
+ *
+ * Smithy marks `ontologyId` `@required`, but the TypeScript generator types
+ * every member as `T | undefined`, so that guarantee doesn't survive codegen.
+ * Narrowing once at the boundary is what keeps callers from coercing with
+ * `?? ""` at each use site — an id-less row cannot be linked to, keyed in a
+ * table, or deleted, so it is unusable rather than merely awkward.
+ */
+export type ListedOntology = OntologyRecord & { ontologyId: string };
+
+/** Runtime narrowing for {@link ListedOntology}; see the type's note. */
+export function hasOntologyId(o: OntologyRecord): o is ListedOntology {
+  return typeof o.ontologyId === "string" && o.ontologyId.length > 0;
+}
+
 export async function listOntologies(
   apiClient: ApiClient,
   namespace: string,
@@ -545,10 +549,14 @@ export async function listOntologies(
     domain_tag?: string;
     limit?: number;
   },
-): Promise<OntologyRecord[]> {
-  return apiClient.get<OntologyRecord[]>(
+): Promise<ListedOntology[]> {
+  // Unwraps the `{ontologies: [...]}` envelope the Smithy contract declares.
+  // `?? []` guards a legacy deployment still emitting a bare array: callers get
+  // an empty list rather than a crash mid-render.
+  const out = await apiClient.get<{ ontologies?: OntologyRecord[] }>(
     `/namespaces/${encodeURIComponent(namespace)}/ontologies${qs(opts ?? {})}`,
   );
+  return (out.ontologies ?? []).filter(hasOntologyId);
 }
 
 /**

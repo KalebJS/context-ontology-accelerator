@@ -37,7 +37,10 @@
 #      grants, etc.) are RemovalPolicy.RETAIN in namespace-stack.ts so
 #      CFN never attempts (and fails) to delete them itself; this step
 #      is what actually tears the whole tree down.
-#   6. `cdk destroy --all`, then verify no stacks remain.
+#   6. Delete every connector stack. They belong to separate CDK apps in
+#      connectors/, so `cdk destroy --all` below never sees them, and left
+#      behind each keeps a spill bucket and a customer-managed KMS key alive.
+#   7. `cdk destroy --all`, then verify no stacks remain.
 #
 # Mirrors deploy.sh's context resolution so `make destroy-dev` tears
 # down exactly what `make deploy-dev` created.
@@ -71,6 +74,17 @@ CONTEXT="--context env=$ENV"
 [ -n "${SCL_PREFIX:-}" ]      && CONTEXT="$CONTEXT --context resource_prefix=$SCL_PREFIX"
 [ -n "${SCL_PROJECT_TAG:-}" ] && CONTEXT="$CONTEXT --context project_tag=$SCL_PROJECT_TAG"
 [ -n "${SCL_VPC_ID:-}" ]      && CONTEXT="$CONTEXT --context vpc_id=$SCL_VPC_ID"
+
+# Statuses that mean "this stack still exists and owns resources". Shared by step 6's connector
+# sweep and step 7's verification so the two cannot disagree — they previously both omitted
+# ROLLBACK_FAILED and UPDATE_ROLLBACK_FAILED, and step 7 also omitted CREATE_FAILED, so a stack
+# stuck in any of them was reported as gone.
+# REVIEW_IN_PROGRESS is deliberately absent: cdk-dryrun-mr creates change-set-only stacks in that
+# state on every MR, and the verification would report them as failed teardowns.
+CFN_LIVE_STATUSES="CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE \
+CREATE_FAILED UPDATE_FAILED DELETE_FAILED ROLLBACK_FAILED UPDATE_ROLLBACK_FAILED \
+IMPORT_COMPLETE IMPORT_ROLLBACK_COMPLETE IMPORT_ROLLBACK_FAILED"
+CONNECTOR_DELETE_WAIT_MAX_SECONDS="${SCL_CONNECTOR_DELETE_WAIT_MAX_SECONDS:-600}"
 
 ENI_WAIT_MAX_SECONDS="${SCL_ENI_WAIT_MAX_SECONDS:-600}"
 ENI_POLL_INTERVAL_SECONDS=15
@@ -110,7 +124,7 @@ arn_id() { echo "$1" | awk -F/ '{print $NF}'; }
 
 # ── Step 1: Delete AgentCore Runtimes ──────────────────────────────────────
 echo ""
-echo "=== Step 1/6: Delete AgentCore Runtimes ==="
+echo "=== Step 1/7: Delete AgentCore Runtimes ==="
 
 RUNTIME_ARNS=()
 for PARAM in "${SSM_PREFIX}/serve/runtime-arn" "${SSM_PREFIX}/mcp/runtime-arn"; do
@@ -162,7 +176,7 @@ fi
 
 # ── Step 2: Wait for AgentCore ENIs to detach ─────────────────────────────
 echo ""
-echo "=== Step 2/6: Wait for AgentCore Runtime ENIs to detach ==="
+echo "=== Step 2/7: Wait for AgentCore Runtime ENIs to detach ==="
 
 if [ ${#AGENTCORE_SG_IDS[@]} -eq 0 ]; then
   ok "No AgentCore security groups found — nothing to wait on."
@@ -222,7 +236,7 @@ fi
 
 # ── Step 3: Delete VKG ECS services and wait ──────────────────────────────
 echo ""
-echo "=== Step 3/6: Delete VKG cluster services ==="
+echo "=== Step 3/7: Delete VKG cluster services ==="
 
 VKG_CLUSTER="${STACK_PREFIX}-vkg-cluster"
 SERVICE_ARNS=()
@@ -307,7 +321,7 @@ fi
 # ── Step 4: Delete Cloud Map services (CFN owns the namespace, not the
 # services registered inside it) ──────────────────────────────────────────
 echo ""
-echo "=== Step 4/6: Delete Cloud Map services ==="
+echo "=== Step 4/7: Delete Cloud Map services ==="
 
 # Scoped by namespace NAME, which carries the prefix and env
 # (`${this.prefixed("services")}.local` in network-stack.ts). Service names
@@ -404,7 +418,7 @@ fi
 # assets, and asset types that CFN's own DeleteDomain/DeleteProject calls
 # cannot clear on their own) ──────────────────────────────────────────────
 echo ""
-echo "=== Step 5/6: Delete DataZone domain ==="
+echo "=== Step 5/7: Delete DataZone domain ==="
 
 DOMAIN_ID=$(aws ssm get-parameter --name "${SSM_PREFIX}/smus/domain-id" \
   --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || echo "")
@@ -496,9 +510,63 @@ else
   done
 fi
 
-# ── Step 5: cdk destroy --all, then verify ────────────────────────────────
+# ── Step 6: Delete the example connector stack ─────────────────────────────
+# Not part of the CDK app `cdk destroy --all` covers — it is a separate app in a
+# separate workspace (connectors/), deployed by scripts/deploy-example-connector.sh.
+# Left behind it would keep a spill bucket and a customer-managed KMS key alive, and
+# its name matches the ${STACK_PREFIX}-* filter the verification below uses, so a
+# teardown that ignored it would report an unexplained leftover stack.
+#
+# Deleted through CloudFormation rather than `cdk destroy`: that would synthesize the
+# connector's app, which needs COA's serve and discovery role ARNs from SSM. At teardown
+# those parameters may already be gone, so synth would fail and block the whole step.
+# Everything the stack owns is RemovalPolicy.DESTROY, including the auto-delete of the
+# spill bucket's objects, so CloudFormation clears it unaided.
 echo ""
-echo "=== Step 6/6: cdk destroy --all ==="
+echo "=== Step 6/7: Delete connector stacks ==="
+
+# Matched by SUFFIX, not named one by one: every connector's stack ends in -coa-connector
+# (CONNECTOR_FUNCTION_SUFFIX in connectors/cdk-toolkit), so a second connector added later is
+# torn down without editing this script. Naming only the example's stack meant any other
+# connector survived, then failed the verification below on every subsequent run.
+CONNECTOR_STACKS=$(aws cloudformation list-stacks --region "$REGION" \
+  --stack-status-filter $CFN_LIVE_STATUSES \
+  --query "StackSummaries[?starts_with(StackName, '${STACK_PREFIX}-') && ends_with(StackName, '-coa-connector')].StackName" \
+  --output text 2>/dev/null || echo "")
+
+if [ -z "$CONNECTOR_STACKS" ]; then
+  ok "No connector stacks (${STACK_PREFIX}-*-coa-connector) — nothing to delete"
+else
+  for CONNECTOR_STACK in $CONNECTOR_STACKS; do
+    echo "Deleting $CONNECTOR_STACK..."
+    if aws cloudformation delete-stack --stack-name "$CONNECTOR_STACK" --region "$REGION"; then
+      # Bounded like every other wait here. The default waiter is 120 x 30s = 60 minutes per
+      # stack, and a ROLLBACK_FAILED stack will never finish, so an unbounded wait would eat the
+      # rest of the job's budget having printed only "Deleting ...".
+      WAIT_ATTEMPTS=$(( ${CONNECTOR_DELETE_WAIT_MAX_SECONDS:-600} / 30 ))
+      [ "$WAIT_ATTEMPTS" -lt 1 ] && WAIT_ATTEMPTS=1
+      if aws cloudformation wait stack-delete-complete \
+        --stack-name "$CONNECTOR_STACK" --region "$REGION" \
+        --waiter-config "Delay=30,MaxAttempts=${WAIT_ATTEMPTS}" 2>/dev/null; then
+        ok "Deleted $CONNECTOR_STACK"
+      else
+        # Best-effort, like every other step here: the verification at the end reports it
+        # as a leftover stack, which is the right place for an operator to see it.
+        warn "$CONNECTOR_STACK did not finish deleting — see the verification below."
+      fi
+    else
+      warn "delete-stack failed for $CONNECTOR_STACK — continuing."
+    fi
+  done
+fi
+# A connector deployed with a custom FUNCTION_NAME_PREFIX carries a name this filter cannot
+# predict, so it is not covered. Say so rather than implying the account is clean.
+echo "Note: only ${STACK_PREFIX}-* connector stacks are covered. A connector deployed with a"
+echo "custom FUNCTION_NAME_PREFIX must be destroyed by hand."
+
+# ── Step 7: cdk destroy --all, then verify ────────────────────────────────
+echo ""
+echo "=== Step 7/7: cdk destroy --all ==="
 echo "CDK context: $CONTEXT"
 pnpm --filter coa-infra exec cdk destroy --all $CONTEXT --force
 DESTROY_EXIT=$?
@@ -507,7 +575,7 @@ echo ""
 echo "=== Post-destroy verification ==="
 LIST_STACKS_ERR=$(mktemp)
 REMAINING=$(aws cloudformation list-stacks --region "$REGION" \
-  --stack-status-filter DELETE_FAILED CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE \
+  --stack-status-filter $CFN_LIVE_STATUSES \
   --query "StackSummaries[?starts_with(StackName, '${STACK_PREFIX}-')].[StackName,StackStatus]" \
   --output text 2>"$LIST_STACKS_ERR")
 LIST_STACKS_EXIT=$?

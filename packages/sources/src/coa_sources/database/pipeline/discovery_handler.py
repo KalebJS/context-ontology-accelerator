@@ -59,6 +59,11 @@ except ValueError:
     )
     MAX_TABLES_PER_SOURCE = 0
 
+# Cap on the failed-table names stored on the scan-job record. A DynamoDB item is
+# limited to 400 KB and this list is a signal, not an inventory — the count next
+# to it is always exact.
+_MAX_REPORTED_FAILED_TABLES = 50
+
 _ds_dao: DynamoDBDAO | None = None
 _scan_dao: DynamoDBDAO | None = None
 _ns_dao: DynamoDBDAO | None = None
@@ -140,7 +145,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         # are discovered directly via their driver dialect (see connectors/dialects.py).
         connector = get_connector(source_type)
         scan_start = time.monotonic()
-        metadata = _discover(connector, config, datasource_id, namespace_id, source_type)
+        metadata = _discover(connector, config, datasource_id, namespace_id, source_type, item)
 
         # Guardrail: fail fast on sources too large to register within the
         # Lambda timeout. Discovery is cheap; the per-table DataZone asset write
@@ -165,17 +170,36 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         )
 
         # Update scan job with discovery counts
+        scan_job_update: dict[str, Any] = {
+            "tablesDiscovered": len(metadata.tables),
+            "columnsDiscovered": metadata.total_columns,
+        }
+        # A connector that reads each table separately can lose a table without
+        # failing the scan, and that table reaches review with no columns, no
+        # comments, and no keys while enrichment backfills AI descriptions over
+        # the gap. Recording it on the scan job makes the degradation visible to
+        # the steward reviewing the result rather than only to whoever reads the
+        # logs. The names are capped because this is a signal, not an inventory —
+        # the count is the part that must always be right.
+        if metadata.failed_tables:
+            scan_job_update["tablesFailed"] = len(metadata.failed_tables)
+            scan_job_update["failedTables"] = metadata.failed_tables[:_MAX_REPORTED_FAILED_TABLES]
         _get_scan_dao().update(
             key=scan_job_key,
-            update_fields={
-                "tablesDiscovered": len(metadata.tables),
-                "columnsDiscovered": metadata.total_columns,
-            },
+            update_fields=scan_job_update,
             condition="attribute_exists(PK)",
         )
 
         emit_metric("ScanDuration", (time.monotonic() - scan_start) * 1000, "Milliseconds", SourceType=source_type)
         emit_metric("TablesDiscovered", len(metadata.tables), "Count", SourceType=source_type)
+        if metadata.failed_tables:
+            emit_metric("TablesFailed", len(metadata.failed_tables), "Count", SourceType=source_type)
+            logger.warning(
+                "Discovery completed with %d unreadable table(s) for %s: %s",
+                len(metadata.failed_tables),
+                datasource_id,
+                metadata.failed_tables[:_MAX_REPORTED_FAILED_TABLES],
+            )
 
         # Update source record with discovery results
         from datetime import datetime
@@ -241,10 +265,23 @@ def _discover(
     datasource_id: str,
     namespace_id: str,
     source_type: str = "",
+    source_item: dict[str, Any] | None = None,
 ) -> DiscoveredMetadata:
-    """Run discovery with the given connector and configuration."""
+    """Run discovery with the given connector and configuration.
+
+    ``source_item`` is the sources-table record. It carries attributes that are
+    not part of the stored ``configuration`` blob — notably the Athena data
+    catalog name a custom-connector source is registered under, which the control
+    plane derives at create time rather than accepting from the caller.
+    """
+    item = source_item or {}
     connector_config = {
         "database_name": config["databaseName"],
+        # Custom-connector (CUSTOM_CONNECTOR) sources only. Read from the source
+        # record, not from `config`: the name is derived by the control plane and
+        # stored as a top-level attribute, so it is not in the configuration blob
+        # the caller supplied. Other connectors ignore it.
+        "athena_data_catalog_name": item.get("athenaDataCatalogName", ""),
         "catalog_id": config.get("catalogId", ""),
         "region": config.get("region", AWS_REGION),
         "cross_account_role_arn": config.get("crossAccountRoleArn"),

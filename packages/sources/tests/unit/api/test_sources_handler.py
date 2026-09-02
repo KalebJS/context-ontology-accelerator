@@ -483,6 +483,88 @@ class TestDocumentDetailMetrics:
         assert "chunksEmbed" not in detail
         assert detail["chunksLLM"] == 42
 
+    def test_extraction_config_chunk_ints_coerced_from_decimal(self):
+        """chunkSize/chunkOverlap are Smithy Integer, but DDB stores them as
+        Number and boto3 reads them back as Decimal -> "0.0" in JSON, violating the
+        contract. _build_document_detail must coerce them back to int so 0 stays 0
+        ("use toolkit default") and 1024 stays 1024, not 1024.0."""
+        from decimal import Decimal
+
+        from coa_sources.api.sources_handler import _build_document_detail
+
+        item = {
+            "sourceType": "DOCUMENTS",
+            "name": "docs",
+            "status": "READY",
+            "filesTotal": 3,
+            "extractionConfig": {
+                "inferEntityClassifications": True,
+                "chunkSize": Decimal("0"),
+                "chunkOverlap": Decimal("0"),
+            },
+        }
+        detail = _build_document_detail(item, None)
+        assert detail is not None
+        ec = detail["extractionConfig"]
+        assert ec["chunkSize"] == 0
+        assert isinstance(ec["chunkSize"], int) and not isinstance(ec["chunkSize"], bool)
+        assert ec["chunkOverlap"] == 0
+        assert type(ec["chunkOverlap"]) is int
+
+        # non-zero override survives as a plain int, not a float
+        item["extractionConfig"]["chunkSize"] = Decimal("1024")
+        item["extractionConfig"]["chunkOverlap"] = Decimal("128")
+        ec2 = _build_document_detail(item, None)
+        assert ec2 is not None
+        ec2 = ec2["extractionConfig"]
+        assert ec2["chunkSize"] == 1024 and type(ec2["chunkSize"]) is int
+        assert ec2["chunkOverlap"] == 128 and type(ec2["chunkOverlap"]) is int
+
+    def test_extraction_config_uncoercible_int_field_logs_and_survives(self, monkeypatch):
+        """If DDB somehow holds a non-numeric chunk value, coercion must not raise
+        (it would 500 the read). The raw value is left in place and a warning is
+        logged. Regression guard for the review finding on the former
+        contextlib.suppress()."""
+        from coa_sources.api import sources_handler
+        from coa_sources.api.sources_handler import _build_document_detail
+
+        warnings: list = []
+        monkeypatch.setattr(
+            sources_handler.logger,
+            "warning",
+            lambda *a, **k: warnings.append((a, k)),
+        )
+
+        item = {
+            "sourceType": "DOCUMENTS",
+            "name": "docs",
+            "status": "READY",
+            "filesTotal": 1,
+            "extractionConfig": {"chunkSize": "not-a-number"},
+        }
+        detail = _build_document_detail(item, None)
+        assert detail is not None
+        # value preserved (not dropped), no exception raised
+        assert detail["extractionConfig"]["chunkSize"] == "not-a-number"
+        assert len(warnings) == 1
+
+    def test_extraction_config_absent_chunk_fields_untouched(self):
+        """When chunk fields aren't stored, coercion is a no-op and doesn't inject them."""
+        from coa_sources.api.sources_handler import _build_document_detail
+
+        item = {
+            "sourceType": "DOCUMENTS",
+            "name": "docs",
+            "status": "READY",
+            "filesTotal": 3,
+            "extractionConfig": {"inferEntityClassifications": True},
+        }
+        detail = _build_document_detail(item, None)
+        assert detail is not None
+        ec = detail["extractionConfig"]
+        assert "chunkSize" not in ec
+        assert "chunkOverlap" not in ec
+
 
 @pytest.mark.unit
 class TestDatabaseDetailEngineProjection:
@@ -544,7 +626,7 @@ _JDBC_CONFIG = {
     "databaseName": "claims",
 }
 _ATHENA_CONFIG = {
-    "metadataFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:widgets-connector",
+    "connectorFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:widgets-connector",
     "databaseName": "widgets",
 }
 
@@ -555,7 +637,7 @@ class TestDatabaseDetailConfigurationDispatch:
     `configuration` column, so sourceSubType is the only thing that says which
     response member the blob belongs under — and the shapes are not
     interchangeable. GlueConfiguration requires catalogId + region, so reporting
-    an ATHENA_CONNECTOR config as Glue fails GetSourceOutput validation and
+    a CUSTOM_CONNECTOR config as Glue fails GetSourceOutput validation and
     turns GET into a 500 rather than a cosmetic mislabel.
     """
 
@@ -574,13 +656,13 @@ class TestDatabaseDetailConfigurationDispatch:
         )
         return _parse_response(aws_env["handler"](event, None))
 
-    def test_athena_connector_config_returned_under_athena_key(self, aws_env):
-        """The regression: an ATHENA_CONNECTOR config read as Glue 500s."""
-        status, body = self._get(aws_env, "ATHENA_CONNECTOR", _ATHENA_CONFIG)
+    def test_custom_connector_config_returned_under_athena_key(self, aws_env):
+        """The regression: a CUSTOM_CONNECTOR config read as Glue 500s."""
+        status, body = self._get(aws_env, "CUSTOM_CONNECTOR", _ATHENA_CONFIG)
 
         assert status == 200
         details = body["databaseDetails"]
-        assert details["athenaConfiguration"] == _ATHENA_CONFIG
+        assert details["customConnectorConfiguration"] == _ATHENA_CONFIG
         assert "glueConfiguration" not in details
         assert "jdbcConfiguration" not in details
 
@@ -590,7 +672,7 @@ class TestDatabaseDetailConfigurationDispatch:
         assert status == 200
         details = body["databaseDetails"]
         assert details["glueConfiguration"] == _GLUE_CONFIG
-        assert "athenaConfiguration" not in details
+        assert "customConnectorConfiguration" not in details
 
     def test_jdbc_config_returned_under_jdbc_key(self, aws_env):
         status, body = self._get(aws_env, "JDBC_DATABASE", _JDBC_CONFIG)
@@ -599,7 +681,7 @@ class TestDatabaseDetailConfigurationDispatch:
         details = body["databaseDetails"]
         assert details["jdbcConfiguration"]["host"] == _JDBC_CONFIG["host"]
         assert "glueConfiguration" not in details
-        assert "athenaConfiguration" not in details
+        assert "customConnectorConfiguration" not in details
 
     # A row whose sourceSubType is absent or unrecognised cannot be asserted
     # end-to-end: GetSourceOutput (and SourceSummary) declare sourceSubType
@@ -622,7 +704,7 @@ class TestDatabaseDetailConfigurationDispatch:
 
         assert detail is not None
         assert detail["glueConfiguration"] == _GLUE_CONFIG
-        assert "athenaConfiguration" not in detail
+        assert "customConnectorConfiguration" not in detail
 
     def test_every_detail_configuration_member_is_reachable(self):
         """Fail loudly when a configuration member is added to the response
@@ -643,7 +725,7 @@ class TestDatabaseDetailConfigurationDispatch:
         new DATABASE sub-type that reuses an existing one — say an
         AURORA_DATABASE carrying a JdbcConfiguration — adds no member, so it
         would pass that check while its blob lands in the Glue fallback and GET
-        500s exactly as ATHENA_CONNECTOR did. Every sub-type must therefore be
+        500s exactly as CUSTOM_CONNECTOR did. Every sub-type must therefore be
         either mapped or explicitly declared as belonging to DOCUMENTS.
         """
         from coa_control_plane_server.models.source_sub_type import SourceSubType
@@ -666,13 +748,13 @@ class TestListIsUnaffectedBySubType:
     """SourceSummary carries no configuration member (only the sourceSubType
     string), so LIST projects every sub-type cleanly and needs no dispatch."""
 
-    def test_athena_connector_source_lists_without_configuration(self, aws_env):
+    def test_custom_connector_source_lists_without_configuration(self, aws_env):
         _put_source(
             aws_env["table"],
             _NAMESPACE_ID,
             "src-athena",
             name="widgets-connector",
-            source_sub_type="ATHENA_CONNECTOR",
+            source_sub_type="CUSTOM_CONNECTOR",
             configuration=_ATHENA_CONFIG,
         )
         event = _make_event("GET", _LIST_RESOURCE, path_params={"namespaceId": _NAMESPACE_ID})
@@ -680,8 +762,8 @@ class TestListIsUnaffectedBySubType:
 
         assert status == 200
         item = body["items"][0]
-        assert item["sourceSubType"] == "ATHENA_CONNECTOR"
-        for field in ("glueConfiguration", "jdbcConfiguration", "athenaConfiguration", "configuration"):
+        assert item["sourceSubType"] == "CUSTOM_CONNECTOR"
+        for field in ("glueConfiguration", "jdbcConfiguration", "customConnectorConfiguration", "configuration"):
             assert field not in item
 
 
@@ -730,3 +812,15 @@ class TestGetSourceMetricsBestEffort:
         doc_details = body.get("documentDetails", {})
         for field in ("documentsProcessed", "chunksLLM", "chunksEmbed", "chunksGraph"):
             assert field not in doc_details
+
+
+class TestPresignS3ClientConfig:
+    """Regression: presign client must use SigV4. A no-Config client falls back
+    to the deprecated SigV2 presigner in pre-2014 regions and can't presign at
+    all in SigV4-only regions (us-east-2, eu-*, ap-*, ca-*, me-*, af-*)."""
+
+    def test_get_s3_pins_sigv4(self):
+        from coa_sources.api import sources_handler
+
+        sources_handler._s3 = None  # reset cold-start singleton
+        assert sources_handler._get_s3().meta.config.signature_version == "s3v4"

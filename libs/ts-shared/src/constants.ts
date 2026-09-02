@@ -60,6 +60,52 @@ export const DEFAULT_VOCAB_PREFIX = BRAND;
 export const DEFAULT_EVENT_SOURCE_PREFIX = BRAND;
 
 /**
+ * Tag a custom connector's Lambda function must carry to be invocable.
+ *
+ * The Athena-mediated `lambda:InvokeFunction` grant must span every account, since the
+ * connector lives in the customer's, so the ARN cannot be pinned. A resource tag is the
+ * scoping attribute: `aws:ResourceTag` is evaluated natively by Lambda with no per-resource
+ * opt-in, and unlike a name convention it cannot be matched by accident — an untagged
+ * function is simply unreachable.
+ *
+ * `BRAND`, not the deployment's `resource_prefix`: the customer applies this in their own
+ * account and cannot know which prefix a given deployment uses, so the token must be
+ * identical everywhere.
+ */
+export const CONNECTOR_TAG_KEY = `${BRAND}:connector`;
+export const CONNECTOR_TAG_VALUE = "true";
+
+/**
+ * Tag the KMS key encrypting a connector's spill bucket must carry.
+ *
+ * SSE-KMS on the spill bucket is REQUIRED, which is what makes this a real control rather
+ * than a partial one: every spilled read must then pass `kms:Decrypt` against a key this tag
+ * allowlists. Without the mandate the check is skipped for the common case (SSE-S3, or no
+ * bucket encryption) and spill authorization rests on the key prefix alone.
+ */
+export const CONNECTOR_SPILL_KMS_TAG_KEY = `${BRAND}:connector-spill`;
+export const CONNECTOR_SPILL_KMS_TAG_VALUE = "true";
+
+/**
+ * Key prefix a connector must spill under, as a glob for IAM resource patterns.
+ *
+ * Spill is read by Athena using the querying principal's forward-access-session credentials,
+ * so the grant cannot be pinned to a bucket — the customer owns it. The key prefix bounds it
+ * instead, which lets the grant span every account INCLUDING this one.
+ *
+ * Deliberately NOT a tag, unlike the Lambda and KMS grants above. S3 does support tag-based
+ * authorization for general purpose buckets (ABAC), and it would work here, but it requires
+ * ABAC to be enabled per bucket via a separate API call — and until it is, the condition is
+ * not evaluated, so the grant silently fails to match and the customer sees a bare 403 on
+ * their first spilled query. It would also make Orion's CDK template effectively mandatory,
+ * since a connector deployed by any other means will not have ABAC on. See the LLD (§5.1)
+ * for the full rationale and the conditions under which to revisit.
+ *
+ * Concrete form: `connectors/{connectorId}/spills/...`, e.g. `connectors/mock/spills/`.
+ */
+export const CONNECTOR_SPILL_KEY_GLOB = "connectors/*/spills/*";
+
+/**
  * DataZone form/asset type name prefix (PascalCase).
  * Form: `{dzTypePrefix}TableMetadata`, Asset: `{dzTypePrefix}RelationalTable`.
  */

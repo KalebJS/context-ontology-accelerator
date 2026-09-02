@@ -7,6 +7,16 @@
 # with "tsc: not found". Keep it out of the nx project graph.
 external-docs
 
+# connectors/ is the same case as external-docs above: a workspace of its own with
+# its own pnpm-lock.yaml, deliberately outside the root pnpm workspace so the samples
+# still build once a customer copies them out. Its three package.json files
+# (coa-connectors, coa-connector-cdk, coa-example-connector-cdk) are otherwise
+# discovered by nx's package-json plugin, and `nx affected`/`run-many` then runs their
+# build/test/synth targets in a checkout where they have no node_modules — "cdk: not
+# found", "node_modules missing, did you mean to install?". The connectors have their
+# own CI jobs (unit-test-{main,mr}-connectors), which install inside connectors/ first.
+connectors
+
 # Agent git worktrees live INSIDE the repo at .claude/worktrees/<id>. Each is a
 # full checkout, so nx's package-json plugin discovers duplicate projects
 # (infra, web-app, ts-shared, root) and fails the graph with
