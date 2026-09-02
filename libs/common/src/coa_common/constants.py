@@ -181,6 +181,25 @@ DEFAULT_USE_BATCH_INFERENCE: str = "false"
 DEFAULT_ENABLE_VERSIONING: str = "true"
 DEFAULT_ENABLE_PROPOSITION_EXTRACTION: str = "true"
 DEFAULT_DELETE_PREV_VERSIONS: str = "false"
+# Infer the entity-class vocabulary from the corpus itself instead of inheriting
+# graphrag-toolkit's hardcoded DEFAULT_ENTITY_CLASSIFICATIONS ('Company',
+# 'Sports Team', 'Creative Work', …), which is a news/finance list that steers
+# extraction to the wrong domain on anything else.
+DEFAULT_INFER_ENTITY_CLASSIFICATIONS: str = "true"
+# Explicit vocabulary is empty by default → falls back to infer (or, in a future
+# change, resolves from the namespace's accepted ontology). Represented as an
+# empty JSON array in env vars so the state-machine → ECS pipe can carry it
+# without needing a new SFN field type.
+DEFAULT_PREFERRED_ENTITY_CLASSIFICATIONS_JSON: str = "[]"
+# Table extraction OFF by default. When ON, PDFs route through Textract's
+# AnalyzeDocument(TABLES) instead of unstructured strategy="fast" — preserves
+# row/column structure at materially higher per-page cost. Opt in per source.
+DEFAULT_ENABLE_TABLE_EXTRACTION: str = "false"
+# Chunk size / overlap — 0 means "use the toolkit default" (SentenceSplitter
+# chunk_size=256, chunk_overlap=25). Setting a positive integer overrides. The
+# graphrag benchmark harness pins 1024 for dense/tabular corpora.
+DEFAULT_CHUNK_SIZE: int = 0
+DEFAULT_CHUNK_OVERLAP: int = 0
 
 # Complete extraction config defaults — single source of truth for all handlers.
 EXTRACTION_DEFAULTS: dict[str, object] = {
@@ -189,6 +208,11 @@ EXTRACTION_DEFAULTS: dict[str, object] = {
     "enable_versioning": DEFAULT_ENABLE_VERSIONING.lower() == "true",
     "enable_proposition_extraction": DEFAULT_ENABLE_PROPOSITION_EXTRACTION.lower() == "true",
     "delete_prev_versions": DEFAULT_DELETE_PREV_VERSIONS.lower() == "true",
+    "infer_entity_classifications": DEFAULT_INFER_ENTITY_CLASSIFICATIONS.lower() == "true",
+    "preferred_entity_classifications": [],
+    "enable_table_extraction": DEFAULT_ENABLE_TABLE_EXTRACTION.lower() == "true",
+    "chunk_size": DEFAULT_CHUNK_SIZE,
+    "chunk_overlap": DEFAULT_CHUNK_OVERLAP,
 }
 
 

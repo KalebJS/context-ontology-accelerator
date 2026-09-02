@@ -32,11 +32,12 @@ export interface HistoryMessage {
 
 /**
  * Execution mode, sent as ``options.mode``. Orthogonal to the tier cascade:
- * ``agentic`` runs the multi-step reasoning loop; ``standard`` runs the
+ * ``deep-reasoning`` runs the multi-step reasoning loop; ``standard`` runs the
  * single-shot retriever. Absent lets serve use its deployment default, which
- * ships as standard (TIER3_STRATEGY=lexical-baseline) — so agentic is opt-in.
+ * ships as standard (TIER3_STRATEGY=lexical-baseline) — so deep reasoning is
+ * opt-in.
  */
-export type ExecutionMode = "agentic" | "standard";
+export type ExecutionMode = "deep-reasoning" | "standard";
 
 /** Session summary for history sidebar listing. */
 export interface SessionSummary {

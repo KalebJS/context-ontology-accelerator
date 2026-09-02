@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>dev.coa</groupId>
+    <artifactId>connectors</artifactId>
+    <version>1.0.0</version>
+  </parent>
+
+  <artifactId>example-connector</artifactId>
+  <packaging>jar</packaging>
+  <name>Example connector</name>
+
+  <!-- This is the whole pom of a connector: the toolkit, JUnit if you write tests, and the
+       shade plugin with no configuration - the parent supplies its version and settings.
+       Copy it when adding your own. -->
+  <dependencies>
+    <dependency>
+      <groupId>dev.coa</groupId>
+      <artifactId>coa-connector-toolkit</artifactId>
+    </dependency>
+
+    <!-- Tests must NOT construct the handlers: MetadataHandler/RecordHandler build S3,
+         Athena and Secrets Manager clients in their constructors, so instantiating one in a
+         unit test needs credentials and a region. Everything worth asserting lives in
+         ExampleCatalog and ExampleTable for exactly that reason. -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

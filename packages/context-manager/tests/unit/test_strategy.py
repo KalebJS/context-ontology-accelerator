@@ -20,10 +20,12 @@ import pytest
 from coa_serve.exceptions import AccessDeniedError, NoResultError
 from coa_serve.orchestrator import Orchestrator
 from coa_serve.tier2.strategy import (
+    LEGACY_STRATEGY_ALIASES,
     StrategyContext,
     StrategyOption,
     StrategyResult,
     StructuredQueryTier,
+    normalize_strategy_option,
 )
 from coa_serve.trace import TraceCollector
 
@@ -588,6 +590,23 @@ class TestResolveStrategySelection:
         assert Orchestrator._resolve_strategy_selection({"strategy": "best"}, None) == "best"
         assert Orchestrator._resolve_strategy_selection({"strategy": "ontop_first"}, None) == "ontop_first"
         assert Orchestrator._resolve_strategy_selection({"strategy": "nl_to_sql_first"}, None) == "nl_to_sql_first"
+        assert Orchestrator._resolve_strategy_selection({"strategy": "deep-reasoning"}, None) == "deep-reasoning"
+
+    def test_deprecated_agentic_pin_resolves_to_deep_reasoning(self):
+        """The pre-rename spelling must still resolve to an explicit pin.
+
+        This is the silent-downgrade guard. Unlike ``options.mode``, an unknown
+        ``options.strategy`` does NOT 400 — it drops out of
+        ``_EXPLICIT_STRATEGY_OPTIONS`` and returns ``DEFAULT_STRATEGY``, so without
+        the alias a caller pinning ``"agentic"`` would quietly run the cheap
+        nl_to_sql_first chain and never reach the agent.
+        """
+        assert Orchestrator._resolve_strategy_selection({"strategy": "agentic"}, None) == "deep-reasoning"
+        assert Orchestrator._has_explicit_strategy({"strategy": "agentic"}) is True
+
+    def test_unknown_strategy_is_not_an_explicit_pin(self):
+        assert Orchestrator._has_explicit_strategy({"strategy": "turbo"}) is False
+        assert Orchestrator._resolve_strategy_selection({"strategy": "turbo"}, None) == "nl_to_sql_first"
 
     def test_tier_override_2_maps_to_default_strategy(self):
         assert Orchestrator._resolve_strategy_selection({}, 2) == "nl_to_sql_first"
@@ -770,33 +789,54 @@ class TestOrchestratorModelValidation:
 
 @pytest.mark.unit
 class TestAgenticStrategySelection:
-    """The AGENTIC arm is opt-in: it runs ONLY when pinned, never as a fallback."""
+    """The DEEP_REASONING arm is opt-in: it runs ONLY when pinned, never as a fallback."""
 
     def _tier(self):
         return StructuredQueryTier(
             strategies=[
                 _make_strategy(StrategyOption.ONTOP),
                 _make_strategy(StrategyOption.NL_TO_SQL),
-                _make_strategy(StrategyOption.AGENTIC),
+                _make_strategy(StrategyOption.DEEP_REASONING),
             ]
         )
 
-    def test_agentic_pin_selects_only_agentic(self):
-        picked = self._tier()._strategies_for(StrategyOption.AGENTIC)
-        assert [s.name for s in picked] == [StrategyOption.AGENTIC]
+    def test_deep_reasoning_pin_selects_only_deep_reasoning(self):
+        picked = self._tier()._strategies_for(StrategyOption.DEEP_REASONING)
+        assert [s.name for s in picked] == [StrategyOption.DEEP_REASONING]
 
-    def test_agentic_excluded_from_nl_to_sql_first_fallback(self):
+    def test_deprecated_agentic_pin_still_selects_the_agent(self):
+        """The pre-rename spelling must not fall through to the fallback chain.
+
+        Fails if the alias is dropped: ``"agentic"`` stops matching any branch in
+        ``_strategies_for`` and lands on ``fallback``, which deliberately EXCLUDES
+        the agent — so a caller pinning it would silently get ontop + nl_to_sql
+        instead, with no error.
+        """
+        picked = self._tier()._strategies_for("agentic")
+        assert [s.name for s in picked] == [StrategyOption.DEEP_REASONING]
+
+    def test_strategy_values_are_wire_stable(self):
+        """These strings are the public API (options.strategy); pinning guards a rename."""
+        assert StrategyOption.DEEP_REASONING == "deep-reasoning"
+        assert LEGACY_STRATEGY_ALIASES == {"agentic": StrategyOption.DEEP_REASONING}
+
+    def test_normalize_tolerates_non_string_input(self):
+        """``options`` is caller-controlled; an unhashable value must not raise."""
+        assert normalize_strategy_option(["explore_graph"]) == ["explore_graph"]
+        assert normalize_strategy_option(None) is None
+
+    def test_deep_reasoning_excluded_from_nl_to_sql_first_fallback(self):
         picked = self._tier()._strategies_for(StrategyOption.NL_TO_SQL_FIRST)
         names = [s.name for s in picked]
-        assert StrategyOption.AGENTIC not in names
+        assert StrategyOption.DEEP_REASONING not in names
         assert names[0] == StrategyOption.NL_TO_SQL  # matching strategy moves to front
 
-    def test_agentic_excluded_from_ontop_first_fallback(self):
+    def test_deep_reasoning_excluded_from_ontop_first_fallback(self):
         picked = self._tier()._strategies_for(StrategyOption.ONTOP_FIRST)
         names = [s.name for s in picked]
-        assert StrategyOption.AGENTIC not in names
+        assert StrategyOption.DEEP_REASONING not in names
         assert names[0] == StrategyOption.ONTOP
 
-    def test_agentic_excluded_from_best(self):
+    def test_deep_reasoning_excluded_from_best(self):
         picked = self._tier()._strategies_for(StrategyOption.BEST)
-        assert StrategyOption.AGENTIC not in [s.name for s in picked]
+        assert StrategyOption.DEEP_REASONING not in [s.name for s in picked]

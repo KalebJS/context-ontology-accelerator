@@ -178,3 +178,61 @@ class TestExtractionConfigNormalization:
         index.handler(_make_event(_make_record(body)), None)
         call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
         assert call_input["extraction_config"]["extraction_mode"] == "continuous"
+
+    @patch.object(index, "sfn_client")
+    def test_new_extraction_config_fields_stringified_correctly(self, mock_sfn):
+        """list → JSON string, int → str, bool → lower — Step Functions
+        container-override JsonPath cannot inline non-string types.
+        """
+        body = {
+            **_VALID_BODY,
+            "extraction_config": {
+                "preferred_entity_classifications": ["Policy", "Claim", "Loss Ratio"],
+                "enable_table_extraction": True,
+                "chunk_size": 1024,
+                "chunk_overlap": 50,
+            },
+        }
+        index.handler(_make_event(_make_record(body)), None)
+        call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
+        ec = call_input["extraction_config"]
+        # JSON-encoded list, decodable by graph_build.py.
+        assert ec["preferred_entity_classifications"] == '["Policy", "Claim", "Loss Ratio"]'
+        assert json.loads(ec["preferred_entity_classifications"]) == ["Policy", "Claim", "Loss Ratio"]
+        assert ec["enable_table_extraction"] == "true"
+        assert ec["chunk_size"] == "1024"
+        assert ec["chunk_overlap"] == "50"
+
+    @patch.object(index, "sfn_client")
+    def test_new_extraction_config_defaults(self, mock_sfn):
+        """Empty preferred list defaults to "[]" and integers default to "0"
+        so the state-machine JsonPath expressions never see a missing key.
+        """
+        index.handler(_make_event(_make_record(_VALID_BODY)), None)
+        call_input = json.loads(mock_sfn.start_execution.call_args.kwargs["input"])
+        ec = call_input["extraction_config"]
+        assert ec["preferred_entity_classifications"] == "[]"
+        assert ec["enable_table_extraction"] == "false"
+        assert ec["chunk_size"] == "0"
+        assert ec["chunk_overlap"] == "0"
+
+
+class TestStringifyConfigValue:
+    """Direct unit tests for the extracted _stringify_config_value helper."""
+
+    def test_bool_checked_before_int(self):
+        # isinstance(True, int) is True, so bool MUST be handled first —
+        # otherwise True would stringify to "1" instead of "true".
+        assert index._stringify_config_value(True) == "true"
+        assert index._stringify_config_value(False) == "false"
+
+    def test_list_json_encoded(self):
+        assert index._stringify_config_value(["A", "B"]) == '["A", "B"]'
+
+    def test_int_stringified(self):
+        assert index._stringify_config_value(1024) == "1024"
+        assert index._stringify_config_value(0) == "0"
+
+    def test_string_and_other_passthrough(self):
+        assert index._stringify_config_value("already") == "already"
+        assert index._stringify_config_value(None) is None

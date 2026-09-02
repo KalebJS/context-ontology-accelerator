@@ -111,12 +111,16 @@ def check_neptune():
     body = json.loads(resp["Payload"].read())
     if body.get("statusCode", 0) != 200:
         raise Exception(f"HTTP {body.get('statusCode')}")
-    ontologies = json.loads(body["body"]) if isinstance(body["body"], str) else body["body"]
+    parsed = json.loads(body["body"]) if isinstance(body["body"], str) else body["body"]
+    # ListOntologies returns a camelCase {"ontologies": [...]} envelope. Accept a
+    # bare array too, so the doctor still reports against an older deployment
+    # instead of failing on the tool rather than the service it is checking.
+    ontologies = parsed.get("ontologies") or [] if isinstance(parsed, dict) else parsed
     if not ontologies:
         raise Exception("No ontology published for this namespace")
     ont = ontologies[0]
-    classes = ont.get("class_count", 0)
-    properties = ont.get("property_count", 0)
+    classes = ont.get("classCount", ont.get("class_count", 0))
+    properties = ont.get("propertyCount", ont.get("property_count", 0))
     return f"{classes} classes, {properties} properties published"
 
 
