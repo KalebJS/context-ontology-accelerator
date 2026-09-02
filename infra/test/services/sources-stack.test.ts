@@ -206,6 +206,121 @@ describe("SourcesStack", () => {
     });
   });
 
+  describe("Discovery role — custom Athena federation connectors", () => {
+    /** IAM statements attached to the db-connector (discovery) Lambda's role. */
+    function discoveryStatements(): any[] {
+      const fn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((f: any) =>
+        String(f.Properties?.FunctionName ?? "").endsWith(
+          "sources-db-connector",
+        ),
+      );
+      expect(fn).toBeDefined();
+      const roleId = (fn as any).Properties.Role["Fn::GetAtt"][0];
+      return Object.values(template.findResources("AWS::IAM::Policy"))
+        .filter((p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === roleId),
+        )
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+    }
+
+    // Discovery runs SHOW/DESCRIBE against the Lambda-backed catalog, and Athena
+    // resolves catalog name → connector ARN via GetDataCatalog. The existing
+    // AthenaEnumSampling statement is workgroup-scoped only, so without this the
+    // very first SHOW DATABASES fails AccessDenied.
+    it("grants prefix-scoped athena:GetDataCatalog", () => {
+      expect(
+        discoveryStatements().find(
+          (s: any) => s.Sid === "CustomConnectorCatalogRead",
+        ),
+      ).toEqual({
+        Sid: "CustomConnectorCatalogRead",
+        Effect: "Allow",
+        Action: "athena:GetDataCatalog",
+        Resource:
+          "arn:aws:athena:us-east-1:123456789012:datacatalog/coadevds_*",
+      });
+    });
+
+    // Two controls covering different things. `aws:CalledVia` keeps this from being an
+    // invoke primitive usable directly from discovery code; the resource TAG scopes
+    // WHICH functions, since the account must stay a wildcard (the connector lives in
+    // the customer's) and Athena exposes no condition key naming the catalog a
+    // forward-access-session invoke serves. The account is still not excluded — a
+    // connector may be deployed alongside this stack — so the same-account escalation
+    // is closed by the Deny below.
+    it("grants connector invoke only when Athena is the caller, and only for tagged functions", () => {
+      expect(
+        discoveryStatements().find(
+          (s: any) => s.Sid === "AthenaFederationConnectorInvoke",
+        ),
+      ).toEqual({
+        Sid: "AthenaFederationConnectorInvoke",
+        Effect: "Allow",
+        Action: "lambda:InvokeFunction",
+        Resource: "arn:aws:lambda:us-east-1:*:function:*",
+        Condition: {
+          "ForAnyValue:StringEquals": {
+            "aws:CalledVia": "athena.amazonaws.com",
+          },
+          StringEquals: { "aws:ResourceTag/coa:connector": "true" },
+        },
+      });
+    });
+
+    // Without this, an Athena UDF — which needs only StartQueryExecution,
+    // granted above, plus InvokeFunction — reaches every Lambda in OUR account,
+    // including the Lake-Formation-admin federation provisioner.
+    //
+    // Account-wide and region-wide, not scoped to our name prefix: the prefix
+    // form made a naming convention load-bearing for security and silently
+    // refused any connector deployed into this account under the prefix, which
+    // is what scripts/deploy-example-connector.sh does. Breadth is the safe
+    // direction for a Deny.
+    it("denies Athena-mediated invoke of every untagged function in this account", () => {
+      expect(
+        discoveryStatements().find(
+          (s: any) => s.Sid === "DenyAthenaInvokeOfUntaggedFunctions",
+        ),
+      ).toEqual({
+        Sid: "DenyAthenaInvokeOfUntaggedFunctions",
+        Effect: "Deny",
+        Action: "lambda:InvokeFunction",
+        Resource: "arn:aws:lambda:*:123456789012:function:*",
+        Condition: {
+          "ForAnyValue:StringEquals": {
+            "aws:CalledVia": "athena.amazonaws.com",
+          },
+          StringNotEquals: { "aws:ResourceTag/coa:connector": "true" },
+        },
+      });
+    });
+
+    // StringNotEquals matches an ABSENT key, which is what makes the exemption
+    // fail closed. Discovery is the role that runs DESCRIBE, so losing this
+    // exemption presents as a source that scans with no keys rather than as a
+    // permissions error.
+    it("exempts the connector tag by its absence, not by an equality match", () => {
+      const condition = discoveryStatements().find(
+        (s: any) => s.Sid === "DenyAthenaInvokeOfUntaggedFunctions",
+      ).Condition;
+      expect(condition.StringNotEquals).toEqual({
+        "aws:ResourceTag/coa:connector": "true",
+      });
+      expect(condition.StringEquals).toBeUndefined();
+    });
+
+    // Spill is a record-path mechanism; discovery's entire Athena surface
+    // (SHOW/DESCRIBE) is metadata-handler traffic that never spills. Granting it
+    // here would widen a second role for no functional gain.
+    it("does not grant the discovery role the cross-account spill read", () => {
+      const sids = discoveryStatements().map((s: any) => s.Sid);
+      expect(sids).not.toContain("AthenaFederationSpillRead");
+      expect(sids).not.toContain("AthenaFederationSpillDecryptViaS3");
+    });
+  });
+
   describe("Federation Provisioner (Option B isolation)", () => {
     it("creates a dedicated JDBC federation provisioner Lambda in VPC", () => {
       template.hasResourceProperties("AWS::Lambda::Function", {
@@ -1187,6 +1302,29 @@ describe("SourcesStack", () => {
       t.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: Match.stringLikeRegexp("sources-doc-preprocessing$"),
         ReservedConcurrentExecutions: Match.absent(),
+      });
+    });
+  });
+
+  describe("Preprocessing Textract IAM", () => {
+    // The table-extraction path (enable_table_extraction) calls
+    // textract:AnalyzeDocument; the scanned-PDF path calls DetectDocumentText.
+    // The preprocessing role must grant BOTH or the tables path fails at runtime
+    // with AccessDeniedException (unit tests mock the Textract client and cannot
+    // catch a missing IAM grant — only this template assertion does).
+    it("grants the preprocessing role textract:AnalyzeDocument and DetectDocumentText", () => {
+      template.hasResourceProperties("AWS::IAM::Policy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Effect: "Allow",
+              Action: Match.arrayWith([
+                "textract:DetectDocumentText",
+                "textract:AnalyzeDocument",
+              ]),
+            }),
+          ]),
+        },
       });
     });
   });

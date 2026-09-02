@@ -1,0 +1,31 @@
+{
+  "name": "coa-databricks-connector-cdk",
+  "version": "0.1.0",
+  "description": "CDK app deploying the Databricks SQL Warehouse Athena Query Federation connector",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "cdk": "cdk",
+    "package": "mvn -q -B package -pl databricks -am -f ../../pom.xml",
+    "predeploy": "pnpm run package",
+    "deploy": "cdk deploy",
+    "presynth": "pnpm run package",
+    "synth": "cdk synth",
+    "destroy": "cdk destroy",
+    "test": "jest --runInBand"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.260.0",
+    "coa-connector-cdk": "workspace:*",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^22.0.0",
+    "aws-cdk": "^2.1127.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.7.0"
+  }
+}

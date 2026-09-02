@@ -300,6 +300,56 @@ class TestEmptyExtractionIsReported:
     @patch.dict(os.environ, _ENV)
     @patch("coa_sources.documents.preprocessing.handler.upload_metadata")
     @patch("coa_sources.documents.preprocessing.handler.upload_file")
+    @patch("coa_sources.documents.preprocessing.handler.read_file_bytes", return_value=b"%PDF-1.7")
+    @patch("coa_sources.documents.preprocessing.handler.get_page_count", return_value=1)
+    @patch("coa_sources.documents.preprocessing.handler.process_pdf", return_value=("| a | b |", ".md"))
+    @patch("coa_sources.documents.preprocessing.handler.list_objects")
+    @patch("coa_sources.documents.preprocessing.handler.get_s3_client")
+    def test_enable_table_extraction_flag_reaches_process_pdf(
+        self, mock_client, mock_list, mock_pdf, mock_pages, mock_read, mock_upload, mock_meta
+    ):
+        """The flag arrives on the state-machine input as a string in
+        extraction_config and must be forwarded as a bool kwarg."""
+        mock_list.return_value = [{"Key": "policy.pdf", "Size": 5000}]
+        from coa_sources.documents.preprocessing.handler import handler
+
+        result = handler(
+            {
+                "namespace_id": "ns1",
+                "doc_source_id": "ds1",
+                "extraction_config": {"enable_table_extraction": "true"},
+            },
+            None,
+        )
+        assert result["files_preprocessed"] == 1
+        _, kwargs = mock_pdf.call_args
+        assert kwargs.get("enable_table_extraction") is True
+        # Metadata records which processing method ran, so operators can grep.
+        uploaded_metadata = mock_meta.call_args.args[3]
+        assert uploaded_metadata["processing_method"] == "textract_analyze_document_tables"
+
+    @patch.dict(os.environ, _ENV)
+    @patch("coa_sources.documents.preprocessing.handler.upload_metadata")
+    @patch("coa_sources.documents.preprocessing.handler.upload_file")
+    @patch("coa_sources.documents.preprocessing.handler.read_file_bytes", return_value=b"%PDF-1.7")
+    @patch("coa_sources.documents.preprocessing.handler.get_page_count", return_value=1)
+    @patch("coa_sources.documents.preprocessing.handler.process_pdf", return_value=("prose", ".md"))
+    @patch("coa_sources.documents.preprocessing.handler.list_objects")
+    @patch("coa_sources.documents.preprocessing.handler.get_s3_client")
+    def test_enable_table_extraction_defaults_to_false(
+        self, mock_client, mock_list, mock_pdf, mock_pages, mock_read, mock_upload, mock_meta
+    ):
+        """Missing extraction_config → flag is False (backward compatible)."""
+        mock_list.return_value = [{"Key": "prose.pdf", "Size": 5000}]
+        from coa_sources.documents.preprocessing.handler import handler
+
+        handler({"namespace_id": "ns1", "doc_source_id": "ds1"}, None)
+        _, kwargs = mock_pdf.call_args
+        assert kwargs.get("enable_table_extraction") is False
+
+    @patch.dict(os.environ, _ENV)
+    @patch("coa_sources.documents.preprocessing.handler.upload_metadata")
+    @patch("coa_sources.documents.preprocessing.handler.upload_file")
     @patch("coa_sources.documents.preprocessing.handler.read_file_bytes")
     @patch("coa_sources.documents.preprocessing.handler.list_objects")
     @patch("coa_sources.documents.preprocessing.handler.get_s3_client")

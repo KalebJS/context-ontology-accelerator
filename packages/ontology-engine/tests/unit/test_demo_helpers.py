@@ -248,20 +248,42 @@ class TestFindExistingOntology:
         return _load_module("setup_under_test", _DEMO_DIR / "setup.py")
 
     def test_hit(self, setup_module):
+        """ListOntologies answers with a camelCase ``{"ontologies": [...]}`` envelope.
+
+        The row is normalised onto the snake_case ``ontology_id`` that the POST
+        response uses, because callers treat the two responses interchangeably.
+        """
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = {
+            "ontologies": [
+                {"ontologyId": "abc", "uri": "https://schema.org/"},
+                {"ontologyId": "def", "uri": "http://other/"},
+            ]
+        }
+        with patch.object(setup_module.httpx, "get", return_value=mock_response):
+            result = setup_module._find_existing_ontology("https://schema.org/")
+        assert result == {
+            "ontologyId": "abc",
+            "uri": "https://schema.org/",
+            "ontology_id": "abc",
+        }
+
+    def test_hit_on_a_legacy_bare_array(self, setup_module):
+        """Deployments predating the envelope answered with a bare array."""
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = [
-            {"id": "abc", "uri": "https://schema.org/"},
-            {"id": "def", "uri": "http://other/"},
+            {"ontology_id": "abc", "uri": "https://schema.org/"},
         ]
         with patch.object(setup_module.httpx, "get", return_value=mock_response):
             result = setup_module._find_existing_ontology("https://schema.org/")
-        assert result == {"id": "abc", "uri": "https://schema.org/"}
+        assert result == {"ontology_id": "abc", "uri": "https://schema.org/"}
 
     def test_miss(self, setup_module):
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = []
+        mock_response.json.return_value = {"ontologies": []}
         with patch.object(setup_module.httpx, "get", return_value=mock_response):
             result = setup_module._find_existing_ontology("https://not-registered/")
         assert result is None
@@ -270,7 +292,7 @@ class TestFindExistingOntology:
         """The server should filter by uri, but be defensive in case it doesn't."""
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = [{"id": "x", "uri": "different-uri"}]
+        mock_response.json.return_value = {"ontologies": [{"ontologyId": "x", "uri": "different-uri"}]}
         with patch.object(setup_module.httpx, "get", return_value=mock_response):
             result = setup_module._find_existing_ontology("https://target/")
         assert result is None
@@ -283,7 +305,7 @@ class TestRegisterOntology:
 
     def test_idempotent_when_already_exists(self, setup_module):
         """Re-running setup.py should not create duplicates."""
-        existing = {"id": "abc", "uri": "https://schema.org/"}
+        existing = {"ontology_id": "abc", "uri": "https://schema.org/"}
         with patch.object(setup_module, "_find_existing_ontology", return_value=existing):
             result = setup_module._register_ontology({"uri": "https://schema.org/"})
         assert result == existing

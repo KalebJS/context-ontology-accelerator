@@ -152,10 +152,15 @@ class TestBedrockLLMClient:
         assert content_blocks[1] == {"guardContent": {"text": {"text": "Question: hello"}}}
 
     async def test_converse_guard_content_sent_without_guardrail(self):
-        """guardContent must be delivered to the model even without a
-        guardrailConfig — tier2 callers use guardContent as the sole
-        channel for untrusted user text, so dropping it in unconfigured
-        deployments would silently lose the user's question.
+        """The guarded text must still reach the model, as PLAIN text.
+
+        tier2 callers use guardContent as the sole channel for the user's
+        question, so dropping it would lose the question. Keeping the tag would
+        lose the whole call: Converse rejects a guardContent block that arrives
+        without a guardrailConfig ("The guardrail can't assess the content in the
+        guardContent field"), and an unguarded deployment then fails EVERY
+        generation — 135/135 questions, empty SQL, on the first benchmark run of
+        SERVE_GUARDRAILS_DISABLED.
         """
         from coa_serve.clients.bedrock import BedrockLLMClient
 
@@ -170,7 +175,7 @@ class TestBedrockLLMClient:
         content_blocks = call_kwargs["messages"][0]["content"]
         assert content_blocks == [
             {"text": "context here"},
-            {"guardContent": {"text": {"text": "Question: hello"}}},
+            {"text": "Question: hello"},
         ]
         # And without a guardrail_id, no guardrailConfig on the request.
         assert "guardrailConfig" not in call_kwargs
@@ -496,6 +501,33 @@ class TestBedrockConverseStream:
         content_blocks = call_kwargs["messages"][0]["content"]
         assert content_blocks[1] == {"guardContent": {"text": {"text": "Question: hi"}}}
         assert call_kwargs["guardrailConfig"]["streamProcessingMode"] == "sync"
+
+    async def test_stream_untags_guard_content_without_a_guardrail(self):
+        """The streamed path shares the kwargs builder, so it has the same rule.
+
+        Tier-3 synthesis streams and also puts the user's query in guardContent, so
+        an unguarded deployment would fail every synthesis for the same reason
+        Tier-2 failed every generation.
+        """
+        from coa_serve.clients.bedrock import BedrockLLMClient
+
+        events = [
+            {"contentBlockDelta": {"delta": {"text": "ok"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+            {"metadata": {}},
+        ]
+        mock_client = MagicMock()
+        mock_client.converse_stream.return_value = {"stream": iter(events)}
+
+        client = BedrockLLMClient(model_id="test-model", region="us-east-1")
+        client._client = mock_client
+
+        async for _ in client.converse_stream("ctx", guardrail_id=None, guard_content="Question: hi"):
+            pass
+
+        call_kwargs = mock_client.converse_stream.call_args[1]
+        assert call_kwargs["messages"][0]["content"] == [{"text": "ctx"}, {"text": "Question: hi"}]
+        assert "guardrailConfig" not in call_kwargs
 
     async def test_converse_model_id_override(self):
         """Verify per-call model_id override reaches Bedrock API kwargs."""

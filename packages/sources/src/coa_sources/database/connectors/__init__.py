@@ -10,12 +10,14 @@ from .base import (
     ConnectionTestResult,
     MetadataConnector,
 )
+from .custom_connector import CustomConnector
 from .glue_catalog import GlueCatalogConnector
 from .jdbc import JdbcConnector
 
 __all__ = [
     "ConnectionCheck",
     "ConnectionTestResult",
+    "CustomConnector",
     "GlueCatalogConnector",
     "JdbcConnector",
     "MetadataConnector",
@@ -25,6 +27,7 @@ __all__ = [
 CONNECTOR_REGISTRY: dict[str, type[MetadataConnector]] = {
     SourceSubType.GLUE_DATABASE: GlueCatalogConnector,
     SourceSubType.JDBC_DATABASE: JdbcConnector,
+    SourceSubType.CUSTOM_CONNECTOR: CustomConnector,
 }
 
 

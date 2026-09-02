@@ -661,8 +661,8 @@ class TestEnvKnobs:
     async def test_env_knobs_are_read_when_not_passed(self, monkeypatch):
         # The strategy leaves these unset, so the env is read per run — a
         # redeploy-free knob. The documented floors (0 schemas, 5s) are clamped.
-        monkeypatch.setenv("SERVE_AGENTIC_PREFETCH_SCHEMAS", "-4")
-        monkeypatch.setenv("SERVE_AGENTIC_EXEC_TIMEOUT_S", "1")
+        monkeypatch.setenv("SERVE_DEEP_REASONING_PREFETCH_SCHEMAS", "-4")
+        monkeypatch.setenv("SERVE_DEEP_REASONING_EXEC_TIMEOUT_S", "1")
         agent, mocks = _build(prefetch_schemas=None)
 
         install_fake_strands(lambda tools: _generate_and_execute(tools))
@@ -673,8 +673,8 @@ class TestEnvKnobs:
 
     @pytest.mark.asyncio
     async def test_unparseable_env_knobs_fall_back_to_defaults(self, monkeypatch):
-        monkeypatch.setenv("SERVE_AGENTIC_PREFETCH_SCHEMAS", "three")
-        monkeypatch.setenv("SERVE_AGENTIC_EXEC_TIMEOUT_S", "")
+        monkeypatch.setenv("SERVE_DEEP_REASONING_PREFETCH_SCHEMAS", "three")
+        monkeypatch.setenv("SERVE_DEEP_REASONING_EXEC_TIMEOUT_S", "")
         agent, mocks = _build(prefetch_schemas=None)
 
         install_fake_strands(lambda tools: _generate_and_execute(tools))
@@ -682,6 +682,37 @@ class TestEnvKnobs:
 
         assert "Candidate tables" in strands_fake.last_agent.prompt  # default 3 = on
         assert mocks["executor"].execute.await_args.kwargs["timeout_seconds"] == 35
+
+    @pytest.mark.asyncio
+    async def test_deprecated_serve_agentic_env_knobs_still_honored(self, monkeypatch):
+        """A deployment on the pre-rename names keeps its tuned values.
+
+        Fails if the ``SERVE_AGENTIC_*`` fallback is dropped: the timeout would
+        silently revert to the 35s default instead of the configured 9s, changing
+        behaviour with no error anywhere.
+        """
+        monkeypatch.delenv("SERVE_DEEP_REASONING_PREFETCH_SCHEMAS", raising=False)
+        monkeypatch.delenv("SERVE_DEEP_REASONING_EXEC_TIMEOUT_S", raising=False)
+        monkeypatch.setenv("SERVE_AGENTIC_PREFETCH_SCHEMAS", "0")
+        monkeypatch.setenv("SERVE_AGENTIC_EXEC_TIMEOUT_S", "9")
+        agent, mocks = _build(prefetch_schemas=None)
+
+        install_fake_strands(lambda tools: _generate_and_execute(tools))
+        await _run(agent)
+
+        assert "Candidate tables" not in strands_fake.last_agent.prompt  # 0 = prefetch off
+        assert mocks["executor"].execute.await_args.kwargs["timeout_seconds"] == 9
+
+    @pytest.mark.asyncio
+    async def test_new_env_knob_wins_over_deprecated(self, monkeypatch):
+        monkeypatch.setenv("SERVE_DEEP_REASONING_EXEC_TIMEOUT_S", "20")
+        monkeypatch.setenv("SERVE_AGENTIC_EXEC_TIMEOUT_S", "9")
+        agent, mocks = _build(prefetch_schemas=None)
+
+        install_fake_strands(lambda tools: _generate_and_execute(tools))
+        await _run(agent)
+
+        assert mocks["executor"].execute.await_args.kwargs["timeout_seconds"] == 20
 
 
 @pytest.mark.unit
@@ -790,15 +821,15 @@ class TestSystemPrompt:
         assert "explore_graph" not in build_system_prompt(intent_review=True)
 
     def test_intent_review_defaults_to_the_env_flag(self, monkeypatch):
-        monkeypatch.delenv("SERVE_AGENTIC_INTENT_REVIEW", raising=False)
+        monkeypatch.delenv("SERVE_DEEP_REASONING_INTENT_REVIEW", raising=False)
         assert build_system_prompt() == AGENT_SYSTEM_PROMPT
 
-        monkeypatch.setenv("SERVE_AGENTIC_INTENT_REVIEW", "true")
+        monkeypatch.setenv("SERVE_DEEP_REASONING_INTENT_REVIEW", "true")
         assert INTENT_REVIEW_BLOCK in build_system_prompt()
 
     @pytest.mark.asyncio
     async def test_agent_uses_the_resolved_prompt(self, monkeypatch):
-        monkeypatch.setenv("SERVE_AGENTIC_INTENT_REVIEW", "1")
+        monkeypatch.setenv("SERVE_DEEP_REASONING_INTENT_REVIEW", "1")
         agent, _ = _build()
 
         install_fake_strands(lambda tools: _generate_and_execute(tools))

@@ -273,3 +273,105 @@ class TestFederationHandler:
         grant.assert_called_once_with(catalog_name="cat", schemas=["public"], principal_arn="")
         assert dao.update.call_args.kwargs["update_fields"]["queryable"] is False
         assert out["queryable"] is False
+
+
+class TestCustomConnectorBranch:
+    """A custom-connector source needs no provisioning here — its Lambda-backed
+    Athena data catalog was registered at source-create, because this sub-type's
+    discovery queries it and discovery runs first. All that remains is marking the
+    source queryable."""
+
+    _ITEM = {"sourceSubType": "CUSTOM_CONNECTOR", "athenaDataCatalogName": "coadevds_abc123"}
+
+    def test_marks_the_source_queryable(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao(dict(self._ITEM))
+        with ctx:
+            out = handler(_EVENT)
+        assert out == {"provisioned": False, "reason": "custom-connector", "queryable": True}
+        assert dao.update.call_args.kwargs["update_fields"] == {"queryable": True}
+        # Guards against a concurrently-deleted row being resurrected.
+        assert dao.update.call_args.kwargs["condition"] == "attribute_exists(PK)"
+
+    def test_provisions_no_glue_or_lake_formation_resources(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao(dict(self._ITEM))
+        with (
+            ctx,
+            patch(f"{MODULE}.provision_federated_catalog") as prov,
+            patch(f"{MODULE}.grant_consumer_select") as grant,
+            patch(f"{MODULE}.grant_consumer_select_native") as grant_native,
+            patch(f"{MODULE}.grant_iam_allowed_principals") as iam_grant,
+        ):
+            handler(_EVENT)
+        # There is no Glue object behind a Lambda catalog, so there is nothing to
+        # provision and nothing for Lake Formation to govern.
+        prov.assert_not_called()
+        grant.assert_not_called()
+        grant_native.assert_not_called()
+        iam_grant.assert_not_called()
+
+    def test_a_failed_write_raises_rather_than_leaving_it_unqueryable(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao(dict(self._ITEM))
+        dao.update.side_effect = RuntimeError("ddb down")
+        # Silently leaving queryable False would present as a source that scanned
+        # cleanly and then answers nothing. Nothing needs rolling back, and a
+        # re-scan retries.
+        with ctx, pytest.raises(RuntimeError):
+            handler(_EVENT)
+
+
+class TestUnhandledSubType:
+    """An absent sub-type must stay a no-op; a recognised DATABASE sub-type with
+    no branch here must not."""
+
+    def test_an_absent_sub_type_is_a_no_op(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        # A source deleted concurrently with its scan reads back as an empty dict.
+        ctx, dao = _patch_dao({})
+        with ctx:
+            out = handler(_EVENT)
+        assert out == {"provisioned": False, "reason": "not-jdbc"}
+        dao.update.assert_not_called()
+
+    def test_an_unrecognised_sub_type_is_a_no_op(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao({"sourceSubType": "SOMETHING_LEGACY"})
+        with ctx:
+            assert handler(_EVENT)["reason"] == "not-jdbc"
+
+    def test_a_documents_sub_type_is_a_no_op(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        # These never reach this pipeline; a row carrying one is mis-stored, and
+        # policing that is not this handler's job.
+        ctx, _ = _patch_dao({"sourceSubType": "S3"})
+        with ctx:
+            assert handler(_EVENT)["reason"] == "not-jdbc"
+
+    def test_a_recognised_database_sub_type_with_no_branch_raises(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        # Simulates a new DATABASE sub-type shipping without its branch. Without
+        # the raise, every source of that type would scan cleanly and then stay
+        # queryable=False with no other signal.
+        ctx, _ = _patch_dao({"sourceSubType": "FUTURE_DATABASE"})
+        with (
+            ctx,
+            patch(f"{MODULE}._UNHANDLED_DATABASE_SUB_TYPES", frozenset({"FUTURE_DATABASE"})),
+            pytest.raises(RuntimeError, match="No federation branch"),
+        ):
+            handler(_EVENT)
+
+    def test_the_set_is_empty_while_every_database_sub_type_has_a_branch(self):
+        from coa_sources.database.pipeline.federation_handler import _UNHANDLED_DATABASE_SUB_TYPES
+
+        # This is the tripwire: adding a DATABASE sub-type to the Smithy enum
+        # without a branch above makes this fail, here, rather than in production.
+        assert not _UNHANDLED_DATABASE_SUB_TYPES

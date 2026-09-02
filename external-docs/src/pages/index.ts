@@ -9,6 +9,7 @@ import agentAccess from '@docs/agent-access.md?raw'
 import cedarPolicies from '@docs/cedar-policy-authoring.md?raw'
 import sources from '@docs/sources.md?raw'
 import crossAccountSources from '@docs/cross-account-sources.md?raw'
+import customConnectorSources from '@docs/custom-connector-sources.md?raw'
 import ontologies from '@docs/ontologies.md?raw'
 import metrics from '@docs/metrics.md?raw'
 import serve from '@docs/serve.md?raw'
@@ -25,6 +26,7 @@ export type PageId =
   | 'cedar-policies'
   | 'sources'
   | 'cross-account-sources'
+  | 'custom-connector-sources'
   | 'ontologies'
   | 'metrics'
   | 'serve'
@@ -41,6 +43,7 @@ export const pages: Record<PageId, string> = {
   'cedar-policies': cedarPolicies,
   sources,
   'cross-account-sources': crossAccountSources,
+  'custom-connector-sources': customConnectorSources,
   ontologies,
   metrics,
   serve,

@@ -51,7 +51,13 @@ def test_readme_structure_paths_exist() -> None:
 
 @pytest.mark.parametrize(
     "target",
-    ["docs", "test-integ", "load-test", "load-test-slow", "load-test-teardown"],
+    [
+        "docs",
+        "test-integ",
+        "load-test",
+        "load-test-slow",
+        "load-test-teardown",
+    ],
 )
 def test_guarded_makefile_targets_do_not_fail_on_missing_dirs(target: str) -> None:
     """Makefile targets that reference potentially-stripped dirs must be guarded."""

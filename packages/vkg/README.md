@@ -125,3 +125,62 @@ aws ecs describe-tasks --cluster $CLUSTER --tasks $TASK_ARN \
 3. New task starts, retries S3 download (3 attempts)
 4. If S3 fails: container enters degraded mode → health check fails after ~2.5 min → ECS replaces
 5. Cycle repeats until S3 artifacts are available
+
+## Image Reloads and the Scheduled Sweep
+
+VKG runs **one ECS service per namespace** (`<prefix>-vkg-<namespace>`). No static
+"default" service exists — a namespace's service is created the first time its
+ontology is published. The `<prefix>-vkg-reload` Lambda owns provisioning and
+image refresh; the latest image URI is published to SSM
+(`/<prefix>/vkg/container-image`) on every CDK deploy.
+
+### Two ways the reload Lambda runs
+
+| Trigger | Event | Scope |
+|---------|-------|-------|
+| `ontology.published` (EventBridge) | `{"detail": {"namespace": "...", "version": "..."}}` | The one namespace that was published |
+| Scheduled sweep (EventBridge, weekly) | `{"sweep": true}` | **Every** `<prefix>-vkg-*` service in the cluster |
+
+On each run the Lambda resolves the latest image from SSM and, per service,
+registers a new task-definition revision when the image differs (else forces a
+new deployment), always with the ECS circuit breaker + rollback.
+
+### Why the scheduled sweep exists
+
+The `ontology.published` trigger only refreshes a namespace **when its ontology
+is re-accepted**. A long-lived namespace that is never republished keeps its
+provision-time image indefinitely, so base-image digest bumps (Renovate, or a
+Dockerfile pin change) never reach a running task and stale, Inspector-flagged
+VKG images accumulate. A CDK deploy does **not** fix this either — it only
+updates the shared template task def and the SSM image parameter, not the
+existing per-namespace services.
+
+The weekly sweep (EventBridge `rate(7 days)` → reload Lambda with
+`{"sweep": true}`) closes the gap: it reconciles every VKG service to the latest
+SSM image. It is a no-op per namespace when the image already matches, and a
+single namespace's failure is isolated so the rest are still patched.
+
+### Manual sweep (on demand)
+
+```bash
+aws lambda invoke --function-name <prefix>-vkg-reload \
+  --payload "$(printf '{"sweep":true}' | base64)" /tmp/out.json
+cat /tmp/out.json   # -> {"status":"sweep_complete","total":N,"triggered":M,...}
+```
+
+### IAM
+
+The reload Lambda role holds, in addition to the per-namespace deploy
+permissions, **`ecs:ListServices` scoped to the VKG cluster** — the sweep needs
+it to enumerate `<prefix>-vkg-*` services. It is read-only and cluster-scoped
+via the `ecs:cluster` condition key (`ecs:ListServices` has no IAM resource
+type, so it is granted on `Resource: "*"` and constrained to this cluster by
+condition).
+
+### Observability
+
+Both paths emit `ReloadTriggered` / `ReloadFailed` CloudWatch metrics under the
+`COA/VKG` namespace (dimensioned by `Namespace` plus an undimensioned roll-up the
+`ReloadFailed` alarm evaluates). Sweep-level failures — the SSM image can't be
+resolved, or `ListServices` errors — emit `ReloadFailed` with namespace `sweep`
+and end the run cleanly rather than raising uncaught.

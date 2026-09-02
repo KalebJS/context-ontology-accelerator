@@ -117,6 +117,21 @@ async function navigateToEnrichmentStep() {
   await clickNext();
 }
 
+const CONNECTOR_ARN =
+  "arn:aws:lambda:us-east-1:123456789012:function:my-connector";
+
+/** Select the custom connector tile and fill its required step-2 fields. */
+async function fillCustomConnectorStep() {
+  await user.click(screen.getByLabelText("Custom connector"));
+  await clickNext();
+  await user.type(
+    screen.getByPlaceholderText("My Custom Connector"),
+    "my-connector",
+  );
+  await user.type(screen.getByPlaceholderText(CONNECTOR_ARN), CONNECTOR_ARN);
+  await user.type(screen.getByPlaceholderText("my_connector_db"), "my_db");
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -695,5 +710,164 @@ describe("ConnectSource — Glue execution engine", () => {
       mockCreate.mock.calls[0][0].body.databaseSource.glueConfiguration;
     expect(cfg.executionEngine).toBe("REDSHIFT");
     expect(cfg.athenaDataCatalogName).toBeUndefined();
+  }, 15000);
+});
+
+describe("ConnectSource — Athena Query Federation connector", () => {
+  beforeEach(() => {
+    mockCreate.mockReset();
+    mockCreateAsync.mockReset();
+  });
+
+  it("offers the connector as a step-1 source kind", () => {
+    render(<ConnectSource />, { wrapper });
+
+    expect(screen.getByText(/Athena Query Federation SDK/)).toBeInTheDocument();
+  });
+
+  it("treats the connector as a database source — the enrichment step is present", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillCustomConnectorStep();
+    await clickNext();
+
+    expect(
+      screen.getByText(/Enable AI metadata enrichment/i),
+    ).toBeInTheDocument();
+  }, 15000);
+
+  it("submits customConnectorConfiguration and nothing else", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillCustomConnectorStep();
+    await clickNext(); // → enrichment
+    await clickNext(); // → review
+    await user.click(screen.getByRole("button", { name: /^connect source$/i }));
+
+    expect(mockCreate).toHaveBeenCalledTimes(1);
+    const databaseSource = mockCreate.mock.calls[0][0].body.databaseSource;
+    expect(databaseSource.name).toBe("my-connector");
+    expect(databaseSource.customConnectorConfiguration).toEqual({
+      connectorFunctionArn: CONNECTOR_ARN,
+      databaseName: "my_db",
+      tableFilter: undefined,
+      tableExcludeFilter: undefined,
+    });
+    // The backend 400s when more than one configuration is present — the
+    // configuration sent is what selects the sub-type.
+    expect(databaseSource.glueConfiguration).toBeUndefined();
+    expect(databaseSource.jdbcConfiguration).toBeUndefined();
+  }, 15000);
+
+  it("asks for exactly one connector ARN, with no metadata/record split", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillCustomConnectorStep();
+
+    // Pins the single-field contract rather than merely not exercising a second
+    // field. Athena itself accepts a split metadata/record pair, so this is what
+    // stops one being reintroduced and asking every customer to choose between two
+    // adjacent ARNs — where the wrong choice fails at query time, not here.
+    expect(screen.queryByText(/record function arn/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/metadata function arn/i),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(/connector function arn/i)).toBeInTheDocument();
+  }, 15000);
+
+  it("submits the table filters when provided", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillCustomConnectorStep();
+    await user.click(screen.getByText("Advanced configuration"));
+    await user.type(
+      screen.getByPlaceholderText("orders|customers"),
+      "orders|customers",
+    );
+    await user.type(
+      screen.getByPlaceholderText("tmp_*|staging_*"),
+      "tmp_*|scratch_*",
+    );
+    await clickNext();
+    await clickNext();
+    await user.click(screen.getByRole("button", { name: /^connect source$/i }));
+
+    const cfg =
+      mockCreate.mock.calls[0][0].body.databaseSource
+        .customConnectorConfiguration;
+    expect(cfg.tableFilter).toBe("orders|customers");
+    expect(cfg.tableExcludeFilter).toBe("tmp_*|scratch_*");
+  }, 20000);
+
+  it("blocks Next when the metadata function ARN is missing", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await user.click(screen.getByLabelText("Custom connector"));
+    await clickNext();
+    await user.type(
+      screen.getByPlaceholderText("My Custom Connector"),
+      "my-connector",
+    );
+    await user.type(screen.getByPlaceholderText("my_connector_db"), "my_db");
+    await clickNext();
+
+    expect(
+      screen.getByText(/Connector function ARN is required/i),
+    ).toBeInTheDocument();
+    expect(mockCreate).not.toHaveBeenCalled();
+  }, 15000);
+
+  it("rejects a partial Lambda ARN — an unqualified name resolves to the wrong account", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await user.click(screen.getByLabelText("Custom connector"));
+    await clickNext();
+    await user.type(
+      screen.getByPlaceholderText("My Custom Connector"),
+      "my-connector",
+    );
+    await user.type(
+      screen.getByPlaceholderText(CONNECTOR_ARN),
+      "123456789012:function:my-connector",
+    );
+    await user.type(screen.getByPlaceholderText("my_connector_db"), "my_db");
+    await clickNext();
+
+    expect(
+      screen.getByText(/Must be a full Lambda function ARN/i),
+    ).toBeInTheDocument();
+    expect(mockCreate).not.toHaveBeenCalled();
+  }, 20000);
+
+  it("blocks Next when the database name is missing", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await user.click(screen.getByLabelText("Custom connector"));
+    await clickNext();
+    await user.type(
+      screen.getByPlaceholderText("My Custom Connector"),
+      "my-connector",
+    );
+    await user.type(screen.getByPlaceholderText(CONNECTOR_ARN), CONNECTOR_ARN);
+    await clickNext();
+
+    expect(screen.getByText(/Database name is required/i)).toBeInTheDocument();
+    expect(mockCreate).not.toHaveBeenCalled();
+  }, 20000);
+
+  it("summarises the connector on the review step", async () => {
+    render(<ConnectSource />, { wrapper });
+
+    await fillCustomConnectorStep();
+    await clickNext();
+    await clickNext();
+
+    expect(screen.getByText("my-connector")).toBeInTheDocument();
+    expect(screen.getByText(CONNECTOR_ARN)).toBeInTheDocument();
+    // The review step mirrors the form, and the form has no record-handler field —
+    // so it must not report a composite/split distinction the customer was never
+    // asked about.
+    expect(screen.queryByText(/composite handler/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("Record function ARN")).not.toBeInTheDocument();
   }, 15000);
 });

@@ -33,12 +33,14 @@ for _mod_name, _attr in [
 from coa_sources.documents.preprocessing.processors import (
     _PROCESSORS,
     _SCANNED_PDF_THRESHOLD,
+    _blocks_to_markdown,
     elements_to_markdown,
     get_page_count,
     process_docx,
     process_md,
     process_pdf,
     process_pdf_textract,
+    process_pdf_textract_tables,
     process_txt,
 )
 
@@ -329,6 +331,185 @@ class TestProcessPdfTextract:
 
 
 # ---------------------------------------------------------------------------
+# PDF processor — Textract AnalyzeDocument(TABLES) path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestProcessPdfTextractTables:
+    """Cover process_pdf_textract_tables end-to-end with real rendered PNGs.
+
+    Mirrors TestProcessPdfTextract's no-mock-pdfium style: real PDF bytes are
+    rendered by the real library and the boto3 client is the only stub, so the
+    render/guard/reassembly path is exercised for real.
+    """
+
+    @staticmethod
+    def _table_blocks(header: str, cell: str) -> list[dict]:
+        """A minimal AnalyzeDocument(TABLES) block graph: one 1x1+header table."""
+        return [
+            {"BlockType": "TABLE", "Id": "t1", "Relationships": [{"Type": "CHILD", "Ids": ["c1", "c2"]}]},
+            {
+                "BlockType": "CELL",
+                "Id": "c1",
+                "RowIndex": 1,
+                "ColumnIndex": 1,
+                "EntityTypes": ["COLUMN_HEADER"],
+                "Relationships": [{"Type": "CHILD", "Ids": ["w1"]}],
+            },
+            {
+                "BlockType": "CELL",
+                "Id": "c2",
+                "RowIndex": 2,
+                "ColumnIndex": 1,
+                "Relationships": [{"Type": "CHILD", "Ids": ["w2"]}],
+            },
+            {"BlockType": "WORD", "Id": "w1", "Text": header},
+            {"BlockType": "WORD", "Id": "w2", "Text": cell},
+        ]
+
+    def test_single_page_calls_analyze_document_with_real_png(self):
+        textract = MagicMock()
+        textract.analyze_document.return_value = {"Blocks": self._table_blocks("Policy", "P-100")}
+
+        result = process_pdf_textract_tables(_make_pdf(["table page"]), "policy.pdf", textract)
+
+        # analyze_document (not detect_document_text) is the TABLES entry point.
+        textract.analyze_document.assert_called_once()
+        assert textract.analyze_document.call_args.kwargs["FeatureTypes"] == ["TABLES"]
+        # The reassembled Markdown carries the header + cell as a pipe-table.
+        assert "Policy" in result and "P-100" in result
+        assert "|" in result
+
+        # The bytes handed to Textract are a real PNG at 300 DPI.
+        png_bytes = textract.analyze_document.call_args.kwargs["Document"]["Bytes"]
+        assert png_bytes[:8] == b"\x89PNG\r\n\x1a\n"
+
+    def test_multi_page_joins_with_double_newline(self):
+        pdf_bytes = _make_pdf(["alpha", "beta", "gamma"])
+
+        # Key the stub off page bytes, not call order (pages OCR concurrently) —
+        # same rationale as TestProcessPdfTextract.test_multi_page.
+        import pypdfium2 as pdfium
+
+        doc = pdfium.PdfDocument(pdf_bytes)
+        page_index: dict[bytes, int] = {}
+        try:
+            for i in range(len(doc)):
+                buf = io.BytesIO()
+                doc[i].render(scale=300 / 72).to_pil().save(buf, format="PNG")
+                page_index[buf.getvalue()] = i
+        finally:
+            doc.close()
+        assert len(page_index) == 3, "pages must render to distinct PNGs"
+
+        def _analyze(Document, FeatureTypes):  # noqa: N803 - boto3 kwarg names
+            idx = page_index[Document["Bytes"]]
+            time.sleep(0.05 * (3 - idx))  # finish in reverse to catch order bugs
+            return {"Blocks": [{"BlockType": "LINE", "Id": f"l{idx}", "Text": f"Page {idx + 1}"}]}
+
+        textract = MagicMock()
+        textract.analyze_document.side_effect = _analyze
+
+        result = process_pdf_textract_tables(pdf_bytes, "multi.pdf", textract)
+        assert result == "Page 1\n\nPage 2\n\nPage 3"
+        assert textract.analyze_document.call_count == 3
+
+    def test_empty_analyze_response_yields_empty(self):
+        textract = MagicMock()
+        textract.analyze_document.return_value = {"Blocks": []}
+        assert process_pdf_textract_tables(_make_pdf(["x"]), "empty.pdf", textract) == ""
+
+    def test_textract_error_on_page_yields_empty_not_crash(self):
+        """A Textract API error (throttling, invalid param, ...) on a page must
+        be isolated to that page — return empty for it, never propagate out of
+        pool.map and abort the whole document. Regression guard for the review
+        finding on _analyze_page."""
+        textract = MagicMock()
+        textract.analyze_document.side_effect = Exception("ThrottlingException")
+        # single page -> whole result is empty, but no exception escapes
+        assert process_pdf_textract_tables(_make_pdf(["x"]), "throttled.pdf", textract) == ""
+        textract.analyze_document.assert_called_once()
+
+    def test_textract_partial_failure_keeps_good_pages(self):
+        """When one page fails but others succeed, the good pages still return —
+        a single transient per-page fault must not zero out the document."""
+        pdf_bytes = _make_pdf(["alpha", "beta", "gamma"])
+        import pypdfium2 as pdfium
+
+        doc = pdfium.PdfDocument(pdf_bytes)
+        page_index: dict[bytes, int] = {}
+        try:
+            for i in range(len(doc)):
+                buf = io.BytesIO()
+                doc[i].render(scale=300 / 72).to_pil().save(buf, format="PNG")
+                page_index[buf.getvalue()] = i
+        finally:
+            doc.close()
+        assert len(page_index) == 3
+
+        def _analyze(Document, FeatureTypes):  # noqa: N803 - boto3 kwarg names
+            idx = page_index[Document["Bytes"]]
+            if idx == 1:  # middle page fails
+                raise Exception("InvalidParameterException")
+            return {"Blocks": [{"BlockType": "LINE", "Id": f"l{idx}", "Text": f"Page {idx + 1}"}]}
+
+        textract = MagicMock()
+        textract.analyze_document.side_effect = _analyze
+
+        result = process_pdf_textract_tables(pdf_bytes, "partial.pdf", textract)
+        # page 2 is empty; pages 1 and 3 survive, positions preserved.
+        assert result == "Page 1\n\n\n\nPage 3"
+        assert textract.analyze_document.call_count == 3
+
+    def test_corrupt_pdf_returns_empty_without_calling_textract(self):
+        textract = MagicMock()
+        assert process_pdf_textract_tables(b"%PDF-1.4 garbage", "bad.pdf", textract) == ""
+        textract.analyze_document.assert_not_called()
+
+    def test_page_count_limit_enforced_before_rendering(self):
+        from coa_sources.documents.preprocessing import processors
+
+        textract = MagicMock()
+        with (
+            patch.object(processors, "_MAX_PDF_PAGES", 2),
+            pytest.raises(ValueError, match="exceeding the 2-page limit"),
+        ):
+            processors.process_pdf_textract_tables(_make_pdf(["a", "b", "c"]), "long.pdf", textract)
+        textract.analyze_document.assert_not_called()
+
+    def test_oversized_page_rejected_before_rendering(self):
+        from coa_sources.documents.preprocessing import processors
+
+        textract = MagicMock()
+        with (
+            patch.object(processors, "_MAX_RENDER_MEGAPIXELS", 1),
+            pytest.raises(ValueError, match="exceeding the 1 MP per-page limit"),
+        ):
+            processors.process_pdf_textract_tables(_make_pdf(["big"]), "big.pdf", textract)
+        textract.analyze_document.assert_not_called()
+
+    def test_page_render_failure_returns_empty_without_calling_textract(self):
+        """If a page fails to rasterize mid-loop, bail with "" — don't bill
+        Textract for a partial document."""
+        import pypdfium2 as pdfium
+        from coa_sources.documents.preprocessing import processors
+
+        textract = MagicMock()
+        pdf_bytes = _make_pdf(["x"])
+
+        real_page = pdfium.PdfDocument(pdf_bytes)[0]
+
+        def _boom(*a, **k):
+            raise pdfium.PdfiumError("render exploded")
+
+        with patch.object(type(real_page), "render", _boom):
+            result = processors.process_pdf_textract_tables(pdf_bytes, "boom.pdf", textract)
+        assert result == ""
+        textract.analyze_document.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # PDF processor (routing logic)
 # ---------------------------------------------------------------------------
 
@@ -394,6 +575,40 @@ class TestProcessPdf:
         records = [r for r in caplog.records if r.getMessage() == "PDF processed"]
         assert len(records) == 1
         assert records[0].levelno == logging.INFO
+
+    @patch(
+        "coa_sources.documents.preprocessing.processors.process_pdf_textract_tables",
+        return_value="| Header |\n| --- |\n| Cell |",
+    )
+    @patch("coa_sources.documents.preprocessing.processors.is_scanned_pdf")
+    def test_enable_table_extraction_bypasses_scanned_check(self, mock_scanned, mock_tables):
+        """With enable_table_extraction=True, ALL PDFs (text-native or
+        scanned) route through Textract AnalyzeDocument(TABLES). is_scanned_pdf
+        is not even called — the flag is a routing override."""
+        textract_client = MagicMock()
+        text, ext = process_pdf(b"pdf-bytes", "policy.pdf", textract_client, enable_table_extraction=True)
+        assert ext == ".md"
+        assert "| Header |" in text
+        mock_tables.assert_called_once_with(b"pdf-bytes", "policy.pdf", textract_client)
+        mock_scanned.assert_not_called()
+
+    @patch("unstructured.partition.pdf.partition_pdf")
+    @patch(
+        "coa_sources.documents.preprocessing.processors.process_pdf_textract_tables",
+    )
+    @patch("coa_sources.documents.preprocessing.processors.is_scanned_pdf", return_value=False)
+    def test_enable_table_extraction_false_preserves_legacy_routing(self, mock_scanned, mock_tables, mock_partition):
+        """Regression guard: with the flag off, the existing scanned/text-native
+        routing is unchanged — prose-dominant corpora don't silently pay the
+        AnalyzeDocument premium."""
+        el = MagicMock()
+        el.category = "NarrativeText"
+        el.__str__ = MagicMock(return_value="Prose only")
+        mock_partition.return_value = [el]
+
+        process_pdf(b"pdf-bytes", "prose.pdf", MagicMock(), enable_table_extraction=False)
+        mock_tables.assert_not_called()
+        mock_partition.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -517,3 +732,150 @@ class TestProcessorDispatchTable:
 
     def test_no_unexpected_keys(self):
         assert set(_PROCESSORS.keys()) == {".txt", ".md", ".docx"}
+
+
+# ---------------------------------------------------------------------------
+# _blocks_to_markdown — Textract AnalyzeDocument(TABLES) reassembly
+# ---------------------------------------------------------------------------
+
+
+def _word(wid: str, text: str) -> dict:
+    return {"Id": wid, "BlockType": "WORD", "Text": text}
+
+
+def _line(lid: str, text: str, word_ids: list[str]) -> dict:
+    return {
+        "Id": lid,
+        "BlockType": "LINE",
+        "Text": text,
+        "Relationships": [{"Type": "CHILD", "Ids": word_ids}],
+    }
+
+
+def _cell(cid: str, row: int, col: int, word_ids: list[str], is_header: bool = False) -> dict:
+    b: dict = {
+        "Id": cid,
+        "BlockType": "CELL",
+        "RowIndex": row,
+        "ColumnIndex": col,
+        "Relationships": [{"Type": "CHILD", "Ids": word_ids}],
+    }
+    if is_header:
+        b["EntityTypes"] = ["COLUMN_HEADER"]
+    return b
+
+
+def _table(tid: str, cell_ids: list[str]) -> dict:
+    return {
+        "Id": tid,
+        "BlockType": "TABLE",
+        "Relationships": [{"Type": "CHILD", "Ids": cell_ids}],
+    }
+
+
+@pytest.mark.unit
+class TestBlocksToMarkdown:
+    def test_table_with_marked_headers_emits_pipe_table(self):
+        """AnalyzeDocument marks column headers as EntityTypes=[COLUMN_HEADER];
+        emit them as the Markdown header row."""
+        blocks = [
+            _word("w1", "Policy"),
+            _word("w2", "Premium"),
+            _word("w3", "P-001"),
+            _word("w4", "1200"),
+            _word("w5", "P-002"),
+            _word("w6", "1500"),
+            _cell("c1", 1, 1, ["w1"], is_header=True),
+            _cell("c2", 1, 2, ["w2"], is_header=True),
+            _cell("c3", 2, 1, ["w3"]),
+            _cell("c4", 2, 2, ["w4"]),
+            _cell("c5", 3, 1, ["w5"]),
+            _cell("c6", 3, 2, ["w6"]),
+            _table("t1", ["c1", "c2", "c3", "c4", "c5", "c6"]),
+        ]
+        md = _blocks_to_markdown(blocks)
+        assert "| Policy | Premium |" in md
+        assert "| --- | --- |" in md
+        assert "| P-001 | 1200 |" in md
+        assert "| P-002 | 1500 |" in md
+
+    def test_table_without_header_marker_treats_row_zero_as_header(self):
+        """If Textract doesn't tag any COLUMN_HEADER, use row 1 — a pipe-table
+        without a header separator line is not valid Markdown."""
+        blocks = [
+            _word("w1", "A"),
+            _word("w2", "B"),
+            _word("w3", "1"),
+            _word("w4", "2"),
+            _cell("c1", 1, 1, ["w1"]),
+            _cell("c2", 1, 2, ["w2"]),
+            _cell("c3", 2, 1, ["w3"]),
+            _cell("c4", 2, 2, ["w4"]),
+            _table("t1", ["c1", "c2", "c3", "c4"]),
+        ]
+        md = _blocks_to_markdown(blocks)
+        assert md.split("\n")[0] == "| A | B |"
+        assert md.split("\n")[1] == "| --- | --- |"
+        assert md.split("\n")[2] == "| 1 | 2 |"
+
+    def test_prose_and_table_both_emitted(self):
+        """Prose LINEs and table content coexist on a real page — both should
+        survive, and neither should double-emit table words as prose."""
+        blocks = [
+            _word("wt1", "Header"),
+            _word("wt2", "Value"),
+            _word("wt3", "Row1"),
+            _word("wt4", "10"),
+            _word("wp1", "Intro"),
+            _word("wp2", "paragraph"),
+            _line("L1", "Intro paragraph", ["wp1", "wp2"]),
+            _line("L2", "Header Value", ["wt1", "wt2"]),  # inside-table line
+            _line("L3", "Row1 10", ["wt3", "wt4"]),  # inside-table line
+            _cell("c1", 1, 1, ["wt1"], is_header=True),
+            _cell("c2", 1, 2, ["wt2"], is_header=True),
+            _cell("c3", 2, 1, ["wt3"]),
+            _cell("c4", 2, 2, ["wt4"]),
+            _table("t1", ["c1", "c2", "c3", "c4"]),
+        ]
+        md = _blocks_to_markdown(blocks)
+        # Prose survives.
+        assert "Intro paragraph" in md
+        # Inside-table LINEs are not emitted as prose (would double-count).
+        assert "Header Value" not in md
+        assert "Row1 10" not in md
+        # Table is present.
+        assert "| Header | Value |" in md
+        assert "| Row1 | 10 |" in md
+
+    def test_cell_text_with_pipe_escaped(self):
+        """A raw pipe in a cell must be escaped so it doesn't break the
+        Markdown grid alignment."""
+        blocks = [
+            _word("w1", "a|b"),
+            _cell("c1", 1, 1, ["w1"], is_header=True),
+            _table("t1", ["c1"]),
+        ]
+        md = _blocks_to_markdown(blocks)
+        assert "a\\|b" in md
+
+    def test_prose_only_no_tables(self):
+        """AnalyzeDocument called on a table-less page — same as
+        DetectDocumentText for the LINEs, no table section."""
+        blocks = [
+            _word("w1", "Just"),
+            _word("w2", "prose"),
+            _line("L1", "Just prose", ["w1", "w2"]),
+        ]
+        md = _blocks_to_markdown(blocks)
+        assert md == "Just prose"
+
+    def test_block_without_id_is_skipped_not_crashed(self):
+        """Hardening: a block missing "Id" must not KeyError the whole page.
+        The by_id map skips it; a well-formed LINE still emits."""
+        blocks = [
+            {"BlockType": "PAGE"},  # no "Id" — pre-hardening this raised KeyError
+            _line("L1", "survives", ["w1"]),
+            _word("w1", "survives"),
+        ]
+        md = _blocks_to_markdown(blocks)
+        assert md == "survives"

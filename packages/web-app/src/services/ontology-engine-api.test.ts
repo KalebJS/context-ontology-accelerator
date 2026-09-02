@@ -122,6 +122,66 @@ describe("ontology-engine API wrappers", () => {
     expect(url).toContain("limit=10");
   });
 
+  // ── ListOntologies wire contract ──
+  // The mirror of packages/ontology-engine/tests/unit/test_list_ontologies_wire_shape.py.
+  // The endpoint used to return a bare snake_case array while Smithy declared a
+  // camelCase `{ontologies: [...]}` envelope, so the client read `undefined`,
+  // `?? []` swallowed it, and the UI silently showed nothing. These pin the
+  // client half of that contract, using the exact JSON the backend now emits.
+
+  it("listOntologies unwraps the {ontologies} envelope", async () => {
+    get.mockResolvedValue({
+      ontologies: [
+        { ontologyId: "http://ex.org/o#", uri: "http://ex.org/o#" },
+        { ontologyId: "http://ex.org/p#", uri: "http://ex.org/p#" },
+      ],
+    });
+    const rows = await listOntologies(api, "ns");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].ontologyId).toBe("http://ex.org/o#");
+  });
+
+  it("listOntologies surfaces the camelCase fields the UI depends on", async () => {
+    // parseStatus drives the Ingesting/Ready/Failed indicator; deleteError tells
+    // a stuck teardown from one still running. Both were absent from the old
+    // contract, so both are asserted here rather than assumed.
+    get.mockResolvedValue({
+      ontologies: [
+        {
+          ontologyId: "http://ex.org/o#",
+          uri: "http://ex.org/o#",
+          ontologyType: "induced",
+          parseStatus: "ok",
+          status: "deleting",
+          deleteError: "Neptune DROP timed out",
+          classCount: 5,
+          embeddingCount: 10,
+          createdAt: "2026-07-01T00:00:00Z",
+        },
+      ],
+    });
+    const [row] = await listOntologies(api, "ns");
+    expect(row.parseStatus).toBe("ok");
+    expect(row.status).toBe("deleting");
+    expect(row.deleteError).toBe("Neptune DROP timed out");
+    expect(row.ontologyType).toBe("induced");
+    expect(row.classCount).toBe(5);
+    expect(row.embeddingCount).toBe(10);
+    expect(row.createdAt).toBe("2026-07-01T00:00:00Z");
+  });
+
+  it("listOntologies yields [] for an empty namespace, not undefined", async () => {
+    get.mockResolvedValue({ ontologies: [] });
+    await expect(listOntologies(api, "ns")).resolves.toEqual([]);
+  });
+
+  it("listOntologies degrades to [] if a legacy deployment omits the envelope", async () => {
+    // Guards the rollout window where the web app is ahead of the API: callers
+    // get an empty list rather than a crash mid-render.
+    get.mockResolvedValue([{ ontology_id: "legacy" }]);
+    await expect(listOntologies(api, "ns")).resolves.toEqual([]);
+  });
+
   it("deleteOntology DELs with the ontology_id query param (IRI-encoded)", async () => {
     await deleteOntology(api, "ns", "http://ex.org/o#Thing");
     expect(del).toHaveBeenCalledWith(
