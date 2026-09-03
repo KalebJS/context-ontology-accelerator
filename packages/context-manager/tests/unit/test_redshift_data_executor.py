@@ -20,6 +20,7 @@ from coa_serve.clients.redshift_data import (
     RedshiftQueryError,
     RedshiftTimeoutError,
 )
+from coa_serve.clients.sources_registry import SQLNamespaceScope
 
 
 def _make_executor(client: MagicMock) -> RedshiftDataAPIExecutor:
@@ -187,6 +188,24 @@ class TestStateMachine:
 
         with pytest.raises(ValueError, match="workgroup"):
             await ex.execute("SELECT id FROM claims", namespace="ns", data_source_id="src", timeout_seconds=5)
+        client.execute_statement.assert_not_called()
+
+    async def test_foreign_qualified_database_is_denied_before_data_api_submission(self):
+        client = MagicMock()
+        ex = _make_executor(client)
+        ex._resolve_workgroup_and_database = _AsyncReturn(("my-wg", "tenant_a_db"))
+        ex._sources.sql_namespace_scope = _AsyncReturn(
+            SQLNamespaceScope(native_databases=frozenset({"tenant_a_db"}), federated_catalog_schemas=frozenset())
+        )
+
+        with pytest.raises(RedshiftQueryError, match="outside the requested namespace"):
+            await ex.execute(
+                "SELECT * FROM AwsDataCatalog.tenant_b_db.customers",
+                namespace="tenant-a",
+                data_source_id="src",
+                timeout_seconds=5,
+            )
+
         client.execute_statement.assert_not_called()
 
 

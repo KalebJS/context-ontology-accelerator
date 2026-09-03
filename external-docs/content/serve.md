@@ -185,11 +185,29 @@ shape (single- vs cross-source); see the [Sources Guide](sources.md#direct-sql-v
 
 ## Access Control on Queries
 
-Every query passes through the Cedar authorization and SQL Firewall:
+Authorization runs at **two** points, so that surfaces which never generate SQL are
+covered as well as those that do:
 
-1. **Cedar**: Checks if the user's roles allow `query` on the target namespace
-2. **SQL Firewall**: Enforces per-user table allowlists and column denylists
-3. **Metric allowlist**: Restricts which metrics a user can resolve (if configured)
+1. **Namespace admission gate (Cedar)** — before anything is dispatched, the caller's
+   roles are resolved from the validated token and Cedar decides whether they may
+   `query` the requested namespace at all. This applies to **every** namespace-scoped
+   surface: the full query path (Tier 1/2/3) and the isolated `translate`, `kbSearch`
+   and `graphTraverse` operations. A caller with no grant on the namespace is
+   rejected with `403 Access denied` before any retrieval runs.
+2. **SQL Firewall (Tier 1/2 only)** — for queries that execute SQL, the firewall
+   validates the statement and enforces per-user table allowlists and column
+   denylists, then applies the Cedar namespace policy again as a final gate.
+3. **Metric allowlist** — restricts which metrics a user can resolve (if configured).
+
+The admission gate is what protects the paths that produce no SQL — Tier 3 document
+retrieval, graph traversal and synthesis, plus the isolated retrieval operations. It
+fails closed: if the caller's grants cannot be read, the request is rejected
+(`502`, retryable) rather than served, and in production a caller with no resolved
+roles is denied.
+
+> **Note:** `DescribeSchema` and `ListMetrics` do not pass through the Context
+> Manager. They are authorized by the API Gateway Cedar authorizer (and, for MCP
+> callers, by a per-tool Cedar check) against the same namespace roles.
 
 These restrictions are configured via [Namespace Management Guide](namespaces.md) permissions.
 

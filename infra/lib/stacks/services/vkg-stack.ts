@@ -262,6 +262,19 @@ export class VkgStack extends SCLStack {
     );
     reloadFn.addToRolePolicy(
       new iam.PolicyStatement({
+        // The scheduled sweep enumerates per-namespace VKG services.
+        // ecs:ListServices has no resource type in the IAM authorization model,
+        // so it must use Resource:"*"; scope it to this cluster via the
+        // ecs:cluster condition key instead (same shape as PutMetricData below).
+        actions: ["ecs:ListServices"],
+        resources: ["*"],
+        conditions: {
+          ArnEquals: { "ecs:cluster": this.cluster.clusterArn },
+        },
+      }),
+    );
+    reloadFn.addToRolePolicy(
+      new iam.PolicyStatement({
         actions: ["ecs:RegisterTaskDefinition", "ecs:DescribeTaskDefinition"],
         resources: ["*"],
       }),
@@ -349,6 +362,24 @@ export class VkgStack extends SCLStack {
         new targets.LambdaFunction(reloadFn, {
           maxEventAge: cdk.Duration.minutes(5),
           retryAttempts: 2,
+        }),
+      ],
+    });
+
+    // Scheduled sweep: weekly, reconcile EVERY per-namespace VKG service to the
+    // latest SSM image. OntologyPublishedRule only refreshes a namespace when
+    // its ontology is re-accepted, so a long-lived namespace that is never
+    // republished keeps its provision-time image forever — and Renovate
+    // base-image digest bumps never reach a running task, leaving stale
+    // (Inspector-flagged) VKG images. The sweep closes that gap. It is a no-op
+    // per namespace when the image already matches, and each reload deploys with
+    // the circuit-breaker + rollback in the handler, so a bad image self-heals.
+    new events.Rule(this, "VkgReloadSweepRule", {
+      ruleName: this.prefixed("vkg-reload-sweep"),
+      schedule: events.Schedule.rate(cdk.Duration.days(7)),
+      targets: [
+        new targets.LambdaFunction(reloadFn, {
+          event: events.RuleTargetInput.fromObject({ sweep: true }),
         }),
       ],
     });

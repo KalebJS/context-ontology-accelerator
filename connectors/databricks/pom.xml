@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>dev.coa</groupId>
+    <artifactId>connectors</artifactId>
+    <version>1.0.0</version>
+  </parent>
+
+  <artifactId>databricks-connector</artifactId>
+  <packaging>jar</packaging>
+  <name>Databricks SQL Warehouse connector</name>
+  <description>
+    Athena Query Federation connector for one Databricks SQL Warehouse: one Unity Catalog catalog,
+    and either one pinned schema or every schema within it. Reads columns, comments and declared
+    keys from Unity Catalog's information_schema and emits the keys as @pk / @fk comment tags;
+    reads rows over JDBC.
+  </description>
+
+  <properties>
+    <!--
+      The open-source Databricks JDBC driver, Apache-2.0, from
+      github.com/databricks/databricks-jdbc. NOT the 2.x line under the same coordinates,
+      which is the Simba-derived driver under the proprietary "Databricks JDBC Driver
+      License" and is a redistribution question we do not need to answer. The two lines
+      share groupId AND artifactId and are told apart only by version, so this property is
+      load-bearing: see the README's "Driver licence" section before changing it.
+    -->
+    <databricks.jdbc.version>3.4.2</databricks.jdbc.version>
+    <!--
+      AWS's shared JDBC foundation, Apache-2.0, released on the same cadence and at the same
+      version as the federation SDK the aggregator pins. Keep the two equal: the published
+      artifact is a shaded uber jar carrying its own copy of the SDK and Arrow, so a version
+      skew would put two SDK builds in one jar with the shade plugin picking per path.
+      The shade filter below keeps only the classes this connector actually extends.
+    -->
+    <athena.jdbc.version>${athena.federation.sdk.version}</athena.jdbc.version>
+    <slf4j.version>2.0.17</slf4j.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>dev.coa</groupId>
+      <artifactId>coa-connector-toolkit</artifactId>
+    </dependency>
+
+    <!--
+      The record path: JdbcRecordHandler's typed per-column extractors and
+      JdbcSplitQueryBuilder's constraints-to-prepared-statement translation. The metadata
+      path is deliberately NOT inherited - it builds schemas from JDBC result-set metadata,
+      which carries neither comments nor constraints.
+    -->
+    <dependency>
+      <groupId>com.amazonaws</groupId>
+      <artifactId>athena-jdbc</artifactId>
+      <version>${athena.jdbc.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>com.databricks</groupId>
+      <artifactId>databricks-jdbc</artifactId>
+      <version>${databricks.jdbc.version}</version>
+    </dependency>
+
+    <!--
+      Without an SLF4J provider every log line from this connector AND from the federation
+      SDK is discarded - the reference connector prints "No SLF4J providers were found" on
+      every invocation. Levels are pinned in src/main/resources/simplelogger.properties,
+      which is the only place they can be pinned: the CDK construct owns JAVA_TOOL_OPTIONS
+      outright and refuses a caller that sets it.
+    -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+
+    <!-- Reads the credential secret's JSON. Already on the SDK's classpath; named here so
+         this module does not depend on a transitive. -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.18.3</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <!--
+          The one connector that needs shade configuration of its own, and the id matters:
+          the aggregator declares this plugin inside an execution, so a plugin-level
+          <configuration> here would be ignored outright rather than merged.
+
+          Restating the aggregator's global excludes is deliberate. Maven replaces a list
+          rather than appending to it, so a child <filters> block silently drops the
+          parent's - and the parent's is what keeps signature files out of the fat jar.
+        -->
+        <executions>
+          <execution>
+            <id>default</id>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>module-info.class</exclude>
+                  </excludes>
+                </filter>
+                <!--
+                  athena-jdbc ships as a 46 MB uber jar: 39 classes we want, and 29,400
+                  files that are its own shaded copy of the federation SDK, Arrow, the AWS
+                  SDK, Netty, log4j-core, Bouncy Castle and HikariCP. Unfiltered, every one
+                  of those competes by path with the artifact that legitimately provides it
+                  and the shade plugin keeps whichever it saw first. Take the 39 classes.
+
+                  This filter is also what keeps the connector's LOGGING working. That uber
+                  jar bundles log4j-slf4j2-impl, service file included, so without the filter
+                  the fat jar would carry TWO SLF4J providers and simplelogger.properties
+                  would stop controlling levels - silently, and the SDK's predicate-carrying
+                  request logs are what those levels exist to quieten. Loosen this and check
+                  META-INF/services/org.slf4j.spi.SLF4JServiceProvider in the built jar.
+
+                  SIZE BUDGET, measured after this filter: 83 MB zipped, 212.6 MB unzipped,
+                  against Lambda's 250 MB unzipped limit for a function's code - 85%, so
+                  about 37 MB of headroom. The zipped figure exceeds the 50 MB direct-upload
+                  limit, which does not bind: CDK ships the jar as an S3 asset. Any
+                  dependency bump should re-measure, because the failure mode is a deploy
+                  that CloudFormation rejects rather than a build that fails:
+
+                    unzip -l target/databricks-connector-1.0.0.jar | tail -2
+                -->
+                <filter>
+                  <artifact>com.amazonaws:athena-jdbc</artifact>
+                  <includes>
+                    <include>com/amazonaws/athena/connectors/jdbc/**</include>
+                  </includes>
+                </filter>
+              </filters>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

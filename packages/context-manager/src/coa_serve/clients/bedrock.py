@@ -736,14 +736,25 @@ class BedrockLLMClient:
         if guard_content:
             # guardContent tag tells Bedrock guardrail to evaluate only this
             # block for prompt attacks, leaving retrieved context untouched.
-            # Bedrock delivers the text to the model whether or not a
-            # guardrailConfig is set — without one, the block is simply not
-            # guardrail-scored. Callers that use guardContent as their SOLE
-            # channel for untrusted user text (e.g. tier2 nl_to_sql /
-            # nl_to_sparql, per the tier3 pattern) depend on this — with
-            # the previous `and guardrail_id` gate, a deployment without a
-            # guardrail would silently drop the user's question.
-            content.append({"guardContent": {"text": {"text": guard_content}}})
+            # Callers that use guardContent as their SOLE channel for untrusted
+            # user text (tier2 nl_to_sql / nl_to_sparql, tier3 synthesizer, per
+            # the tier3 pattern) depend on the text reaching the model either
+            # way, so with no guardrail it is sent as an ordinary text block.
+            #
+            # It cannot stay a guardContent block: Converse REJECTS one when no
+            # guardrailConfig accompanies it — "The guardrail can't assess the
+            # content in the guardContent field. The guardrail configuration is
+            # missing." (ValidationException, ~110ms, reproducible against
+            # bedrock-runtime directly). So an unguarded deployment — which
+            # ALLOW_NO_GUARDRAIL permits and SERVE_GUARDRAILS_DISABLED creates —
+            # failed EVERY Tier-2 generation, returning empty SQL: 135/135
+            # questions on the first benchmark run of this switch. Nothing is
+            # guardrail-scored in that configuration either way, so the only
+            # difference the tag makes is whether the call is accepted at all.
+            if guardrail_id:
+                content.append({"guardContent": {"text": {"text": guard_content}}})
+            else:
+                content.append({"text": guard_content})
 
         kwargs: dict[str, Any] = {
             "modelId": effective_model_id,

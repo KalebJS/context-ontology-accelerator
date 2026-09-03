@@ -30,6 +30,28 @@ async def _invoke_collect(payload, context=None):
     return results[0] if len(results) == 1 else results
 
 
+# Real reference to the admission gate, captured before any patching so the
+# dedicated gate tests below can restore it over the module-level bypass.
+from coa_serve.main import _authorize_namespace_access as _REAL_ADMISSION_GATE  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _bypass_namespace_admission():
+    """Bypass the F-2 Cedar admission gate for the pre-existing behavioral tests.
+
+    These tests predate the gate and exercise downstream dispatch/resolution with
+    bare ``MagicMock`` orchestrators (whose ``authorize_namespace().denied`` would
+    be truthy). Patching the gate to a no-op ALLOW keeps them focused on what they
+    assert; the gate itself is covered end-to-end by ``TestNamespaceAdmissionGate``
+    (which restores the real gate) and at the decision level in
+    ``test_authz_invariants.py``. Returning ``(None, None)`` means "allowed, no
+    pre-resolved profile" so the query path still runs its own resolve_profile —
+    preserving the profile-resolution tests unchanged.
+    """
+    with patch("coa_serve.main._authorize_namespace_access", new_callable=AsyncMock, return_value=(None, None)):
+        yield
+
+
 @pytest.fixture
 def config():
     return ServiceConfig(
@@ -337,6 +359,57 @@ class TestInvokeFunction:
         assert result["statusCode"] == 400
         assert result["error"] == "ValidationError"
         registry.namespace_exists.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_indeterminate_existence_fails_closed_when_table_configured(self, mock_init, config):
+        """F-2: a lookup error (None) with the namespaces table configured must fail
+        CLOSED — never dispatch a query against a namespace we could not verify.
+        """
+        mock_init.return_value = None
+        import coa_serve.main as main_mod
+
+        orch = MagicMock()
+        orch.resolve = AsyncMock()
+        main_mod._orchestrator = orch
+        registry = MagicMock()
+        registry.namespace_exists = AsyncMock(return_value=None)
+        registry.namespaces_configured = True
+        main_mod._sources_registry = registry
+
+        result = await _invoke_collect({"query": "test", "namespace": "demo"})
+
+        assert result["statusCode"] == 502
+        orch.resolve.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    async def test_indeterminate_existence_proceeds_when_table_unconfigured(self, mock_init, config):
+        """The counterpart: no namespaces table (feature absent) → None means
+        "cannot check", not an error, so the request must still proceed.
+        """
+        mock_init.return_value = None
+        import coa_serve.main as main_mod
+
+        orch = MagicMock()
+        orch.resolve = AsyncMock(
+            return_value=InvokeResponse(
+                result=QueryResult(
+                    tier=3,
+                    confidence=ConfidenceScore(score=0.5, rationale="ok"),
+                    trace=[TraceStep(step="s", status="success", duration_ms=0)],
+                    metadata={},
+                ),
+            )
+        )
+        main_mod._orchestrator = orch
+        registry = MagicMock()
+        registry.namespace_exists = AsyncMock(return_value=None)
+        registry.namespaces_configured = False
+        main_mod._sources_registry = registry
+
+        result = await _invoke_collect({"query": "test", "namespace": "demo"})
+
+        assert result.get("statusCode", 200) not in (404, 502)
+        orch.resolve.assert_awaited_once()
 
     @patch("coa_serve.main._ensure_initialized")
     async def test_invoke_validation_error_does_not_leak_constraints(self, mock_init, config):
@@ -822,3 +895,230 @@ class TestHandleKbSearch:
 
         assert result["statusCode"] == 400
         mock_orchestrator._bedrock_client.embed.assert_not_called()
+
+
+@pytest.mark.unit
+class TestNamespaceAdmissionGate:
+    """F-2 (CWE-862): invoke() gates every namespace-scoped surface before dispatch.
+
+    Runs the REAL admission gate (restoring it over the module-level bypass) so a
+    denied namespace short-circuits to 403 BEFORE any retrieval or orchestration,
+    for both an isolated action (kbSearch) and the full query path.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_and_restore_gate(self):
+        import coa_serve.main as main_mod
+
+        main_mod._config = None
+        main_mod._orchestrator = None
+        main_mod._sources_registry = None
+        # Restore the real gate over the module-level bypass fixture.
+        with patch("coa_serve.main._authorize_namespace_access", _REAL_ADMISSION_GATE):
+            yield
+        main_mod._config = None
+        main_mod._orchestrator = None
+        main_mod._sources_registry = None
+
+    @staticmethod
+    def _orchestrator(*, denied: bool):
+        from coa_serve.tier2.sql_firewall import FirewallResult
+
+        orch = MagicMock()
+        orch.authorize_namespace.return_value = FirewallResult(
+            denied=denied, authorized_sql="", reason="not permitted" if denied else None
+        )
+        orch.resolve = AsyncMock(
+            return_value=InvokeResponse(
+                result=QueryResult(
+                    tier=3,
+                    confidence=ConfidenceScore(score=0.5, rationale="ok"),
+                    trace=[TraceStep(step="s", status="success", duration_ms=0)],
+                    metadata={},
+                ),
+            )
+        )
+        # Isolated-action dependencies — must never be touched on a denied request.
+        orch._knowledge_retriever = MagicMock()
+        orch._knowledge_retriever._vector = AsyncMock()
+        orch._bedrock_client = AsyncMock()
+        return orch
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_kb_search_denied_returns_403_without_retrieval(self, mock_resolve, mock_init):
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        mock_init.return_value = None
+        mock_resolve.return_value = ResolvedProfile(user_id="attacker")
+        orch = self._orchestrator(denied=True)
+        main_mod._orchestrator = orch
+
+        result = await _invoke_collect({"action": "kbSearch", "query": "secret", "namespace": "victim"})
+
+        assert result["statusCode"] == 403
+        assert result["error"] == "AccessDeniedError"
+        orch.authorize_namespace.assert_called_once()
+        # The retriever/embedder must never run for an unauthorized namespace.
+        orch._bedrock_client.embed.assert_not_called()
+        orch._knowledge_retriever._vector.search.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_query_denied_returns_403_without_orchestration(self, mock_resolve, mock_init):
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        mock_init.return_value = None
+        mock_resolve.return_value = ResolvedProfile(user_id="attacker")
+        orch = self._orchestrator(denied=True)
+        main_mod._orchestrator = orch
+
+        result = await _invoke_collect({"query": "secret", "namespace": "victim", "options": {"tierOverride": 3}})
+
+        assert result["statusCode"] == 403
+        orch.resolve.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_translate_denied_returns_403_without_translation(self, mock_resolve, mock_init):
+        """`translate` is one of the three isolated actions that were ungated (F-2)."""
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        mock_init.return_value = None
+        mock_resolve.return_value = ResolvedProfile(user_id="attacker")
+        orch = self._orchestrator(denied=True)
+        main_mod._orchestrator = orch
+        nl = AsyncMock()
+
+        with patch("coa_serve.main._nl_to_sparql", nl):
+            result = await _invoke_collect({"action": "translate", "query": "secret", "namespace": "victim"})
+
+        assert result["statusCode"] == 403
+        assert result["error"] == "AccessDeniedError"
+        orch.authorize_namespace.assert_called_once()
+        # Translation must not run for an unauthorized namespace.
+        nl.translate.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_graph_traverse_denied_returns_403_without_traversal(self, mock_resolve, mock_init):
+        """`graphTraverse` is one of the three isolated actions that were ungated (F-2)."""
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        mock_init.return_value = None
+        mock_resolve.return_value = ResolvedProfile(user_id="attacker")
+        orch = self._orchestrator(denied=True)
+        graph = AsyncMock()
+        orch._knowledge_retriever._graph = graph
+        main_mod._orchestrator = orch
+
+        result = await _invoke_collect(
+            {
+                "action": "graphTraverse",
+                "namespace": "victim",
+                "options": {"startUri": "https://example.com/ontology#Claim"},
+            }
+        )
+
+        assert result["statusCode"] == 403
+        assert result["error"] == "AccessDeniedError"
+        orch.authorize_namespace.assert_called_once()
+        # Graph traversal must not run for an unauthorized namespace.
+        graph.traverse_from_uris.assert_not_called()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_grant_lookup_failure_fails_closed_as_retryable(self, mock_resolve, mock_init):
+        """A DynamoDB fault must reject the request, but as a retryable 502 — not a
+        403, which would make a transient outage look like mass access revocation.
+        """
+        import coa_serve.main as main_mod
+
+        mock_init.return_value = None
+        mock_resolve.side_effect = RuntimeError("dynamodb throttled")
+        orch = self._orchestrator(denied=False)
+        main_mod._orchestrator = orch
+
+        result = await _invoke_collect({"query": "hello", "namespace": "mine"})
+
+        assert result["statusCode"] == 502
+        # Rejected before any authorization decision or orchestration.
+        orch.authorize_namespace.assert_not_called()
+        orch.resolve.assert_not_called()
+        # The internal cause must not reach the caller.
+        assert "dynamodb" not in str(result).lower()
+
+    @patch("coa_serve.main._ensure_initialized")
+    @patch("coa_serve.main.resolve_profile")
+    async def test_allowed_namespace_reaches_orchestrator(self, mock_resolve, mock_init):
+        import coa_serve.main as main_mod
+        from coa_serve.role_resolver import ResolvedProfile
+
+        mock_init.return_value = None
+        mock_resolve.return_value = ResolvedProfile(user_id="owner")
+        orch = self._orchestrator(denied=False)
+        main_mod._orchestrator = orch
+
+        result = await _invoke_collect({"query": "hello", "namespace": "mine"})
+
+        orch.authorize_namespace.assert_called_once()
+        orch.resolve.assert_awaited_once()
+        assert result.get("statusCode", 200) != 403
+
+
+@pytest.mark.unit
+class TestResolvePrincipal:
+    """resolve_principal centralizes the JWT-authoritative (user_id, groups) rule."""
+
+    def test_jwt_sub_and_groups_win_over_body(self):
+        from coa_serve.identity import resolve_principal
+
+        uid, groups = resolve_principal(
+            {"userId": "body-attacker", "groups": ["admin"]},
+            "jwt-sub",
+            "a@x.com",
+            ["viewer"],
+        )
+        assert uid == "jwt-sub"
+        assert groups == ["viewer"]
+
+    def test_authenticated_caller_with_no_groups_does_not_fall_back_to_body(self):
+        """A JWT with no groups is authenticated-with-no-groups, not "use the body"."""
+        from coa_serve.identity import resolve_principal
+
+        uid, groups = resolve_principal({"groups": ["admin"]}, "jwt-sub", "", [])
+        assert uid == "jwt-sub"
+        assert groups == []
+
+    def test_profile_fallback_only_without_jwt(self):
+        from coa_serve.identity import resolve_principal
+
+        uid, groups = resolve_principal({"userId": "u1", "groups": ["g1"]}, "", "", [])
+        assert uid == "u1"
+        assert groups == ["g1"]
+
+    def test_comma_joined_group_string_is_normalized(self):
+        from coa_serve.identity import resolve_principal
+
+        _, groups = resolve_principal({"groups": "g1, g2 ,, g3"}, "", "", [])
+        assert groups == ["g1", "g2", "g3"]
+
+    @pytest.mark.parametrize("bad", [42, {"a": 1}, 3.5, True])
+    def test_malformed_groups_type_is_discarded(self, bad):
+        """`profile` is attacker-controlled on the direct path — a non-list/str
+        `groups` must not escape and violate the list[str] contract.
+        """
+        from coa_serve.identity import resolve_principal
+
+        _, groups = resolve_principal({"groups": bad}, "", "", [])
+        assert groups == []
+
+    def test_non_string_group_members_are_dropped(self):
+        from coa_serve.identity import resolve_principal
+
+        _, groups = resolve_principal({"groups": ["ok", 7, None, "  ", "also-ok"]}, "", "", [])
+        assert groups == ["ok", "also-ok"]

@@ -2,7 +2,7 @@ cedarpy>=4.8.7
 pydantic>=2.13.4
 pydantic-settings>=2.15.0
 structlog>=24.4.0
-cryptography>=50.0.0
+cryptography>=50.0.1
 PyJWT>=2.13.0
 requests>=2.34.2
 # Namespace teardown drops the namespace's AOSS indexes via

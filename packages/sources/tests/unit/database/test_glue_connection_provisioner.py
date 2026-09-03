@@ -267,17 +267,17 @@ class TestProvisionFederatedCatalog:
 @pytest.mark.unit
 class TestCatalogNaming:
     def test_distinct_ids_distinct_names(self):
-        from coa_sources.database.connectors.glue_connection_provisioner import _build_catalog_name
+        from coa_sources.database.connectors.glue_connection_provisioner import build_catalog_name
 
-        assert _build_catalog_name(f"{RESOURCE_PREFIX}-dev-", "ds-1") != _build_catalog_name(
+        assert build_catalog_name(f"{RESOURCE_PREFIX}-dev-", "ds-1") != build_catalog_name(
             f"{RESOURCE_PREFIX}-dev-", "ds_1"
         )
 
     def test_name_is_lowercase_and_bounded(self):
-        from coa_sources.database.connectors.glue_connection_provisioner import _build_catalog_name
+        from coa_sources.database.connectors.glue_connection_provisioner import build_catalog_name
 
-        n = _build_catalog_name(f"{RESOURCE_PREFIX}-dev-", "abc-123")
-        assert n == _build_catalog_name(f"{RESOURCE_PREFIX}-dev-", "abc-123")
+        n = build_catalog_name(f"{RESOURCE_PREFIX}-dev-", "abc-123")
+        assert n == build_catalog_name(f"{RESOURCE_PREFIX}-dev-", "abc-123")
         assert n[0].isalpha() and n == n.lower() and len(n) <= 41
         assert all(c.isalnum() or c == "_" for c in n)
 

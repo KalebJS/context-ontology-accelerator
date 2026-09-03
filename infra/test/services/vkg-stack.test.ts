@@ -360,4 +360,35 @@ describe("VkgStack", () => {
 
     expect(sources).toContain("sclz.ontology");
   });
+
+  // ── Scheduled reload sweep ────────────────────────────────────────
+
+  test("schedules a weekly VKG reload sweep invoking the reload Lambda with {sweep:true}", () => {
+    template.hasResourceProperties("AWS::Events::Rule", {
+      Name: `${PREFIX}-vkg-reload-sweep`,
+      ScheduleExpression: "rate(7 days)",
+      Targets: Match.arrayWith([
+        Match.objectLike({ Input: '{"sweep":true}' }),
+      ]),
+    });
+  });
+
+  test("reload Lambda may list services in the cluster (for the sweep)", () => {
+    template.hasResourceProperties("AWS::IAM::Policy", {
+      PolicyDocument: {
+        Statement: Match.arrayWith([
+          // ecs:ListServices has no resource type — must be Resource:"*",
+          // scoped to this cluster via the ecs:cluster condition key.
+          Match.objectLike({
+            Action: "ecs:ListServices",
+            Effect: "Allow",
+            Resource: "*",
+            Condition: {
+              ArnEquals: { "ecs:cluster": Match.anyValue() },
+            },
+          }),
+        ]),
+      },
+    });
+  });
 });

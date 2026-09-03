@@ -206,11 +206,12 @@ class TestTestConnection:
         assert engine in result.message
         mock_socket.assert_not_called()
 
-    @patch("coa_sources.database.connectors.jdbc.boto3")
+    @patch("coa_sources.database.connectors.sts_assume.boto3")
     @patch("coa_sources.database.connectors.jdbc.socket.create_connection")
     def test_cross_account_role(self, mock_socket, mock_boto3, connector, base_config):
         base_config["cross_account_role_arn"] = "arn:aws:iam::999999999999:role/cross-role"
         base_config["external_id"] = "my-external-id"
+        base_config["namespace_id"] = "ns-7"
         mock_socket.return_value = MagicMock()
         mock_sts = MagicMock()
         mock_sts.assume_role.return_value = {
@@ -237,11 +238,33 @@ class TestTestConnection:
 
         assert result.success
         mock_boto3.client.assert_called_with("sts", region_name="us-east-1")
+        # The session name reaches the data owner's CloudTrail, so it names the
+        # requesting namespace rather than a fixed connector string.
         mock_sts.assume_role.assert_called_once_with(
             RoleArn="arn:aws:iam::999999999999:role/cross-role",
-            RoleSessionName="coa-jdbc-connector",
+            RoleSessionName="coa-jdbc-ns-7",
             ExternalId="my-external-id",
         )
+
+    @patch("coa_sources.database.connectors.sts_assume.boto3")
+    @patch("coa_sources.database.connectors.jdbc.socket.create_connection")
+    def test_cross_account_role_without_external_id_is_refused(self, mock_socket, mock_boto3, connector, base_config):
+        """No external_id → the credential fetch must not assume the role at all.
+
+        Without an ExternalId the assume carries no evidence of which namespace
+        requested it, so a caller could point a source at another tenant's role.
+        The connector reports an auth failure instead of assuming unconditioned.
+        """
+        base_config["cross_account_role_arn"] = "arn:aws:iam::999999999999:role/cross-role"
+        base_config.pop("external_id", None)
+        mock_socket.return_value = MagicMock()
+        mock_sts = MagicMock()
+        mock_boto3.client.return_value = mock_sts
+
+        result = connector.test_connection(base_config)
+
+        assert not result.success
+        mock_sts.assume_role.assert_not_called()
 
 
 class TestDiscoverMetadata:

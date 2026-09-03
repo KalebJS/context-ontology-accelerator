@@ -96,6 +96,10 @@ class UnsafeSQLError(ValueError):
     """Raised when SQL fails safety validation (non-SELECT, dangerous functions, etc.)."""
 
 
+class NamespaceSQLScopeError(ValueError):
+    """Raised when SQL names an object outside the requested namespace's sources."""
+
+
 @dataclass(frozen=True)
 class _QueryRefs:
     """Table and column references extracted from a SQL statement.
@@ -318,6 +322,31 @@ class SQLFirewall:
         logger.info("sql_firewall_evaluate", tables=sorted(refs.tables), decision="allow", restricted=True)
         return self._apply_cedar(sql, namespace, profile)
 
+    def authorize_namespace(self, namespace: str, profile: dict[str, Any] | None = None) -> FirewallResult:
+        """Coarse namespace admission gate (Cedar only), independent of any SQL.
+
+        Answers "may this principal query in this namespace at all?" — the same
+        ``SCL::Action::"query"`` decision the SQL path applies, but for retrieval
+        surfaces that never build SQL and so never reach :meth:`evaluate`: the
+        isolated ``kbSearch`` / ``graphTraverse`` / ``translate`` actions and the
+        Tier-3 retrieval/synthesis path. This is their ONLY namespace
+        authorization point; without it any authenticated IdP user could read any
+        namespace's chunks, graph and synthesized answers (F-2, CWE-862).
+
+        Fails CLOSED: an evaluator error denies, and (in prod) a caller with no
+        resolved roles denies — the posture is owned by the ``CedarAuthorizer``.
+        ``authorized_sql`` is empty because there is no SQL on this path.
+        """
+        ns = namespace or str((profile or {}).get("namespace", ""))
+        reason = self._cedar_gate(ns, profile or {}, tables=[])
+        if reason is not None:
+            # Logged here rather than via ``_deny`` so the event name reflects the
+            # namespace-admission path — ``_deny`` emits ``sql_firewall_evaluate``,
+            # which would be misleading when no SQL was evaluated at all.
+            logger.warning("namespace_authorize_denied", namespace=ns, reason=reason)
+            return FirewallResult(denied=True, authorized_sql="", reason=reason)
+        return FirewallResult(denied=False, authorized_sql="")
+
     def _apply_cedar(self, sql: str, namespace: str, profile: dict[str, Any]) -> FirewallResult:
         """Apply the Cedar policy gate as a final authorization step.
 
@@ -327,24 +356,39 @@ class SQLFirewall:
         passed (evaluate() does not currently receive it as a parameter).
         """
         ns = namespace or str(profile.get("namespace", ""))
-        tables = self.extract_tables(sql)
+        reason = self._cedar_gate(ns, profile, tables=self.extract_tables(sql))
+        if reason is not None:
+            return self._deny(reason)
+        return FirewallResult(denied=False, authorized_sql=sql)
+
+    def _cedar_gate(self, namespace: str, profile: dict[str, Any], tables: list[str]) -> str | None:
+        """Run the Cedar policy decision. Returns a deny REASON, or None if allowed.
+
+        The single call site for the Cedar authorizer, shared by the SQL path
+        (:meth:`_apply_cedar`) and the SQL-free namespace gate
+        (:meth:`authorize_namespace`) so the fail-closed error handling exists
+        exactly once. Returns the reason string rather than a ``FirewallResult``
+        so each caller keeps its own ``authorized_sql`` and emits its own log
+        event (the SQL path's ``sql_firewall_evaluate`` would misdescribe the
+        namespace-admission path).
+        """
         try:
-            decision = self._cedar.authorize(namespace=ns, profile=profile, tables=tables)
+            decision = self._cedar.authorize(namespace=namespace, profile=profile, tables=tables)
         except Exception as exc:
             # Security-critical path: log full diagnostics server-side (the deny
             # reason returned to the caller stays generic).
             logger.warning(
                 "cedar_authorize_error",
-                namespace=ns,
+                namespace=namespace,
                 table_count=len(tables),
                 error=type(exc).__name__,
                 error_msg=str(exc),
                 exc_info=True,
             )
-            return self._deny("Authorization policy evaluation failed")
+            return "Authorization policy evaluation failed"
         if not decision.allowed:
-            return self._deny(decision.reason or "Access denied by policy")
-        return FirewallResult(denied=False, authorized_sql=sql)
+            return decision.reason or "Access denied by policy"
+        return None
 
     @staticmethod
     def _deny(reason: str) -> FirewallResult:
@@ -369,6 +413,56 @@ class SQLFirewall:
             cols = ", ".join(f"{table}.{c}" for c in sorted(blocked))
             return f"Access denied to column(s): {cols}"
         return None
+
+    @staticmethod
+    def validate_namespace_sql_scope(
+        sql: str,
+        *,
+        native_databases: frozenset[str],
+        federated_catalog_schemas: frozenset[tuple[str, str]],
+        default_catalog: str,
+    ) -> bool:
+        """Authorize qualified table references against one namespace's sources.
+
+        Returns ``True`` when a query contains at least one catalog/database
+        qualifier (and therefore needed this check), ``False`` for bare-table SQL.
+        Bare names resolve through the executor's namespace-scoped query context;
+        this method protects the attacker-controlled qualifiers that override it.
+
+        ``information_schema`` is denied rather than treated as a normal schema:
+        querying it under ``AwsDataCatalog`` can enumerate every Glue database the
+        shared runtime role can see, including other namespaces' sources.
+        """
+        try:
+            parsed = sqlglot.parse_one(sql, read="trino")
+        except sqlglot.errors.ParseError as exc:
+            raise NamespaceSQLScopeError("Unable to verify SQL references") from exc
+
+        cte_names = {cte.alias_or_name.lower() for cte in parsed.find_all(sqlglot.exp.CTE)}
+        checked = False
+        default_catalog_lc = (default_catalog or "AwsDataCatalog").lower()
+
+        for table in parsed.find_all(sqlglot.exp.Table):
+            if not table.name or (not table.db and table.name.lower() in cte_names):
+                continue
+            catalog = (table.catalog or "").lower()
+            database = (table.db or "").lower()
+            if not catalog and not database:
+                continue
+            checked = True
+
+            if database == "information_schema":
+                raise NamespaceSQLScopeError("SQL reference is not available in the requested namespace")
+
+            effective_catalog = catalog or default_catalog_lc
+            if effective_catalog == "awsdatacatalog":
+                allowed = bool(database) and database in native_databases
+            else:
+                allowed = bool(database) and (effective_catalog, database) in federated_catalog_schemas
+            if not allowed:
+                raise NamespaceSQLScopeError("SQL reference is not available in the requested namespace")
+
+        return checked
 
     @staticmethod
     def _analyze_refs(sql: str) -> _QueryRefs | None:

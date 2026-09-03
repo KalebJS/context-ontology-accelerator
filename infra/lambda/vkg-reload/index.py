@@ -66,43 +66,124 @@ def _emit_metric(name, namespace):
 
 
 def handler(event, context):
-    """Provision or redeploy the per-namespace VKG service on ontology publish.
+    """Provision or redeploy per-namespace VKG service(s).
 
-    Triggered by an ontology-publish event carrying ``detail.namespace`` and
-    ``detail.version``. Resolves the latest VKG container image from SSM and,
-    if the running service already uses it, forces a new deployment; otherwise
-    registers a fresh task-definition revision with the new image first. If the
-    service does not yet exist, provisions it. Reload outcomes are published as
-    ``ReloadTriggered``/``ReloadFailed`` CloudWatch metrics.
+    Two entry modes:
+
+    * **Per-namespace** (EventBridge ``ontology.published``): the event carries
+      ``detail.namespace`` / ``detail.version`` and only that namespace's VKG
+      service is reconciled.
+    * **Sweep** (scheduled rule with constant input ``{"sweep": true}``): every
+      ``<prefix>-vkg-*`` service in the cluster is reconciled against the latest
+      SSM image. This keeps long-lived namespaces current even when their
+      ontology is never republished — otherwise a base-image digest bump never
+      reaches a running task, which is how stale VKG images accumulate.
 
     Args:
-        event: EventBridge event; ``detail.namespace`` and ``detail.version``
-            identify the ontology being reloaded.
+        event: EventBridge event. ``{"sweep": true}`` selects sweep mode;
+            otherwise ``detail.namespace`` / ``detail.version`` select the
+            per-namespace reload.
         context: Lambda runtime context (unused).
 
     Returns:
-        A status dict describing the outcome (``reload_triggered``, ``skipped``,
-        or ``failed``) with the namespace and, on success, the deployment id.
+        Per-namespace: a status dict (``reload_triggered`` / ``provisioned`` /
+        ``skipped`` / ``failed``). Sweep: ``{"status": "sweep_complete", ...}``
+        with a per-namespace ``results`` list, or ``failed`` if the image cannot
+        be resolved at all.
 
     Raises:
-        Exception: Re-raised after emitting ``ReloadFailed`` when an unexpected
-            error occurs during reload of an existing service.
+        Exception: In per-namespace mode, re-raised after emitting
+            ``ReloadFailed`` on an unexpected error. The sweep isolates
+            per-namespace failures and never raises for a single bad namespace.
     """
-    ns = event.get("detail", {}).get("namespace", "unknown")
-    version = event.get("detail", {}).get("version", "unknown")
     cluster = os.environ["CLUSTER_ARN"]
     prefix = os.environ["RESOURCE_PREFIX"]
+
+    if event.get("sweep") is True:
+        return _sweep(cluster, prefix)
+
+    ns = event.get("detail", {}).get("namespace", "unknown")
+    version = event.get("detail", {}).get("version", "unknown")
 
     if ns == "unknown" or not _NS_PATTERN.match(ns):
         print(json.dumps({"action": "reload_skipped", "reason": "missing or invalid namespace"}))
         return {"status": "skipped", "reason": "missing or invalid namespace"}
 
+    return _reload_one(ns, version, cluster, prefix)
+
+
+def _sweep(cluster, prefix):
+    """Reconcile every per-namespace VKG service in the cluster to the SSM image.
+
+    Resolves the target image once, then reloads each ``<prefix>-vkg-*`` service.
+    A single namespace's failure is recorded and the sweep continues — one broken
+    service must not stop the rest from being patched.
+    """
+    print(json.dumps({"action": "sweep_start", "cluster": cluster}))
+    container_image = _resolve_container_image()
+    if not container_image:
+        print(json.dumps({"action": "sweep_failed", "reason": "cannot resolve container image"}))
+        _emit_metric("ReloadFailed", "sweep")
+        return {"status": "failed", "reason": "cannot resolve container image"}
+
+    try:
+        namespaces = _list_vkg_namespaces(cluster, prefix)
+    except Exception as e:
+        # A failed ListServices (throttling, IAM denial, bad cluster) must not
+        # raise uncaught — surface it like every other reload failure so the
+        # ReloadFailed alarm fires and the run ends cleanly.
+        print(json.dumps({"action": "sweep_failed", "reason": "list_services_failed", "error": str(e)}))
+        _emit_metric("ReloadFailed", "sweep")
+        return {"status": "failed", "reason": f"list services failed: {e}"}
+
+    results = []
+    for ns in namespaces:
+        try:
+            outcome = _reload_one(ns, "scheduled-sweep", cluster, prefix, container_image)
+            results.append({"namespace": ns, "status": outcome.get("status")})
+        except Exception as e:  # one bad namespace must not abort the sweep
+            print(json.dumps({"action": "sweep_item_failed", "namespace": ns, "error": str(e)}))
+            results.append({"namespace": ns, "status": "failed", "error": str(e)})
+
+    triggered = sum(1 for r in results if r["status"] in ("reload_triggered", "provisioned"))
+    print(json.dumps({"action": "sweep_complete", "total": len(results), "triggered": triggered}))
+    return {"status": "sweep_complete", "total": len(results), "triggered": triggered, "results": results}
+
+
+def _list_vkg_namespaces(cluster, prefix):
+    """Return the namespace id of every ``<prefix>-vkg-*`` service in the cluster."""
+    marker = f"{prefix}-vkg-"
+    namespaces = []
+    paginator = ecs.get_paginator("list_services")
+    for page in paginator.paginate(cluster=cluster):
+        for arn in page.get("serviceArns", []):
+            name = arn.split("/")[-1]
+            if name.startswith(marker):
+                namespaces.append(name[len(marker) :])
+    return namespaces
+
+
+def _reload_one(ns, version, cluster, prefix, container_image=None):
+    """Reconcile a single namespace's VKG service to the latest image.
+
+    Resolves the target image from SSM when not supplied (the sweep resolves it
+    once and passes it in for every namespace). If the running service already
+    uses that image, forces a new deployment; otherwise registers a fresh
+    task-definition revision first. If the service does not yet exist, provisions
+    it. Reload outcomes are published as ``ReloadTriggered``/``ReloadFailed``
+    CloudWatch metrics.
+
+    Raises:
+        Exception: Re-raised after emitting ``ReloadFailed`` when an unexpected
+            error occurs during reload of an existing service.
+    """
     service_name = f"{prefix}-vkg-{ns}"
     log = {"action": "reload_start", "namespace": ns, "version": version, "cluster": cluster, "service": service_name}
     print(json.dumps(log))
 
     try:
-        container_image = _resolve_container_image()
+        if container_image is None:
+            container_image = _resolve_container_image()
         if not container_image:
             print(json.dumps({"action": "reload_failed", "namespace": ns, "reason": "cannot resolve container image"}))
             _emit_metric("ReloadFailed", ns)

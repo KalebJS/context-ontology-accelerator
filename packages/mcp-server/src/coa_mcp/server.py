@@ -339,8 +339,9 @@ async def query(
             without executing it. Absent = default (execute).
         tierOverride: Pin resolution to a specific tier (1, 2, or 3), bypassing
             automatic routing. Omit for auto.
-        mode: Execution mode — ``standard`` (single-shot) or ``agentic`` (multi-step
-            reasoning). Absent = the serve deployment default.
+        mode: Execution mode — ``standard`` (single-shot) or ``deep-reasoning``
+            (multi-step reasoning loop; higher recall, much slower). Absent = the
+            serve deployment default.
         dimensions: Dimension filters constraining the query. Each entry is a
             ``{name, value}`` object matching ``DimensionFilter``.
         includeSupporting: Whether to include supporting document chunks (default True).

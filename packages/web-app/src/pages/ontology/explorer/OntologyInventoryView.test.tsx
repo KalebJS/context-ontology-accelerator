@@ -32,44 +32,44 @@ vi.mock("react-router-dom", async () => {
 
 function record(overrides: Partial<OntologyRecord>): OntologyRecord {
   return {
-    ontology_id: "http://ex.org/o",
+    ontologyId: "http://ex.org/o",
     uri: "http://ex.org/o",
     title: "Onto",
-    ontology_type: "foundational",
+    ontologyType: "foundational",
     format: "turtle",
-    domain_tags: [],
-    class_count: 0,
-    property_count: 0,
-    axiom_count: 0,
-    embedding_count: 0,
-    created_at: "2026-07-01T00:00:00Z",
-    updated_at: "2026-07-01T00:00:00Z",
+    domainTags: [],
+    classCount: 0,
+    propertyCount: 0,
+    axiomCount: 0,
+    embeddingCount: 0,
+    createdAt: "2026-07-01T00:00:00Z",
+    updatedAt: "2026-07-01T00:00:00Z",
     ...overrides,
   };
 }
 
 const INDUCED = record({
-  ontology_id: "http://ex.org/induced/sales",
+  ontologyId: "http://ex.org/induced/sales",
   uri: "http://ex.org/induced/sales",
   title: "Sales (induced)",
-  ontology_type: "induced",
-  class_count: 11,
-  property_count: 22,
-  axiom_count: 33,
+  ontologyType: "induced",
+  classCount: 11,
+  propertyCount: 22,
+  axiomCount: 33,
 });
 const FOUNDATIONAL = record({
-  ontology_id: "http://ex.org/fibo",
+  ontologyId: "http://ex.org/fibo",
   uri: "http://ex.org/fibo",
   title: "FIBO",
-  ontology_type: "foundational",
-  class_count: 400,
+  ontologyType: "foundational",
+  classCount: 400,
 });
 const UPLOADED = record({
-  ontology_id: "http://ex.org/mine",
+  ontologyId: "http://ex.org/mine",
   uri: "http://ex.org/mine",
   title: "My Upload",
-  ontology_type: "user_uploaded",
-  class_count: 3,
+  ontologyType: "user_uploaded",
+  classCount: 3,
 });
 
 // Minimal stub client — the component only forwards it to the (mocked) service
@@ -166,10 +166,10 @@ describe("OntologyInventoryView", () => {
     listOntologies.mockResolvedValue([
       UPLOADED,
       record({
-        ontology_id: "http://ex.org/mine2",
+        ontologyId: "http://ex.org/mine2",
         uri: "http://ex.org/mine2",
         title: "My Other Upload",
-        ontology_type: "user_created",
+        ontologyType: "user_created",
       }),
     ]);
     const view = renderView();
@@ -203,14 +203,14 @@ describe("OntologyInventoryView", () => {
     const view = renderView();
 
     // The induced row's title is an anchor to the graph-contents page, with the
-    // ontology_id URL-encoded into the query string.
+    // ontologyId URL-encoded into the query string.
     const inducedLink = await view.findByText("Sales (induced)");
     const anchor = inducedLink.closest("a");
     expect(anchor).not.toBeNull();
     expect(anchor).toHaveAttribute(
       "href",
       `/namespaces/ns/ontology/induced?ontology_id=${encodeURIComponent(
-        INDUCED.ontology_id,
+        INDUCED.ontologyId,
       )}`,
     );
 
@@ -229,7 +229,7 @@ describe("OntologyInventoryView", () => {
       fireEvent.click(view.getByText("Sales (induced)"));
       expect(navigate).toHaveBeenCalledWith(
         `/namespaces/ns/ontology/induced?ontology_id=${encodeURIComponent(
-          INDUCED.ontology_id,
+          INDUCED.ontologyId,
         )}`,
       );
     });
@@ -238,10 +238,10 @@ describe("OntologyInventoryView", () => {
   it("shows 'Delete in progress' instead of a type Badge while a row is deleting", async () => {
     listOntologies.mockResolvedValue([
       record({
-        ontology_id: "http://ex.org/going",
+        ontologyId: "http://ex.org/going",
         uri: "http://ex.org/going",
         title: "Going Away",
-        ontology_type: "user_uploaded",
+        ontologyType: "user_uploaded",
         status: "deleting",
       }),
     ]);
@@ -252,6 +252,59 @@ describe("OntologyInventoryView", () => {
     // The Type cell is taken over by the status indicator — no "Uploaded" badge
     // in the row (the filter segment label is "Uploaded (1)", not "Uploaded").
     expect(view.queryByText("Uploaded")).toBeNull();
+  });
+
+  it("polls while a row is deleting so the indicator clears itself", async () => {
+    listOntologies.mockResolvedValue([
+      record({
+        ontologyId: "http://ex.org/going",
+        uri: "http://ex.org/going",
+        title: "Going Away",
+        ontologyType: "induced",
+        status: "deleting",
+      }),
+    ]);
+
+    // Fake timers must be installed BEFORE render so they own the interval the
+    // component schedules. `shouldAdvanceTime` keeps promises/RTL queries
+    // working. Driving the clock beats waiting on it: a real 4-6s wait holds a
+    // vitest worker for the whole duration and made the suite's timing-sensitive
+    // tests flaky under parallel load.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const view = renderView();
+      await view.findByText("Delete in progress");
+      const callsBefore = listOntologies.mock.calls.length;
+
+      await vi.advanceTimersByTimeAsync(4100);
+
+      // The poll must re-fetch on its own; without it the row would sit at
+      // "Delete in progress" until the user pressed Refresh.
+      await waitFor(() =>
+        expect(listOntologies.mock.calls.length).toBeGreaterThan(callsBefore),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not link a row that is being deleted", async () => {
+    listOntologies.mockResolvedValue([
+      record({
+        ontologyId: "http://ex.org/going",
+        uri: "http://ex.org/going",
+        title: "Going Away",
+        // Induced rows normally link to their detail page; a mid-delete one must
+        // not, since its graph is being torn down underneath.
+        ontologyType: "induced",
+        status: "deleting",
+      }),
+    ]);
+
+    const view = renderView();
+    // The title still renders (as plain text) — only the anchor is withheld.
+    await view.findByText("Going Away");
+    expect(view.queryByRole("link", { name: "Going Away" })).toBeNull();
   });
 
   it("renders the all-types empty state pointing at the Induction page", async () => {

@@ -51,6 +51,20 @@ _SOURCE_TYPE_DOCUMENTS = "DOCUMENTS"
 
 
 @dataclass(frozen=True)
+class SQLNamespaceScope:
+    """Physical Athena/Redshift objects a namespace is permitted to reference.
+
+    Native Glue sources are addressed through ``AwsDataCatalog.<database>``.
+    Federated JDBC/custom-connector sources are addressed through their generated
+    catalog and discovered schema. The map deliberately omits table names: source
+    onboarding, rather than a model/LLM table list, is the tenancy boundary.
+    """
+
+    native_databases: frozenset[str]
+    federated_catalog_schemas: frozenset[tuple[str, str]]
+
+
+@dataclass(frozen=True)
 class SourceComposition:
     """What kinds of data sources a namespace has, for serve-tier gating.
 
@@ -116,6 +130,17 @@ class SourcesRegistry:
     def available(self) -> bool:
         """Return whether a DynamoDB resource and sources table are configured."""
         return bool(self._dynamodb and self._table_name)
+
+    @property
+    def namespaces_configured(self) -> bool:
+        """Whether the namespaces table is wired (so existence CAN be checked).
+
+        Lets the entrypoint distinguish ``namespace_exists() -> None`` meaning
+        "feature absent, cannot check" (this is False) from "configured but the
+        lookup errored" (this is True). Only the latter must fail CLOSED — a
+        deployment without a namespaces table must still serve requests.
+        """
+        return bool(self._namespaces_table and self._dynamodb)
 
     def _resolve_ns(self, namespace: str) -> str:
         """Resolve namespace name to UUID for DDB key construction."""
@@ -286,6 +311,45 @@ class SourcesRegistry:
             return None
         db_sources = [item for item in items if item.get("sourceType") == _SOURCE_TYPE_DATABASE]
         return db_sources[0] if len(db_sources) == 1 else None
+
+    async def sql_namespace_scope(self, namespace: str) -> SQLNamespaceScope | None:
+        """Return the physical SQL objects registered to ``namespace``.
+
+        ``None`` means the source inventory is unavailable or incomplete and must
+        be treated as a deny by the query executor. A partial inventory cannot
+        safely authorize a qualified reference: it could omit an owned source, but
+        allowing on uncertainty reopens F-3's cross-namespace catalog escape.
+        """
+        items = await self._query_sources(namespace)
+        if items is None:
+            logger.warning("sql_namespace_scope_unavailable", namespace=namespace)
+            return None
+
+        native_databases: set[str] = set()
+        federated_catalog_schemas: set[tuple[str, str]] = set()
+        for item in items:
+            if item.get("sourceType") != _SOURCE_TYPE_DATABASE or item.get("queryable") is False:
+                continue
+
+            catalog = str(item.get("athenaDataCatalogName") or "").lower()
+            if catalog:
+                for schema in item.get("discoveredSchemas") or []:
+                    schema_name = str(schema).lower()
+                    if _IDENTIFIER_PATTERN.fullmatch(catalog) and _IDENTIFIER_PATTERN.fullmatch(schema_name):
+                        federated_catalog_schemas.add((catalog, schema_name))
+                continue
+
+            config = self.parse_configuration(item)
+            database = str(
+                item.get("athenaDatabase") or item.get("glueDatabaseName") or config.get("databaseName") or ""
+            ).lower()
+            if _IDENTIFIER_PATTERN.fullmatch(database):
+                native_databases.add(database)
+
+        return SQLNamespaceScope(
+            native_databases=frozenset(native_databases),
+            federated_catalog_schemas=frozenset(federated_catalog_schemas),
+        )
 
     async def get_source_composition(self, namespace: str) -> SourceComposition:
         """Return which source types a namespace has (for serve-tier gating).

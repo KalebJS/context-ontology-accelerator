@@ -96,8 +96,26 @@ def process_pdf(
     content_bytes: bytes,
     filename: str,
     textract_client: Any,
+    *,
+    enable_table_extraction: bool = False,
 ) -> tuple[str, str]:
-    """Process a PDF — text-native via unstructured, scanned via Textract."""
+    """Process a PDF — text-native via unstructured, scanned via Textract.
+
+    When ``enable_table_extraction`` is True, ALL PDFs (text-native or
+    scanned) route through Textract's ``AnalyzeDocument(TABLES)`` instead of
+    ``unstructured.partition_pdf(strategy="fast")``. The ``fast`` strategy
+    uses pdfminer only, which does not detect tables — a statistical table
+    arrives at graphrag as flattened prose with rows severed from headers,
+    losing the very structure that made it worth extracting.
+    """
+    if enable_table_extraction:
+        logger.info(
+            "PDF routed to Textract AnalyzeDocument(TABLES) — table structure preserved",
+            extra={"doc_filename": filename},
+        )
+        text = process_pdf_textract_tables(content_bytes, filename, textract_client)
+        return text, ".md"
+
     if is_scanned_pdf(content_bytes):
         logger.info(
             "PDF detected as scanned, routing to Textract",
@@ -281,6 +299,218 @@ def process_pdf_textract(
                 pages_text[idx] = text
 
     return "\n\n".join(pages_text)
+
+
+def process_pdf_textract_tables(
+    pdf_bytes: bytes,
+    filename: str,
+    textract_client: Any,
+) -> str:
+    """Extract text + tables from a PDF using Textract ``AnalyzeDocument``.
+
+    Renders each page to a 300-DPI PNG (same as
+    :func:`process_pdf_textract`), then calls ``AnalyzeDocument`` with
+    ``FeatureTypes=['TABLES']`` per page. Reassembles each page into
+    Markdown: prose LINEs first, then any TABLE as a Markdown pipe-table.
+    Preserves row/column structure so a statistical table arrives at
+    graphrag as facts, not prose.
+
+    Cost note: ``AnalyzeDocument`` is materially more expensive per page
+    than ``DetectDocumentText``. Opt in per source via
+    ``ENABLE_TABLE_EXTRACTION=true`` — do not enable globally on
+    prose-dominant corpora.
+
+    Raises:
+        ValueError: on the same page-count / page-size guards as
+            :func:`process_pdf_textract`.
+    """
+    import pypdfium2 as pdfium  # lazy import
+
+    try:
+        doc = pdfium.PdfDocument(pdf_bytes)
+    except pdfium.PdfiumError as exc:
+        logger.warning(
+            "Could not open PDF for Textract TABLES rendering",
+            extra={"doc_filename": filename, "reason": str(exc)},
+        )
+        return ""
+
+    try:
+        num_pages = len(doc)
+        if num_pages > _MAX_PDF_PAGES:
+            raise ValueError(f"PDF has {num_pages} pages, exceeding the {_MAX_PDF_PAGES}-page limit for OCR")
+
+        scale = _TEXTRACT_RENDER_DPI / 72
+        max_pixels = _MAX_RENDER_MEGAPIXELS * 1_000_000
+
+        page_pngs: list[bytes] = []
+        for page_num in range(num_pages):
+            page = doc[page_num]
+            width_pt, height_pt = page.get_size()
+            pixels = (width_pt * scale) * (height_pt * scale)
+            if pixels > max_pixels:
+                raise ValueError(
+                    f"PDF page {page_num + 1} is {width_pt:.0f}x{height_pt:.0f} pt, which renders to "
+                    f"{pixels / 1_000_000:.0f} MP at {_TEXTRACT_RENDER_DPI} DPI, "
+                    f"exceeding the {_MAX_RENDER_MEGAPIXELS} MP per-page limit"
+                )
+
+            try:
+                bitmap = page.render(scale=scale)
+            except pdfium.PdfiumError as exc:
+                logger.warning(
+                    "Could not render PDF page for Textract TABLES",
+                    extra={"doc_filename": filename, "page": page_num + 1, "reason": str(exc)},
+                )
+                return ""
+            try:
+                buf = io.BytesIO()
+                bitmap.to_pil().save(buf, format="PNG")
+                page_pngs.append(buf.getvalue())
+            finally:
+                bitmap.close()
+    finally:
+        doc.close()
+
+    total_pages = len(page_pngs)
+
+    def _analyze_page(idx_png: tuple[int, bytes]) -> tuple[int, str]:
+        idx, png_bytes = idx_png
+        logger.info(
+            "Calling Textract AnalyzeDocument(TABLES) for page",
+            extra={"doc_filename": filename, "page": idx + 1, "total_pages": total_pages},
+        )
+        # Runs inside ThreadPoolExecutor.map; an unhandled exception here
+        # (ThrottlingException, ProvisionedThroughputExceeded, a malformed page,
+        # etc.) propagates out of pool.map and aborts EVERY page, turning one
+        # transient per-page fault into a whole-document failure. Isolate it:
+        # log and yield an empty page so the rest of the document still returns.
+        try:
+            resp = textract_client.analyze_document(
+                Document={"Bytes": png_bytes},
+                FeatureTypes=["TABLES"],
+            )
+            return idx, _blocks_to_markdown(resp.get("Blocks", []))
+        except Exception as exc:  # noqa: BLE001 - isolate per-page failure
+            logger.error(
+                "Textract AnalyzeDocument(TABLES) failed for page",
+                extra={
+                    "doc_filename": filename,
+                    "page": idx + 1,
+                    "total_pages": total_pages,
+                    "error": str(exc),
+                },
+            )
+            return idx, ""
+
+    pages_md: list[str] = [""] * total_pages
+    if total_pages:
+        workers = min(_TEXTRACT_CONCURRENCY, total_pages)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for idx, md in pool.map(_analyze_page, enumerate(page_pngs)):
+                pages_md[idx] = md
+
+    return "\n\n".join(pages_md)
+
+
+def _blocks_to_markdown(blocks: list[dict]) -> str:
+    """Reassemble Textract ``AnalyzeDocument`` blocks as Markdown.
+
+    LINE blocks that are NOT inside any TABLE cell are emitted as prose,
+    in reading order. TABLE blocks are emitted as pipe-tables, cells
+    filled by walking ``CELL → CHILD → WORD`` and reconstructing per-row
+    text. Header cells (``EntityTypes == ["COLUMN_HEADER"]``) become the
+    first row; if none are marked, the first row of cells is treated as
+    the header so the pipe-table stays valid.
+    """
+    by_id = {b["Id"]: b for b in blocks if "Id" in b}
+
+    # 1. Collect every WORD id that participates in some TABLE cell, so the
+    #    prose pass can skip them and we don't emit table content twice.
+    table_word_ids: set[str] = set()
+    tables: list[dict] = []
+    for b in blocks:
+        if b.get("BlockType") == "TABLE":
+            tables.append(b)
+            for rel in b.get("Relationships") or []:
+                if rel.get("Type") != "CHILD":
+                    continue
+                for cell_id in rel.get("Ids", []):
+                    cell = by_id.get(cell_id, {})
+                    for cell_rel in cell.get("Relationships") or []:
+                        if cell_rel.get("Type") != "CHILD":
+                            continue
+                        table_word_ids.update(cell_rel.get("Ids", []))
+
+    def _cell_text(cell: dict) -> str:
+        parts: list[str] = []
+        for rel in cell.get("Relationships") or []:
+            if rel.get("Type") != "CHILD":
+                continue
+            for wid in rel.get("Ids", []):
+                w = by_id.get(wid)
+                if w and w.get("BlockType") == "WORD":
+                    parts.append(w.get("Text", ""))
+        return " ".join(p for p in parts if p).replace("|", "\\|").strip()
+
+    # 2. Build tables. Textract gives per-cell RowIndex / ColumnIndex, both
+    #    1-indexed. Fill a grid, header-detect, emit a pipe-table.
+    md_tables: list[str] = []
+    for tbl in tables:
+        cells: list[dict] = []
+        for rel in tbl.get("Relationships") or []:
+            if rel.get("Type") != "CHILD":
+                continue
+            for cid in rel.get("Ids", []):
+                c = by_id.get(cid)
+                if c and c.get("BlockType") == "CELL":
+                    cells.append(c)
+        if not cells:
+            continue
+        max_row = max(c.get("RowIndex", 1) for c in cells)
+        max_col = max(c.get("ColumnIndex", 1) for c in cells)
+        grid: list[list[str]] = [["" for _ in range(max_col)] for _ in range(max_row)]
+        header_row_idx: int | None = None
+        for c in cells:
+            r = c.get("RowIndex", 1) - 1
+            col = c.get("ColumnIndex", 1) - 1
+            grid[r][col] = _cell_text(c)
+            if "COLUMN_HEADER" in (c.get("EntityTypes") or []) and header_row_idx is None:
+                header_row_idx = r
+        # If Textract didn't tag any header, treat row 0 as the header — a
+        # pipe-table without a header line is not valid Markdown.
+        if header_row_idx is None:
+            header_row_idx = 0
+        header = grid[header_row_idx]
+        body_rows = [row for i, row in enumerate(grid) if i != header_row_idx]
+
+        lines = [
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join("---" for _ in header) + " |",
+            *("| " + " | ".join(row) + " |" for row in body_rows),
+        ]
+        md_tables.append("\n".join(lines))
+
+    # 3. Prose lines, skipping any LINE composed entirely of table words.
+    prose: list[str] = []
+    for b in blocks:
+        if b.get("BlockType") != "LINE":
+            continue
+        line_word_ids: list[str] = []
+        for rel in b.get("Relationships") or []:
+            if rel.get("Type") == "CHILD":
+                line_word_ids.extend(rel.get("Ids", []))
+        if line_word_ids and all(wid in table_word_ids for wid in line_word_ids):
+            continue
+        text = b.get("Text", "").strip()
+        if text:
+            prose.append(text)
+
+    parts: list[str] = []
+    if prose:
+        parts.append("\n\n".join(prose))
+    parts.extend(md_tables)
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------

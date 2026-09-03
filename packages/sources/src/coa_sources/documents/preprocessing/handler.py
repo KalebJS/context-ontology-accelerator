@@ -158,6 +158,11 @@ def handler(event: dict, context: Any) -> dict:
     s3_prefixes: list[str] = event.get("s3_prefixes") or []
     source_bucket_arn: str | None = event.get("source_bucket_arn")
     role_arn: str | None = event.get("role_arn")
+    # extraction_config is stringified by the trigger Lambda so it can ride the
+    # state-machine → Lambda-invoke pipe; only booleans need parsing here (the
+    # rest are consumed downstream by the KG-build container).
+    ec = event.get("extraction_config") or {}
+    enable_table_extraction = str(ec.get("enable_table_extraction", "false")).lower() == "true"
 
     try:
         validate_id(namespace_id, "namespace_id")
@@ -306,8 +311,12 @@ def handler(event: dict, context: Any) -> dict:
                     content_bytes,
                     filename,
                     textract_client,
+                    enable_table_extraction=enable_table_extraction,
                 )
-                processing_method = "textract" if out_ext == ".txt" else "unstructured_partition_pdf"
+                if enable_table_extraction:
+                    processing_method = "textract_analyze_document_tables"
+                else:
+                    processing_method = "textract" if out_ext == ".txt" else "unstructured_partition_pdf"
             elif ext in _PROCESSORS:
                 processed_text, out_ext = _PROCESSORS[ext](content_bytes, filename)
                 processing_method = (

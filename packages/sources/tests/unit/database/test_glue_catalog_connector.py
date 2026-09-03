@@ -202,7 +202,7 @@ class TestDiscoverMetadata:
 
         assert r1.tables[0].technical_metadata_hash == r2.tables[0].technical_metadata_hash
 
-    @patch("coa_sources.database.connectors.glue_catalog.boto3")
+    @patch("coa_sources.database.connectors.sts_assume.boto3")
     def test_cross_account_role(self, mock_boto3, connector):
         """Verify STS AssumeRole is called for cross-account access."""
         mock_sts = MagicMock()
@@ -228,6 +228,7 @@ class TestDiscoverMetadata:
             {
                 "database_name": "db",
                 "cross_account_role_arn": "arn:aws:iam::999999999999:role/test",
+                "external_id": "coa-dev-ns-1",
                 "region": "us-east-1",
             }
         )
@@ -235,9 +236,9 @@ class TestDiscoverMetadata:
         mock_sts.assume_role.assert_called_once()
         mock_boto3.Session.assert_called_once()
 
-    @patch("coa_sources.database.connectors.glue_catalog.boto3")
+    @patch("coa_sources.database.connectors.sts_assume.boto3")
     def test_cross_account_role_passes_external_id(self, mock_boto3, connector):
-        """When external_id is configured, AssumeRole must include ExternalId."""
+        """The configured external_id must reach AssumeRole."""
         mock_sts = MagicMock()
         mock_sts.assume_role.return_value = {
             "Credentials": {
@@ -268,9 +269,32 @@ class TestDiscoverMetadata:
         assert mock_sts.assume_role.call_args.kwargs["ExternalId"] == "ext-xyz"
         assert mock_sts.assume_role.call_args.kwargs["RoleArn"] == "arn:aws:iam::999999999999:role/test"
 
-    @patch("coa_sources.database.connectors.glue_catalog.boto3")
-    def test_cross_account_role_omits_external_id_when_absent(self, mock_boto3, connector):
-        """No external_id → AssumeRole must NOT include an ExternalId key."""
+    @patch("coa_sources.database.connectors.sts_assume.boto3")
+    def test_cross_account_role_without_external_id_is_refused(self, mock_boto3, connector):
+        """No external_id → refuse to assume at all (confused-deputy guard).
+
+        An assume with no ExternalId carries no evidence of which namespace asked
+        for it, so a caller could point a source at another tenant's role and read
+        it. The connector must raise rather than fall back to an unconditioned
+        assume, which is what it used to do.
+        """
+        mock_sts = MagicMock()
+        mock_boto3.client.return_value = mock_sts
+
+        with pytest.raises(ValueError, match="external_id is required"):
+            connector.discover_metadata(
+                {
+                    "database_name": "db",
+                    "cross_account_role_arn": "arn:aws:iam::999999999999:role/test",
+                    "region": "us-east-1",
+                }
+            )
+
+        mock_sts.assume_role.assert_not_called()
+
+    @patch("coa_sources.database.connectors.sts_assume.boto3")
+    def test_role_session_name_carries_namespace(self, mock_boto3, connector):
+        """RoleSessionName reaches the data owner's CloudTrail — it must name the namespace."""
         mock_sts = MagicMock()
         mock_sts.assume_role.return_value = {
             "Credentials": {"AccessKeyId": "A", "SecretAccessKey": "S", "SessionToken": "T"}
@@ -289,8 +313,12 @@ class TestDiscoverMetadata:
             {
                 "database_name": "db",
                 "cross_account_role_arn": "arn:aws:iam::999999999999:role/test",
+                "external_id": "coa-dev-ns-42",
+                "namespace_id": "ns-42",
                 "region": "us-east-1",
             }
         )
 
-        assert "ExternalId" not in mock_sts.assume_role.call_args.kwargs
+        session_name = mock_sts.assume_role.call_args.kwargs["RoleSessionName"]
+        assert "ns-42" in session_name
+        assert len(session_name) <= 64

@@ -30,10 +30,12 @@ import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import unquote
 
 import boto3
 import structlog
 from boto3.dynamodb.conditions import Attr
+from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common import resolve_region
 from coa_common.constants import (
@@ -55,6 +57,11 @@ from coa_control_plane_server.models.source_summary import SourceSummary
 from coa_control_plane_server.models.source_type import SourceType
 from pydantic import ValidationError
 
+from coa_sources.database.connectors.athena_catalog import (
+    AthenaCatalogError,
+    delete_lambda_catalog,
+    derive_catalog_name,
+)
 from coa_sources.database.connectors.glue_connection_provisioner import (
     cleanup_federated_resources,
 )
@@ -102,7 +109,7 @@ _BY_SOURCE_TYPE_GSI = "BySourceType"
 # The sources-table stores the config blob in one untyped `configuration`
 # column, so sourceSubType is the only thing that says which shape it holds —
 # and the shapes are not interchangeable. GlueConfiguration requires catalogId
-# (12-digit account form) and region, which an ATHENA_CONNECTOR config has
+# (12-digit account form) and region, which a CUSTOM_CONNECTOR config has
 # neither of, so reporting one as Glue fails GetSourceOutput validation and
 # turns GET into a 500 rather than a cosmetic mislabel.
 #
@@ -112,7 +119,7 @@ _BY_SOURCE_TYPE_GSI = "BySourceType"
 _DETAIL_CONFIG_KEYS: dict[str, str] = {
     SourceSubType.GLUE_DATABASE.value: "glueConfiguration",
     SourceSubType.JDBC_DATABASE.value: "jdbcConfiguration",
-    SourceSubType.ATHENA_CONNECTOR.value: "athenaConfiguration",
+    SourceSubType.CUSTOM_CONNECTOR.value: "customConnectorConfiguration",
 }
 
 # How a row this map does not cover is read: as Glue, which is how every
@@ -181,7 +188,12 @@ def _get_sqs():
 def _get_s3():
     global _s3
     if _s3 is None:
-        _s3 = boto3.client("s3", region_name=_AWS_REGION)
+        # Pin SigV4 for presigned document-upload URLs: a no-Config client
+        # falls back to the deprecated SigV2 presigner in pre-2014 regions,
+        # and SigV2-only regions can't presign at all. Only ContentType is
+        # signed (see document_routes._handle_upload_urls), so browser PUTs
+        # stay valid under SigV4.
+        _s3 = boto3.client("s3", region_name=_AWS_REGION, config=Config(signature_version="s3v4"))
     return _s3
 
 
@@ -304,6 +316,29 @@ def _build_document_detail(item: dict[str, Any], metrics: dict[str, Any] | None 
     ):
         if field in item and item[field] is not None:
             doc[field] = item[field]
+
+    # extractionConfig is stored in DDB, which marshals Integer fields as Number;
+    # boto3 reads them back as Decimal -> they serialize to "0.0" in JSON, breaking
+    # the Smithy Integer contract for the chunkSize/chunkOverlap fields.
+    # Coerce them back to int on readback so the API honours its own model
+    # (0 == "use the graphrag-toolkit default", not 0.0).
+    ec = doc.get("extractionConfig")
+    if isinstance(ec, dict):
+        for int_field in ("chunkSize", "chunkOverlap"):
+            v = ec.get(int_field)
+            if v is not None:
+                try:
+                    ec[int_field] = int(v)
+                except (TypeError, ValueError) as exc:
+                    # Leave the raw value in place rather than dropping the field;
+                    # log loudly so a contract-violating DDB value is diagnosable
+                    # instead of silently emitting a non-integer to the client.
+                    logger.warning(
+                        "failed to coerce extractionConfig int field on readback",
+                        field=int_field,
+                        value=v,
+                        error=str(exc),
+                    )
 
     if metrics:
         # Stage metrics are plain Number counters written by the ProgressMonitor.
@@ -810,6 +845,44 @@ def _handle_delete(namespace_id: str, source_id: str) -> dict[str, Any]:
                     "status": current_status,
                 },
             )
+        sub_type = item.get("sourceSubType", "")
+
+        # The one name every teardown below works from, derived from the source id
+        # rather than read off the row. `build_catalog_name` is what named the
+        # resource in the first place — for the custom-connector Athena catalog and
+        # for the federated-JDBC Glue catalog/connection alike — so the row has
+        # nothing to contribute here, and the derivation being the sole input is
+        # what makes it impossible for a stored value to redirect a delete.
+        expected_name = derive_catalog_name(source_id)
+
+        # A custom-connector source owns a top-level LAMBDA-type Athena data
+        # catalog, which is a plain athena:DeleteDataCatalog on this role — no
+        # Glue object, no Lake Formation grants, and so nothing to assume the
+        # federation provisioner's admin role for.
+        #
+        # This must run BEFORE the federated-teardown block below, and that block
+        # must exclude this sub-type: a Lambda catalog also populates
+        # `athenaDataCatalogName`, so it would otherwise match, assume the
+        # LF-admin role, and call glue.delete_catalog — a no-op for a Lambda
+        # catalog — reporting success while leaking the registration.
+        #
+        # Fails the delete (HTTP 500) rather than proceeding, for the same reason
+        # the federated teardown does: the source row is the only handle on the
+        # catalog, so dropping the row after a failed teardown orphans it.
+        if sub_type == SourceSubType.CUSTOM_CONNECTOR:
+            try:
+                delete_lambda_catalog(catalog_name=expected_name)
+            except AthenaCatalogError:
+                logger.exception(
+                    "athena_data_catalog_delete_failed",
+                    source_id=source_id,
+                    catalog_name=expected_name,
+                )
+                return api_response(
+                    500,
+                    {"error": "Failed to remove the Athena data catalog; deletion not completed"},
+                )
+
         # Teardown of any Glue federated catalog / connection provisioned for
         # this source. Dropping an LF-governed catalog requires the federation
         # provisioner's Lake Formation admin role, so we assume it and run the
@@ -817,9 +890,49 @@ def _handle_delete(namespace_id: str, source_id: str) -> dict[str, Any]:
         # billable resources with no automatic recovery path, a teardown failure
         # blocks the DDB delete (HTTP 500) so the source row remains and the
         # delete can be retried — rather than silently orphaning the resources.
-        glue_conn = item.get("glueConnectionName")
-        athena_cat = item.get("athenaDataCatalogName")
-        if (glue_conn or athena_cat) and _FEDERATION_PROVISIONER_ROLE_ARN:
+        #
+        # The two names are DERIVED from the source id rather than trusted from the
+        # row, because the row is not a trustworthy record of what the provisioner
+        # created. `POST /sources` used to copy the caller's
+        # `glueConfiguration.athenaDataCatalogName` straight into this attribute; it
+        # no longer does (see database_routes._create_database_source), but rows
+        # written before that change still carry a caller-chosen value, and this is
+        # the layer that has to be safe regardless of what reached the table.
+        #
+        # It matters because the role assumed below is a Lake Formation data-lake
+        # admin whose IAM is scoped to the deployment-wide `{sanitizedPrefix}ds_*`
+        # window — not to one namespace — so a seeded name would let a delete here
+        # drop ANOTHER namespace's federated catalog, deregister its LF resource and
+        # delete its Glue connection. Teardown is best-effort per resource, so that
+        # would even report success.
+        #
+        # `build_catalog_name` makes the real name a pure function of
+        # (RESOURCE_PREFIX, sourceId), and sourceId is a server-generated UUID
+        # scoped to this namespace, so a cross-namespace name can never match
+        # `expected_name`. A stored name that does not match is therefore either
+        # seeded or from a deployment whose RESOURCE_PREFIX has since changed; both
+        # are logged and skipped. Skipping can orphan a real resource in the
+        # prefix-changed case, which is the right way round to fail — an orphan
+        # costs money and is recoverable from the log line, dropping another
+        # namespace's catalog is not.
+        stored_conn = item.get("glueConnectionName") or ""
+        stored_cat = item.get("athenaDataCatalogName") or ""
+        unexpected = sorted({n for n in (stored_conn, stored_cat) if n and n != expected_name})
+        if unexpected:
+            logger.warning(
+                "federated_teardown_skipped_name_not_derived",
+                source_id=source_id,
+                namespace_id=namespace_id,
+                expected_name=expected_name,
+                stored_names=unexpected,
+            )
+        glue_conn = stored_conn if stored_conn == expected_name else None
+        athena_cat = stored_cat if stored_cat == expected_name else None
+        if (
+            sub_type != SourceSubType.CUSTOM_CONNECTOR
+            and (glue_conn or athena_cat)
+            and _FEDERATION_PROVISIONER_ROLE_ARN
+        ):
             try:
                 creds = (
                     _get_sts()
@@ -1086,7 +1199,18 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 def _route(event: dict[str, Any]) -> dict[str, Any]:
     http_method: str = event.get("httpMethod", "")
     resource: str = event.get("resource", "")
-    path_params: dict[str, str] = event.get("pathParameters") or {}
+    # REST API Gateway proxy integration passes pathParameters exactly as they
+    # appear in the request URL — still percent-encoded. Smithy-generated
+    # clients (and the web app through them) encode every httpLabel per
+    # RFC 3986, so a non-ASCII tableId such as "db.商品マスタ" arrives as
+    # "db.%E5%95%86%E5%93%81%E3%83%9E%E3%82%B9%E3%82%BF" and would never match
+    # the stored asset name. Decode once here, at the single extraction point,
+    # so every route below sees the literal identifier. unquote() leaves
+    # strings without escape sequences untouched, so already-decoded values
+    # (e.g. in unit-test events) pass through unchanged.
+    path_params: dict[str, str] = {
+        key: unquote(value) for key, value in (event.get("pathParameters") or {}).items() if value is not None
+    }
     namespace_id: str = path_params.get("namespaceId", "")
 
     logger.info("request_received", method=http_method, resource=resource, namespace_id=namespace_id)

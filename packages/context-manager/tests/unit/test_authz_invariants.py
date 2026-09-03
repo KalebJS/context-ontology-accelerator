@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from coa_serve import role_resolver
+from coa_serve.tier2.cedar_authorizer import CedarDecision, RealCedarAuthorizer
 from coa_serve.tier2.sql_firewall import SQLFirewall
 
 _NS = "ns-Z"
@@ -227,3 +228,79 @@ class TestFailClosed:
         assert dao.query_all.called
         assert not dao.query.called, "authorization reads must not use the single-page query()"
         assert resolved.column_denylist == {"customers": ["ssn"]}
+
+
+def _admit(grants: list[dict], *, namespace: str = _NS) -> tuple[bool, str | None]:
+    """Resolve a profile from ``grants``, then run the SQL-free namespace gate.
+
+    Returns ``(denied, reason)`` — the observable admission outcome. Uses a
+    fail-closed RealCedarAuthorizer so the no-roles case is deterministic
+    regardless of ambient ``SCL_CEDAR_FAIL_OPEN_NO_ROLES``.
+    """
+    dao = MagicMock()
+    dao.query_all.side_effect = lambda params: grants
+    with (
+        patch.object(role_resolver, "_RRM_TABLE", "rrm"),
+        patch.object(role_resolver, "DynamoDBDAO", return_value=dao),
+    ):
+        resolved = role_resolver.resolve_profile(_USER, [], namespace=namespace)
+
+    profile: dict = {}
+    resolved.inject_into(profile)
+    firewall = SQLFirewall(cedar_authorizer=RealCedarAuthorizer(fail_open_no_roles=False))
+    result = firewall.authorize_namespace(namespace, profile)
+    return result.denied, result.reason
+
+
+@pytest.mark.unit
+class TestNamespaceAdmissionGate:
+    """F-2 (CWE-862): the SQL-free retrieval surfaces must be namespace-gated too.
+
+    ``authorize_namespace`` is the single admission point for the isolated
+    kbSearch/graphTraverse/translate actions and the Tier-3 path, none of which
+    reach the SQL firewall. These assert on the DECISION, the same discipline as
+    the SQL-path invariants above.
+    """
+
+    def test_grant_on_namespace_is_admitted(self):
+        denied, _ = _admit([_grant(role=_CEDAR_OK_ROLE)])
+
+        assert not denied, "a principal holding a query role on the namespace must be admitted"
+
+    def test_no_grant_anywhere_is_denied(self):
+        """No resolved roles → Cedar fails closed. This is the core F-2 fix."""
+        denied, _ = _admit([])
+
+        assert denied, "an authenticated caller with no grant must not read the namespace"
+
+    def test_grant_on_another_namespace_does_not_admit_this_one(self):
+        """The F-2 cross-tenant read: a role on ns-OTHER must not admit ns-Z.
+
+        This is exactly the precondition in the finding — the attacker holds a
+        grant on some namespace and targets another they were never granted.
+        """
+        denied, _ = _admit([{"role": _CEDAR_OK_ROLE, "resourceId": "ns-OTHER"}], namespace=_NS)
+
+        assert denied, "a grant on another namespace must not admit this one"
+
+    def test_evaluator_error_denies(self):
+        """A Cedar evaluator failure must fail closed, never admit."""
+        boom = MagicMock()
+        boom.authorize.side_effect = RuntimeError("cedar exploded")
+        result = SQLFirewall(cedar_authorizer=boom).authorize_namespace(_NS, {"userId": "u", "globalRoles": ["x"]})
+
+        assert result.denied, "an evaluator error must deny (fail closed)"
+        # The reason survives the shared _cedar_gate refactor (and stays generic —
+        # the evaluator's own exception text is logged, not returned).
+        assert result.reason == "Authorization policy evaluation failed"
+        assert "cedar exploded" not in (result.reason or "")
+
+    def test_deny_carries_reason_and_no_sql(self):
+        """A policy deny returns the reason for logging, with no SQL on this path."""
+        denying = MagicMock()
+        denying.authorize.return_value = CedarDecision(allowed=False, reason="not permitted to query this namespace")
+        result = SQLFirewall(cedar_authorizer=denying).authorize_namespace(_NS, {"userId": "u", "globalRoles": ["x"]})
+
+        assert result.denied
+        assert result.reason == "not permitted to query this namespace"
+        assert result.authorized_sql == ""

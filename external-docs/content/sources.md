@@ -42,6 +42,73 @@ flowchart LR
 | JDBC | `JDBC_DATABASE` | SQL Server | Direct SQL or Athena federated |
 | JDBC | `JDBC_DATABASE` | Oracle | Athena federated only |
 | JDBC | `JDBC_DATABASE` | Snowflake | Athena federated only |
+| Custom connector | `CUSTOM_CONNECTOR` | Databricks SQL Warehouse — a ready-made connector ships in `connectors/databricks/` | Athena only (Lambda-backed catalog) |
+| Custom connector | `CUSTOM_CONNECTOR` | Any other source you can wrap in an Athena Query Federation SDK connector Lambda | Athena only (Lambda-backed catalog) |
+
+!!! tip "Sources with no native support"
+    For a source none of the rows above covers — SAP, a mainframe, an internal
+    REST API, a proprietary SaaS product — you can author an Athena Query
+    Federation SDK connector Lambda in your own account and onboard it as an
+    `CUSTOM_CONNECTOR` source. See
+    [Custom Connector Sources](custom-connector-sources.md) for what the
+    connector must return, the resource policies you must grant, and the
+    governance disclosure that Lake Formation does not apply to that source type.
+
+### Custom data source connectors
+
+A source with no native support above — SAP, a mainframe, an internal REST API, a
+proprietary SaaS — reaches COA through an **Athena Query Federation connector**: a Lambda
+you deploy in your own account and register as an Athena data catalog. COA then queries it
+through Athena, the same federated path a JDBC source uses.
+
+Because a connector supplies its own metadata, you declare what COA would otherwise read
+from a database's information schema:
+
+- **Column descriptions** are the Arrow schema's per-column comments.
+- **Primary and foreign keys** travel inside those same comments, as `@pk` and
+  `@fk(parent_table.parent_column)` tags that COA parses out and strips.
+
+Two COA roles reach a connector and both must be granted: the **serve** role runs queries,
+and the **discovery** role runs `DESCRIBE` — which is the only way the key tags are read.
+Grant serve alone and the connector answers queries correctly while no declared key is
+ever found.
+
+**If you are writing one, start from `connectors/README.md` in your COA checkout** — that guide is
+not published on this site. It holds a reference connector to copy, a Java toolkit that handles the
+comment placement and tag encoding for you, and a CDK construct that emits the required tag, spill
+prefix and resource policies. [Custom Connector Sources](custom-connector-sources.md) is the
+contract that guide builds against.
+
+#### Databricks SQL Warehouse
+
+A ready-made connector for Databricks SQL Warehouse ships with COA — you deploy it and register a
+`CUSTOM_CONNECTOR` source against it, rather than writing one yourself.
+
+**Its runbook is `connectors/databricks/README.md` in your COA checkout**, not a page on this site:
+it covers deployment, creating the credential secret, the three Unity Catalog grants, registering
+the source, and the alarms the stack creates. Start from its *Quick start*. Four things to know
+before you plan around it:
+
+- **One deployment serves one warehouse**, exposing one Unity Catalog catalog and either one
+  pinned schema or every schema in that catalog. A second warehouse needs a second deployment.
+- **Declared primary and foreign keys come across automatically**, read from Unity Catalog's
+  `information_schema`, so relationships in the ontology come from what your data engineers
+  declared rather than from inference. Two limits: a table that declares no constraints
+  contributes no keys, and a foreign key whose parent table lies outside the exposed schema is
+  dropped. You encode nothing yourself — the connector handles the
+  [key-passing format](custom-connector-sources.md#declaring-primary-and-foreign-keys-in-column-comments)
+  custom connectors use, and removes any such tag already present in a Unity Catalog column
+  comment so it cannot assert a key the warehouse never declared.
+- **Aggregations are computed in Athena, not in the warehouse.** Athena federation pushes
+  predicates and `LIMIT` down into the warehouse, but never aggregation, so `COUNT`, `SUM` and
+  `GROUP BY` read every row matching the predicate. To keep that from becoming an unexplained
+  timeout, the connector **fails** any query whose table exceeds a row ceiling — two million
+  rows by default, set with `DATABRICKS_MAX_ROWS_PER_TABLE` — with an error naming the table
+  and the ceiling. It does not silently return partial results. Narrow the predicate, or raise
+  the ceiling together with the connector's memory and timeout.
+- **Authentication is a personal access token or OAuth machine-to-machine**, chosen by the
+  shape of the Secrets Manager secret you point it at: `{"token": …}` for a token,
+  `{"client_id": …, "client_secret": …}` for OAuth. A secret carrying both is rejected.
 
 ### Direct SQL vs Athena federated
 
@@ -72,13 +139,32 @@ system-set, read-only field — there is no API or configuration knob for it.
 
 ### Prerequisites
 
-1. **Credentials in Secrets Manager** — Create a secret with `username` and `password` keys:
+1. **Credentials in Secrets Manager** — Create a secret with `username` and `password` keys, **tagged with the namespace that will own the source**:
 
 ```bash
 aws secretsmanager create-secret \
   --name "coa/jdbc/my-postgres" \
-  --secret-string '{"username":"readonly_user","password":"s3cur3!"}'
+  --secret-string '{"username":"readonly_user","password":"s3cur3!"}' \
+  --tags Key=coa:namespace,Value=<namespaceId>
 ```
+
+!!! warning "The `coa:namespace` tag is required for in-account secrets"
+    A credential secret **in the deployment account** must carry the tag
+    `coa:namespace=<namespaceId>` matching the namespace you register the source
+    under. This binds the secret to that namespace: registration reads the tag
+    (via `DescribeSecret`) and rejects a secret that is untagged or tagged for a
+    different namespace with a `400`, and the platform's discovery/serve roles are
+    IAM-restricted to secrets carrying the tag. To move a secret between namespaces,
+    re-tag it and re-register the source.
+
+    **Existing sources:** credential secrets created before this requirement are
+    untagged and will fail discovery/query until you add the tag —
+    `aws secretsmanager tag-resource --secret-id <arn> --tags Key=coa:namespace,Value=<namespaceId>`.
+
+    This applies only to secrets in the deployment account. A **cross-account**
+    credential secret lives in the customer's account (which the deployment does
+    not tag); it is authorized by the secret's own resource policy instead — see
+    [Cross-Account Data Sources](cross-account-sources.md).
 
 2. **Network access** — The source database must be reachable from the COA VPC. The connector security group needs inbound access on your database port:
 
@@ -134,8 +220,8 @@ and a `databaseSource.jdbcConfiguration` body — see **CreateSource** in the
 | `host` | Yes | Database hostname (RFC 1123, max 253 chars). For Snowflake, the account host `<account>.snowflakecomputing.com` |
 | `port` | Yes | Port number (1–65535). Snowflake uses `443` |
 | `databaseName` | Yes | Target database (alphanumeric + `_` `-`, max 128 chars) |
-| `credentialSecretArn` | Yes | Secrets Manager secret ARN with `username`/`password` |
-| `crossAccountRoleArn` | No | IAM role to assume for cross-account secret access. The web app's **Connect Source** form requires the role name to contain `{prefix}-datasource-access-` as a convention |
+| `credentialSecretArn` | Yes | Secrets Manager secret ARN with `username`/`password`. In-account secrets must be tagged `coa:namespace=<namespaceId>` (see the credentials prerequisite above) |
+| `crossAccountRoleArn` | No | IAM role to assume for cross-account secret access. The web app's **Connect Source** form requires the role name to contain `{prefix}-datasource-access-` as a convention. The role's trust policy **must** condition on the namespace's `sts:ExternalId` — see [Cross-Account Data Sources](cross-account-sources.md) |
 | `schemaFilter` | No | Regex — only schemas matching this pattern are discovered |
 | `schemaExcludeFilter` | No | Regex — schemas matching this are excluded (after include filter) |
 | `tableFilter` | No | Regex — only tables matching this are discovered |
@@ -188,8 +274,8 @@ and a `databaseSource.glueConfiguration` body — see **CreateSource** in the
 | `databaseName` | Yes | Glue database name |
 | `tableFilter` | No | Regex — only tables matching this are discovered |
 | `tableExcludeFilter` | No | Regex — tables matching this are excluded |
-| `crossAccountRoleArn` | No | IAM role ARN the discovery connector assumes to read catalog metadata in a different account. The web app's **Connect Source** form requires the role name to contain `{prefix}-datasource-access-` as a convention |
-| `externalId` | No | STS ExternalId required by the cross-account role's trust policy — only meaningful alongside `crossAccountRoleArn` |
+| `crossAccountRoleArn` | No | IAM role ARN the discovery connector assumes to read catalog metadata in a different account. The web app's **Connect Source** form requires the role name to contain `{prefix}-datasource-access-` as a convention. The role's trust policy **must** condition on the namespace's `sts:ExternalId` — see [Cross-Account Data Sources](cross-account-sources.md) |
+| `externalId` | No | **Deprecated — ignored.** The ExternalId is derived server-side from the namespace and cannot be set through the API; a value supplied here is discarded. Read the value to pin in your trust policy from `datasourceExternalId` on `GET /namespaces/{namespaceId}`. See [Cross-Account Data Sources](cross-account-sources.md) |
 | `athenaDataCatalogName` | No | Explicit Athena catalog name (overrides auto-resolution) |
 
 ## Monitoring Scans
@@ -432,6 +518,20 @@ LIMIT 100;
 | `SCAN_FAILED` with `... exceeding the limit of N` | Source has more tables than `MAX_TABLES_PER_SOURCE` (default `10000`); discovery fails fast rather than hitting the Lambda timeout | Narrow the scan scope with `schemaFilter` / `schemaExcludeFilter` / `tableFilter` (e.g. exclude system schemas like `schemaExcludeFilter: "information_schema\|pg_catalog\|sys"`). If a larger source genuinely needs to be scanned in one pass, raise (or set `0` to disable) the `MAX_TABLES_PER_SOURCE` env var on the `sources-db-connector` Lambda. |
 | Scan times out on a very large Glue/Athena catalog | Enum sampling issues one Athena query per candidate column; the fan-out has to fit inside the scan Lambda timeout | Sampling queries run in parallel, capped by the `ATHENA_SAMPLING_CONCURRENCY` env var on the `sources-db-connector` Lambda (default `16`). Raise it if the account's Athena concurrent-DML quota allows more in-flight queries — that quota, not this setting, is the real ceiling. A non-numeric value falls back to `16`, and the effective concurrency is floored at `1`. |
 
+### Custom connector issues
+
+Symptoms specific to a source reached through an Athena federation connector. The connector's own
+guide (`connectors/README.md`) covers each in more depth.
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Tables are discovered but no primary or foreign keys arrive | The discovery role has no `lambda:InvokeFunction` on the connector, so `DESCRIBE` — the only thing that reads the key tags — never ran | Grant the role named by `/{prefix}/sources/db-connector-role-arn`. Queries work without it, which is why this looks like a metadata problem rather than a permissions one |
+| `DESCRIBE` returns names and types with no comment column | The connector put comments on the Arrow *field* rather than in the schema's metadata, where Athena reads them | Build the schema with the toolkit's `TableSchema`, which makes the working placement the only one expressible |
+| A large result returns **zero rows** with status `SUCCEEDED` | The connector could not write its spill: no `spill_bucket`, the wrong prefix, or no `s3:PutObject` under it | Check the Lambda's `spill_bucket` and that `spill_prefix` is `connectors/<id>/spills`; confirm objects appear there during a query |
+| `AccessDenied`, but only on large results | Spill is read with the *querying* role's credentials, not the connector's | Grant the serve and discovery roles `s3:GetObject` under the spill prefix and `kms:Decrypt` on the spill key |
+| A `@fk(...)` tag appears verbatim in a stored description | The tag was malformed, and the parser's warning goes to COA's logs rather than the connector's | Build tags with the toolkit's `ColumnComment` rather than by hand |
+| Every read fails while metadata calls succeed | The connector's Lambda is missing `JAVA_TOOL_OPTIONS=--add-opens=java.base/java.nio=ALL-UNNAMED`, which Arrow needs on Java 17 | Set it; the CDK construct does this for you |
+
 ## Document Sources
 
 ### Local Upload
@@ -483,6 +583,81 @@ After creation, documents go through:
 2. **Entity extraction** — identifies concepts and relationships from text
 3. **Knowledge graph build** — creates nodes/edges in Neptune
 4. **Embedding** — vectorizes chunks for semantic search in OpenSearch
+
+### Configuring Document Extraction
+
+Document sources accept an optional `extractionConfig` object that tunes how the
+knowledge graph is built from your documents. All fields are optional; the
+defaults are tuned for general prose corpora.
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `preferredEntityClassifications` | `string[]` | `[]` (unset) | Explicit entity-class vocabulary handed to the extraction LLM. |
+| `inferEntityClassifications` | `boolean` | `true` | Derive the entity-class vocabulary from your corpus at ingest start. |
+| `enableTableExtraction` | `boolean` | `false` | Route PDFs through Amazon Textract to preserve table structure. |
+| `chunkSize` | `integer` | `0` (toolkit default 256) | Token size of each extraction/embedding chunk. |
+| `chunkOverlap` | `integer` | `0` (toolkit default 25) | Token overlap between adjacent chunks. |
+
+#### Entity vocabulary: `preferredEntityClassifications` and `inferEntityClassifications`
+
+By default the extractor derives the entity-class vocabulary from **your own
+documents** (`inferEntityClassifications: true`). This avoids typing your graph
+against a generic news/finance vocabulary that would not match domains such as
+insurance, healthcare, or manufacturing.
+
+To pin an explicit vocabulary instead, set `preferredEntityClassifications` to
+the exact class labels you want (case-sensitive, spaces allowed):
+
+```json
+{
+  "extractionConfig": {
+    "preferredEntityClassifications": ["Policy", "Claim", "Loss Ratio", "Policyholder"]
+  }
+}
+```
+
+When `preferredEntityClassifications` is non-empty it **overrides** inference —
+the extractor uses exactly those labels. Leave it empty (the default) to fall
+back to corpus inference. If both are effectively off (empty list and
+`inferEntityClassifications: false`), extraction runs unguided.
+
+#### Table-heavy PDFs: `enableTableExtraction`
+
+For PDFs whose meaning lives in tables (premium schedules, rate cards, spec
+sheets), set `enableTableExtraction: true`. Every PDF is then routed through
+Amazon Textract's `AnalyzeDocument` with the `TABLES` feature, which preserves
+row/column structure as Markdown tables instead of flattening them into prose.
+
+```json
+{
+  "extractionConfig": {
+    "enableTableExtraction": true
+  }
+}
+```
+
+This costs materially more per page than the default text extraction, so leave
+it off for prose-dominant corpora.
+
+#### Chunking: `chunkSize` and `chunkOverlap`
+
+`chunkSize` and `chunkOverlap` (in tokens) control how documents are split for
+extraction and embedding. `0` (the default for both) means "use the toolkit
+default" — `chunkSize` 256, `chunkOverlap` 25. Set a positive `chunkSize`
+(e.g. 1024) to keep more context per chunk for dense or tabular corpora:
+
+```json
+{
+  "extractionConfig": {
+    "chunkSize": 1024,
+    "chunkOverlap": 100
+  }
+}
+```
+
+`chunkOverlap` must be smaller than `chunkSize`; if it is set greater than or
+equal to `chunkSize` it is clamped down (with a logged warning) so chunking
+still produces valid chunks.
 
 ## Cross-Account Sources
 

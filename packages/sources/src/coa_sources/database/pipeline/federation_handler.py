@@ -58,6 +58,27 @@ FEDERATED_CATALOG_ROLE_ARN = os.environ.get("FEDERATED_CATALOG_ROLE_ARN", "")
 _dao: DynamoDBDAO | None = None
 _ssm = None
 
+# DATABASE sub-types this handler has an explicit branch for.
+_HANDLED_SUB_TYPES = frozenset(
+    {
+        SourceSubType.GLUE_DATABASE.value,
+        SourceSubType.JDBC_DATABASE.value,
+        SourceSubType.CUSTOM_CONNECTOR.value,
+    }
+)
+# DOCUMENTS sub-types never reach this pipeline, so a row carrying one is a
+# mis-stored record. The right treatment there is the long-standing no-op, not a
+# scan failure — this handler is not the place to police that.
+_DOCUMENT_SUB_TYPES = frozenset({SourceSubType.S3.value, SourceSubType.LOCAL_UPLOAD.value})
+# What is left is a DATABASE sub-type the enum recognises and this handler has no
+# branch for. Empty today, and that is the point: it becomes non-empty only when a
+# new DATABASE sub-type ships without its branch here, which the catch-all in
+# :func:`handler` then reports instead of silently leaving every source of that
+# type not-queryable. An absent or unrecognised value is deliberately NOT in this
+# set, so a concurrently-deleted source (which reads back as an empty dict) and a
+# legacy row both keep the no-op.
+_UNHANDLED_DATABASE_SUB_TYPES = frozenset(m.value for m in SourceSubType) - _HANDLED_SUB_TYPES - _DOCUMENT_SUB_TYPES
+
 
 def _get_dao() -> DynamoDBDAO:
     global _dao
@@ -117,12 +138,19 @@ def _consumer_role_arn() -> str:
         return ""
 
 
-def _grant_secret_read_to_consumer(secret_arn: str) -> None:
+def _grant_secret_read_to_consumer(secret_arn: str, namespace_id: str) -> None:
     """Attach a resource policy on the credential secret granting the consumer role GetSecretValue.
 
     Idempotent: merges the consumer principal into the existing policy if one exists.
     Best-effort: failures are logged but don't block provisioning (the source remains
     queryable via Athena federation; only the direct JDBC fast-path is affected).
+
+    Namespace binding: the grant is conditioned on the secret carrying
+    ``coa:namespace == namespace_id``, so the serve runtime can read the secret
+    only while it is tagged for the namespace that registered the source. This is
+    the serve-side half of the namespace binding — it keeps a stale or rebound
+    grant from being used to read a secret that now belongs to another namespace,
+    without giving the serve role any DescribeSecret permission of its own.
     """
     consumer_arn = _consumer_role_arn()
     if not consumer_arn or not secret_arn:
@@ -166,6 +194,8 @@ def _grant_secret_read_to_consumer(secret_arn: str) -> None:
                 "Principal": {"AWS": consumer_arn},
                 "Action": "secretsmanager:GetSecretValue",
                 "Resource": "*",
+                # Only readable while the secret is tagged for this namespace.
+                "Condition": {"StringEquals": {"secretsmanager:ResourceTag/coa:namespace": namespace_id}},
             }
         )
         policy = {
@@ -229,7 +259,41 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         )
         return {"provisioned": False, "reason": "glue-native", "queryable": granted}
 
+    # Custom-connector sources need no provisioning here: the Lambda-backed Athena
+    # data catalog was registered at source-create, because this sub-type's
+    # discovery queries it and discovery runs BEFORE this step. All that remains
+    # is to mark the source queryable, which discovery having succeeded is the
+    # evidence for — the SHOW/DESCRIBE statements it ran are proof the catalog
+    # resolves and the connector answers. There is no Glue object and no Lake
+    # Formation grant to make, so nothing gates this beyond the write itself.
+    if sub_type == SourceSubType.CUSTOM_CONNECTOR:
+        # Raises on failure, matching the JDBC path: leaving queryable False after
+        # a successful discovery would present as a source that scanned fine and
+        # silently answers nothing. Nothing needs rolling back — the catalog
+        # belongs to the create path — and a re-scan retries.
+        _get_dao().update(
+            key=source_key,
+            update_fields={"queryable": True},
+            condition="attribute_exists(PK)",
+        )
+        logger.info("custom_connector_marked_queryable", extra={"datasource_id": datasource_id})
+        return {"provisioned": False, "reason": "custom-connector", "queryable": True}
+
     if sub_type != SourceSubType.JDBC_DATABASE:
+        # An ABSENT sub-type is the benign case and must stay a no-op: a source
+        # deleted concurrently with its scan reads back as an empty dict, and a
+        # legacy row may predate the attribute. Turning either into a pipeline
+        # failure would convert a race into an alarm.
+        #
+        # A sub-type the enum RECOGNISES but this handler does not is different —
+        # it means a new DATABASE sub-type shipped without its branch here, and
+        # every source of that type would silently stay queryable=False, scanning
+        # cleanly and then answering nothing. That has to be loud.
+        if sub_type in _UNHANDLED_DATABASE_SUB_TYPES:
+            raise RuntimeError(
+                f"No federation branch for sourceSubType {sub_type!r} ({datasource_id}); "
+                f"the source would stay not-queryable with no other signal"
+            )
         logger.info("Skipping federation for non-JDBC source: %s (type=%s)", datasource_id, sub_type)
         return {"provisioned": False, "reason": "not-jdbc"}
 
@@ -297,7 +361,7 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     # Grant the consumer query principal (AgentCore runtime role) read access to
     # the credential secret so the direct JDBC executor can authenticate at query time.
     # Uses a resource-based policy on the secret (least-privilege, no broad IAM grant).
-    _grant_secret_read_to_consumer(credential_secret_arn)
+    _grant_secret_read_to_consumer(credential_secret_arn, namespace_id)
 
     # Persist the references; roll back the cloud resources if the write fails
     # so we never leave orphaned Glue/LF resources unrecorded, then re-raise to

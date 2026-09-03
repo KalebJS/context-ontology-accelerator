@@ -34,6 +34,7 @@ from coa_common.domain_models import (
 from . import lf_grant
 from .base import ConnectionCheck, ConnectionTestResult, MetadataConnector
 from .filters import compile_filter
+from .sts_assume import assume_datasource_session
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ class GlueCatalogConnector(MetadataConnector):
                 ],
             )
 
-        glue = self._get_glue_client(region, cross_account_role, external_id)
+        glue = self._get_glue_client(region, cross_account_role, external_id, config.get("namespace_id", ""))
         get_db_kwargs: dict = {"Name": database_name}
         if catalog_id:
             get_db_kwargs["CatalogId"] = catalog_id
@@ -173,7 +174,7 @@ class GlueCatalogConnector(MetadataConnector):
         table_filter = config.get("table_filter")
         table_exclude_filter = config.get("table_exclude_filter")
 
-        glue = self._get_glue_client(region, cross_account_role, external_id)
+        glue = self._get_glue_client(region, cross_account_role, external_id, config.get("namespace_id", ""))
         # Reuse the shared filter compiler (same as JDBC) so a pipe/comma list
         # like ``staging_*|temp_*`` excludes ANY matching glob. A bare
         # ``fnmatch.translate`` treated the whole string as one glob and silently
@@ -391,27 +392,20 @@ class GlueCatalogConnector(MetadataConnector):
         region: str,
         cross_account_role: str | None = None,
         external_id: str | None = None,
+        namespace_id: str = "",
     ):
         """Get a Glue client, optionally assuming a cross-account role.
 
-        When ``external_id`` is provided it is passed to ``AssumeRole`` to
-        satisfy the cross-account role's trust-policy ExternalId condition
-        (confused-deputy protection).
+        A cross-account assume REQUIRES ``external_id``; it is derived from the
+        requesting namespace by ``discovery_handler``, never taken from the API
+        request. See ``sts_assume.assume_datasource_session``.
         """
         if cross_account_role:
-            sts = boto3.client("sts", region_name=region)
-            assume_params: dict = {
-                "RoleArn": cross_account_role,
-                "RoleSessionName": "coa-glue-discovery",
-            }
-            if external_id:
-                assume_params["ExternalId"] = external_id
-            creds = sts.assume_role(**assume_params)["Credentials"]
-            session = boto3.Session(
-                aws_access_key_id=creds["AccessKeyId"],
-                aws_secret_access_key=creds["SecretAccessKey"],
-                aws_session_token=creds["SessionToken"],
-                region_name=region,
+            session = assume_datasource_session(
+                role_arn=cross_account_role,
+                external_id=external_id or "",
+                region=region,
+                session_name=f"coa-glue-{namespace_id}",
             )
             return session.client("glue", region_name=region)
         return boto3.client("glue", region_name=region)

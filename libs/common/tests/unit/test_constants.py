@@ -9,6 +9,7 @@ import re
 import pytest
 from coa_common.constants import (
     canonical_col,
+    datasource_external_id,
     graphrag_chunk_index_name,
     graphrag_index_names,
     ontology_artifact_s3_key,
@@ -271,3 +272,38 @@ class TestGraphragIndexNames:
         a = graphrag_index_names("550e8400-e29b-41d4-a716-446655440000")
         b = graphrag_index_names("f47ac10b-58cc-4372-a567-0e02b2c3d479")
         assert not set(a) & set(b)
+
+
+@pytest.mark.unit
+class TestDatasourceExternalId:
+    """The ExternalId presented when assuming a customer's cross-account role.
+
+    The cross-account role ARN is caller-supplied, so this value — derived from
+    the namespace, never from the request — is what binds an assume to the
+    namespace entitled to it.
+    """
+
+    def test_derives_from_prefix_and_namespace(self, monkeypatch):
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
+        assert datasource_external_id("ns-1") == "coa-dev-ns-1"
+
+    def test_distinct_namespaces_get_distinct_values(self, monkeypatch):
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
+        a = datasource_external_id("550e8400-e29b-41d4-a716-446655440000")
+        b = datasource_external_id("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+        assert a != b
+
+    def test_distinct_deployments_get_distinct_values(self, monkeypatch):
+        """Two deployments must not present the same value for one namespace id."""
+        ns = "550e8400-e29b-41d4-a716-446655440000"
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
+        dev = datasource_external_id(ns)
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-prod-")
+        assert datasource_external_id(ns) != dev
+
+    def test_reads_prefix_per_call_not_at_import(self, monkeypatch):
+        """The value is read live so a redeploy under a new prefix takes effect."""
+        monkeypatch.setenv("RESOURCE_PREFIX", "a-")
+        assert datasource_external_id("ns") == "a-ns"
+        monkeypatch.setenv("RESOURCE_PREFIX", "b-")
+        assert datasource_external_id("ns") == "b-ns"
