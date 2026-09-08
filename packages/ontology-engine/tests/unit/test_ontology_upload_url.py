@@ -85,17 +85,18 @@ def client(monkeypatch, tmp_path):
         patch("coa_ontology.dynamo_store.update_ingest_job"),
         patch("coa_ontology.dynamo_store.put_ingest_job"),
         patch("coa_ontology.dynamo_store.get_ontology_registry", return_value=None),
+        patch("coa_ontology.dynamo_store._get_s3", return_value=mock_s3),
         patch("boto3.client", return_value=mock_s3),
         patch("boto3.Session", return_value=MagicMock(client=MagicMock(return_value=mock_s3))),
     ):
         from coa_ontology.main import app
 
-        yield TestClient(app), mock_table
+        yield TestClient(app), mock_table, mock_s3
 
 
 class TestGetUploadUrl:
     def test_returns_presigned_url(self, client):
-        http, _ = client
+        http, _, _ = client
         resp = http.post(
             "/ontologies/upload-url?namespace=test-ns",
             json={"filename": "my-onto.ttl", "contentType": "text/turtle"},
@@ -107,18 +108,32 @@ class TestGetUploadUrl:
         assert "s3Key" in body
 
     def test_rejects_invalid_filename(self, client):
-        http, _ = client
+        http, _, _ = client
         resp = http.post(
             "/ontologies/upload-url?namespace=ns",
             json={"filename": "...", "contentType": "text/turtle"},
         )
         assert resp.status_code == 400
 
+    def test_presign_does_not_sign_content_length(self, client):
+        """Regression: ``ContentLength`` must NOT be signed. Signing a fixed
+        length forces the browser to PUT exactly that many bytes under SigV4
+        or get a 403 (real file size ≠ signed size). It never capped uploads."""
+        http, _, mock_s3 = client
+        resp = http.post(
+            "/ontologies/upload-url?namespace=test-ns",
+            json={"filename": "my-onto.ttl", "contentType": "text/turtle"},
+        )
+        assert resp.status_code == 200
+        params = mock_s3.generate_presigned_url.call_args.kwargs["Params"]
+        assert "ContentLength" not in params
+        assert params["ContentType"] == "text/turtle"
+
 
 class TestIngestFromS3:
     def test_returns_202(self, client):
         """The ingest-from-s3 endpoint returns 202 (async job)."""
-        http, mock_table = client
+        http, mock_table, _ = client
         mock_table.get_item.return_value = {}
 
         resp = http.post(

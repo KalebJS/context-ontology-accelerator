@@ -1,6 +1,6 @@
 [project]
 name = "coa-sources"
-version = "0.1.0"
+version = "0.2.3"
 description = "Unified Sources for Context Ontology Accelerator"
 requires-python = ">=3.12"
 
@@ -28,6 +28,7 @@ integ = [
 markers = [
     "unit: Unit tests",
     "integ: Integration tests",
+    "real_glue_ownership: Opt out of the unit conftest's Glue ownership stub and exercise the real check",
 ]
 pythonpath = ["."]
 

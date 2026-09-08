@@ -174,6 +174,40 @@ class TestSourcesRegistry:
         registry._mock_table.query.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_sql_namespace_scope_includes_only_queryable_database_sources(self):
+        registry = self._make_registry_with_query(
+            [
+                {
+                    "sourceType": "DATABASE",
+                    "athenaDatabase": "tenant_a_glue",
+                    "queryable": True,
+                },
+                {
+                    "sourceType": "DATABASE",
+                    "athenaDataCatalogName": "sclds_a",
+                    "discoveredSchemas": ["sales", "analytics"],
+                    "queryable": True,
+                },
+                {
+                    "sourceType": "DATABASE",
+                    "athenaDatabase": "not_queryable",
+                    "queryable": False,
+                },
+                {
+                    "sourceType": "DOCUMENTS",
+                    "configuration": {"databaseName": "not_a_database_source"},
+                    "queryable": True,
+                },
+            ]
+        )
+
+        scope = await registry.sql_namespace_scope("ns-a")
+
+        assert scope is not None
+        assert scope.native_databases == frozenset({"tenant_a_glue"})
+        assert scope.federated_catalog_schemas == frozenset({("sclds_a", "sales"), ("sclds_a", "analytics")})
+
+    @pytest.mark.asyncio
     async def test_find_sole_database_source_not_available(self):
         registry = SourcesRegistry(table_name="", region="us-west-2")
         result = await registry.find_sole_database_source("ns-1")
@@ -365,3 +399,14 @@ class TestNamespaceExists:
         with patch("boto3.resource"):
             reg = SourcesRegistry(table_name="test-sources", region="us-west-2")
         assert await reg.namespace_exists("anything") is None
+
+    def test_namespaces_configured_reflects_table_wiring(self):
+        """namespaces_configured distinguishes "cannot check" from "lookup errored"
+        so the entrypoint fails closed only on the latter (F-2).
+        """
+        configured = self._make_ns_registry()
+        assert configured.namespaces_configured is True
+
+        with patch("boto3.resource"):
+            unconfigured = SourcesRegistry(table_name="test-sources", region="us-west-2")
+        assert unconfigured.namespaces_configured is False

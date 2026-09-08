@@ -18,6 +18,8 @@ export interface RuntimeContext {
   readonly apiEndpoint?: string;
   /** AgentCore Runtime ARN. Frontend builds the invocations URL from this + region. */
   readonly serveRuntimeArn?: string;
+  /** Monorepo version (from VERSION), rendered as a badge in the UI. */
+  readonly version?: string;
   readonly oidcConfig: OidcConfig;
 }
 

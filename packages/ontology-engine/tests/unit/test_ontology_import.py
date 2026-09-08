@@ -539,15 +539,21 @@ class TestUploadEndpoint:
         # Distinct namespace
         r = http.get("/ontologies/", params={"namespace": "acme"})
         assert r.status_code == 200
-        rows = r.json()
+        # ``{ontologies: [...]}`` envelope with camelCase members — the
+        # Smithy-declared shape (see test_list_ontologies_wire_shape.py).
+        rows = r.json()["ontologies"]
         assert len(rows) == 1
         assert rows[0]["uri"] == "https://example.com/onto"
-        assert rows[0]["graph_uri"].startswith("https://")
-        assert rows[0]["embedding_index"] == "ontology-workbench-embeddings-acme"
+        assert rows[0]["graphUri"].startswith("https://")
+        # ``embedding_index`` is registry-only bookkeeping that the contract does
+        # not declare, so it is no longer part of this response. The namespace
+        # scoping it used to prove is covered by the graph URI + the
+        # cross-namespace isolation assertion below.
+        assert "embedding_index" not in rows[0]
 
         # Different namespace sees nothing
         r2 = http.get("/ontologies/", params={"namespace": "other"})
-        assert r2.json() == []
+        assert r2.json() == {"ontologies": []}
 
     def test_delete_clears_registry_and_vectors(self, import_client):
         http, mock_graph, mock_vec, *_ = import_client
@@ -565,7 +571,7 @@ class TestUploadEndpoint:
         mock_graph.delete_ontology.assert_called()
         mock_vec.delete_embeddings_for_ontology.assert_called()
         listing = http.get("/ontologies/", params={"namespace": "default"}).json()
-        assert listing == []
+        assert listing == {"ontologies": []}
 
 
 # ── Multi-proposal merge into a single ontology ─────────────────────────

@@ -42,7 +42,7 @@ import structlog
 from coa_common import resolve_region
 
 from ..query_utils import validate_namespace
-from ..tier2.sql_firewall import SQLFirewall
+from ..tier2.sql_firewall import NamespaceSQLScopeError, SQLFirewall
 from .base import QueryResult, instrumented
 from .sources_registry import SourcesRegistry
 
@@ -158,6 +158,7 @@ class RedshiftDataAPIExecutor:
             # guarantees carry a workgroup.
             raise ValueError(f"No Redshift workgroup configured for source {namespace}/{data_source_id}")
 
+        await self._authorize_qualified_references(sql, namespace)
         sql = self._prepare_sql(sql, glue_database, max_rows)
 
         statement_id = await self._start_statement(sql, workgroup)
@@ -197,6 +198,30 @@ class RedshiftDataAPIExecutor:
         return None
 
     # ── SQL preparation ──────────────────────────────────────────────────
+
+    async def _authorize_qualified_references(self, sql: str, namespace: str) -> None:
+        """Deny cross-namespace Glue references before Redshift rewrites them.
+
+        The Redshift rewriter preserves an explicit database from generated SQL,
+        so it must not run until the database is proven to belong to this
+        namespace. Bare tables use the source-resolved Glue database and need no
+        additional inventory lookup.
+        """
+        if not any("." in ref for ref in _firewall.extract_tables(sql)):
+            return
+
+        scope = await self._sources.sql_namespace_scope(namespace)
+        if scope is None:
+            raise RedshiftQueryError("Unable to verify SQL references for the requested namespace")
+        try:
+            _firewall.validate_namespace_sql_scope(
+                sql,
+                native_databases=scope.native_databases,
+                federated_catalog_schemas=scope.federated_catalog_schemas,
+                default_catalog=_AWS_DATA_CATALOG,
+            )
+        except NamespaceSQLScopeError as exc:
+            raise RedshiftQueryError("Access denied: SQL reference is outside the requested namespace") from exc
 
     def _prepare_sql(self, sql: str, glue_database: str, max_rows: int) -> str:
         """Transpile Trino→Redshift, rewrite to awsdatacatalog 3-part names, cap LIMIT."""

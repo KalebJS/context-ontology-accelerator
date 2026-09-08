@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import pytest
-from coa_serve.tier2.sql_firewall import FirewallResult, SQLFirewall, UnsafeSQLError
+from coa_serve.tier2.sql_firewall import FirewallResult, NamespaceSQLScopeError, SQLFirewall, UnsafeSQLError
 
 
 @pytest.mark.unit
@@ -678,3 +678,44 @@ class TestRealCedarThroughFirewall:
         # still apply, but none set here).
         result = fw.evaluate("SELECT id FROM orders", profile={"userId": "u1"}, namespace="ns")
         assert not result.denied
+
+
+@pytest.mark.unit
+class TestNamespaceSQLScope:
+    """F-3: qualified SQL may not escape the requested namespace's sources."""
+
+    _NATIVE = frozenset({"tenant_a_db"})
+    _FEDERATED = frozenset({("sclds_a", "sales")})
+
+    def _validate(self, sql: str, default_catalog: str = "AwsDataCatalog") -> bool:
+        return SQLFirewall.validate_namespace_sql_scope(
+            sql,
+            native_databases=self._NATIVE,
+            federated_catalog_schemas=self._FEDERATED,
+            default_catalog=default_catalog,
+        )
+
+    def test_owned_native_database_is_allowed(self):
+        assert self._validate("SELECT * FROM AwsDataCatalog.tenant_a_db.customers")
+
+    def test_owned_federated_catalog_schema_is_allowed(self):
+        assert self._validate("SELECT * FROM sclds_a.sales.customers")
+
+    def test_bare_table_uses_namespace_context_without_inventory_lookup(self):
+        assert not self._validate("SELECT * FROM customers")
+
+    def test_foreign_native_database_is_denied_even_when_table_name_matches(self):
+        with pytest.raises(NamespaceSQLScopeError, match="not available in the requested namespace"):
+            self._validate("SELECT * FROM AwsDataCatalog.tenant_b_db.customers")
+
+    def test_foreign_federated_catalog_is_denied(self):
+        with pytest.raises(NamespaceSQLScopeError, match="not available in the requested namespace"):
+            self._validate("SELECT * FROM sclds_b.sales.customers")
+
+    def test_two_part_foreign_database_is_denied_under_native_context(self):
+        with pytest.raises(NamespaceSQLScopeError, match="not available in the requested namespace"):
+            self._validate("SELECT * FROM tenant_b_db.customers")
+
+    def test_information_schema_enumeration_is_denied(self):
+        with pytest.raises(NamespaceSQLScopeError, match="not available in the requested namespace"):
+            self._validate("SELECT * FROM information_schema.tables")

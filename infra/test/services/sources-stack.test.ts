@@ -204,6 +204,438 @@ describe("SourcesStack", () => {
           "arn:aws:athena:us-east-1:123456789012:datacatalog/coadevds_*",
       });
     });
+
+    it("grants the sources-api role in-account DescribeSecret for the namespace-binding check, and NOT GetSecretValue", () => {
+      // At source registration the API verifies a JDBC credential secret carries
+      // a `{prefix}:namespace` tag LISTING the registering namespace. That check
+      // reads TAGS only (DescribeSecret) — it must never be able to read secret
+      // VALUES on this role, and must be scoped to this account (cross-account
+      // secrets are gated by their own resource policy, not by this grant).
+      const apiFn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((fn: any) =>
+        String(fn.Properties?.FunctionName ?? "").endsWith("sources-api"),
+      );
+      expect(apiFn).toBeDefined();
+      const apiRoleId = (apiFn as any).Properties.Role["Fn::GetAtt"][0];
+
+      const statements = Object.values(
+        template.findResources("AWS::IAM::Policy"),
+      )
+        .filter((p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === apiRoleId),
+        )
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+
+      expect(
+        statements.find(
+          (s: any) => s.Sid === "DescribeSecretForNamespaceBinding",
+        ),
+      ).toEqual({
+        Sid: "DescribeSecretForNamespaceBinding",
+        Effect: "Allow",
+        Action: "secretsmanager:DescribeSecret",
+        Resource: "arn:aws:secretsmanager:*:123456789012:secret:*",
+      });
+
+      // Least privilege: the registration path reads tags, never values.
+      const grantsGetSecretValue = statements.some((s: any) => {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        return actions.includes("secretsmanager:GetSecretValue");
+      });
+      expect(grantsGetSecretValue).toBe(false);
+    });
+
+    it("grants the sources-api role Glue GetTags AND GetDatabase for the namespace-ownership check", () => {
+      // Source-create refuses a Glue database whose owner has not tagged it for
+      // the caller's namespace (finding F-8). The check fails closed, so without
+      // this grant every native Glue source create would 403.
+      const apiFn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((fn: any) =>
+        String(fn.Properties?.FunctionName ?? "").endsWith("sources-api"),
+      );
+      expect(apiFn).toBeDefined();
+      const apiRoleId = (apiFn as any).Properties.Role["Fn::GetAtt"][0];
+
+      const statements = Object.values(
+        template.findResources("AWS::IAM::Policy"),
+      )
+        .filter((p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === apiRoleId),
+        )
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+
+      const stmt = statements.find(
+        (s: any) => s.Sid === "GlueOwnershipTagRead",
+      );
+      expect(stmt).toBeDefined();
+      // GetDatabase is REQUIRED, not incidental: Glue authorizes GetTags on a
+      // database ARN against glue:GetDatabase on the catalog, so GetTags alone
+      // yields AccessDenied and the fail-closed check then refuses every
+      // legitimate Glue source. An earlier revision asserted `["glue:GetTags"]`
+      // exactly and shipped that 403 to a live account — this assertion exists to
+      // stop the narrower policy coming back.
+      expect(stmt.Action).toEqual(["glue:GetTags", "glue:GetDatabase"]);
+      // Still metadata only: no GetTable(s), no Lake Formation, no data path.
+      expect(stmt.Action).not.toContain("glue:GetTables");
+    });
+  });
+
+  describe("credential-secret namespace binding (secret-read conditions)", () => {
+    /** Every IAM policy statement in the stack, flattened. */
+    function allStatements(): any[] {
+      return Object.values(template.findResources("AWS::IAM::Policy")).flatMap(
+        (p: any) => p.Properties.PolicyDocument.Statement,
+      );
+    }
+    const bySid = (sid: string) =>
+      allStatements().find((s: any) => s.Sid === sid);
+
+    // Discovery role: an in-account customer secret must carry a
+    // `{prefix}:namespace` tag (Null:false = key must be present), so a bypassed write path can't
+    // read an arbitrary untagged account secret. Still ANDs the account guard.
+    it("conditions the discovery role's in-account secret read on the namespace tag", () => {
+      const s = bySid("SecretsManagerCustomerProvided");
+      expect(s.Condition).toEqual({
+        StringEquals: { "aws:ResourceAccount": "123456789012" },
+        Null: { "secretsmanager:ResourceTag/coa:namespace": "false" },
+      });
+    });
+
+    // Federated-catalog role: in-account read is tag-gated; cross-account read
+    // is split into its own statement (customer secret, gated by the customer's
+    // resource policy, no tag we control).
+    it("splits the federated-catalog secret read into tag-gated in-account and unconditioned cross-account", () => {
+      expect(bySid("ReadCredentialSecretInAccount").Condition).toEqual({
+        StringEquals: { "aws:ResourceAccount": "123456789012" },
+        Null: { "secretsmanager:ResourceTag/coa:namespace": "false" },
+      });
+      // The cross-account statement also requires aws:ResourceAccount to be
+      // PRESENT. A negated condition is satisfied when its key is absent, so
+      // StringNotEquals on its own would leave this statement unconditioned in
+      // any request context that does not populate the key.
+      expect(bySid("ReadCredentialSecretCrossAccount").Condition).toEqual({
+        StringNotEquals: { "aws:ResourceAccount": "123456789012" },
+        Null: { "aws:ResourceAccount": "false" },
+      });
+    });
+
+    // The provisioner's PutResourcePolicy write primitive is scoped to
+    // onboarded (tagged) in-account secrets, not every account secret.
+    it("scopes the federation provisioner's resource-policy write to tagged in-account secrets", () => {
+      const s = bySid("SecretResourcePolicyForConsumer");
+      expect(s.Action).toEqual([
+        "secretsmanager:GetResourcePolicy",
+        "secretsmanager:PutResourcePolicy",
+      ]);
+      expect(s.Condition).toEqual({
+        StringEquals: { "aws:ResourceAccount": "123456789012" },
+        Null: { "secretsmanager:ResourceTag/coa:namespace": "false" },
+      });
+    });
+
+    /** IAM statements attached to the role of the Lambda whose name ends `suffix`. */
+    function statementsForFunction(suffix: string): any[] {
+      const fn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((f: any) =>
+        String(f.Properties?.FunctionName ?? "").endsWith(suffix),
+      );
+      expect(fn).toBeDefined();
+      const roleId = (fn as any).Properties.Role["Fn::GetAtt"][0];
+      return Object.values(template.findResources("AWS::IAM::Policy"))
+        .filter((p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === roleId),
+        )
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+    }
+
+    // There used to be an unconditioned `SecretsManagerCoaManaged` statement on
+    // the discovery role covering `{prefix}datasource-*`. IAM statements are
+    // additive, so it exempted exactly the naming convention the platform's own
+    // credential secrets use from the tag requirement above. Verified live: with
+    // it attached, an untagged secret and a secret tagged for another namespace
+    // were both readable.
+    it("leaves the discovery role no untagged in-account read path", () => {
+      const reads = statementsForFunction("sources-db-connector").filter(
+        (s: any) => {
+          const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+          return actions.includes("secretsmanager:GetSecretValue");
+        },
+      );
+      expect(reads).toHaveLength(1);
+      expect(reads[0].Sid).toBe("SecretsManagerCustomerProvided");
+      expect(
+        allStatements().some((s: any) => s.Sid === "SecretsManagerCoaManaged"),
+      ).toBe(false);
+    });
+
+    // Both scan-pipeline handlers re-verify the binding against the STORED row
+    // before reading the secret, which needs DescribeSecret (tags), never
+    // GetSecretValue.
+    it.each([["sources-db-connector"], ["sources-federation-provisioner"]])(
+      "grants %s in-account DescribeSecret for the scan-time re-check",
+      (suffix: string) => {
+        expect(
+          statementsForFunction(suffix).find(
+            (s: any) => s.Sid === "DescribeSecretForNamespaceBinding",
+          ),
+        ).toEqual({
+          Sid: "DescribeSecretForNamespaceBinding",
+          Effect: "Allow",
+          Action: "secretsmanager:DescribeSecret",
+          Resource: "arn:aws:secretsmanager:*:123456789012:secret:*",
+        });
+      },
+    );
+
+    // The discovery Lambda derives the tag key at runtime, so it needs the same
+    // BARE prefix the IAM conditions were written against. Without it the key
+    // falls back to the brand default and a non-`coa` deployment's re-check would
+    // read a tag nobody writes.
+    it("gives the discovery Lambda the RESOURCE_TAG_PREFIX its re-check derives the key from", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-db-connector$"),
+        Environment: {
+          Variables: Match.objectLike({ RESOURCE_TAG_PREFIX: "coa" }),
+        },
+      });
+    });
+
+    // The enrichment task reaches source credentials through the same JDBC
+    // connector code, so its read carries the same tag requirement. Its grant was
+    // the other untagged in-account read path.
+    it("conditions the enrichment task role's credential-secret read on the namespace tag", () => {
+      const s = bySid("ReadNamespaceBoundCredentialSecret");
+      expect(s.Action).toBe("secretsmanager:GetSecretValue");
+      expect(s.Condition).toEqual({
+        Null: { "secretsmanager:ResourceTag/coa:namespace": "false" },
+      });
+    });
+  });
+
+  // The tag KEY carries the deployment prefix, so two deployments co-located in
+  // one AWS account bind independently — a secret onboarded to `scl` is not
+  // readable by a `coa` deployment. The assertions above run under the default
+  // prefix (`coa`), where a hardcoded key is indistinguishable from a derived
+  // one; this block synthesizes under a different prefix so a regression to a
+  // literal `coa:namespace` fails here.
+  describe("credential-secret namespace binding (prefix-derived tag key)", () => {
+    let scl: Template;
+
+    beforeAll(() => {
+      const app = new cdk.App({
+        context: { ...TEST_CONTEXT, resource_prefix: "scl", env: "dev" },
+      });
+      const network = new NetworkStack(app, "SclNetwork", { env: TEST_ENV });
+      const storage = new StorageStack(app, "SclStorage", {
+        network,
+        env: TEST_ENV,
+      });
+      scl = Template.fromStack(
+        new SourcesStack(app, "SclSources", {
+          network,
+          storage,
+          allowedOrigin: "https://test.example.com",
+          env: TEST_ENV,
+        }),
+      );
+    });
+
+    const sclBySid = (sid: string) =>
+      Object.values(scl.findResources("AWS::IAM::Policy"))
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement)
+        .find((st: any) => st.Sid === sid);
+
+    it.each([
+      "SecretsManagerCustomerProvided",
+      "ReadCredentialSecretInAccount",
+      "SecretResourcePolicyForConsumer",
+    ])("keys %s's tag condition on the deployment prefix", (sid) => {
+      expect(sclBySid(sid).Condition.Null).toEqual({
+        "secretsmanager:ResourceTag/scl:namespace": "false",
+      });
+    });
+
+    // The runtime derives the same key from RESOURCE_TAG_PREFIX. If this var is
+    // missing or carries the `{prefix}-{env}-` form, registration writes/checks a
+    // key the IAM conditions above cannot match and every JDBC source breaks.
+    it.each(["sources-api", "sources-federation-provisioner"])(
+      "passes the BARE prefix to %s as RESOURCE_TAG_PREFIX",
+      (fnSuffix) => {
+        const fn = Object.values(
+          scl.findResources("AWS::Lambda::Function"),
+        ).find((f: any) =>
+          String(f.Properties?.FunctionName ?? "").endsWith(fnSuffix),
+        );
+        expect(fn).toBeDefined();
+        expect(
+          (fn as any).Properties.Environment.Variables.RESOURCE_TAG_PREFIX,
+        ).toBe("scl");
+      },
+    );
+  });
+
+  describe("Discovery role — custom Athena federation connectors", () => {
+    /** IAM statements attached to the db-connector (discovery) Lambda's role. */
+    function discoveryStatements(): any[] {
+      const fn = Object.values(
+        template.findResources("AWS::Lambda::Function"),
+      ).find((f: any) =>
+        String(f.Properties?.FunctionName ?? "").endsWith(
+          "sources-db-connector",
+        ),
+      );
+      expect(fn).toBeDefined();
+      const roleId = (fn as any).Properties.Role["Fn::GetAtt"][0];
+      return Object.values(template.findResources("AWS::IAM::Policy"))
+        .filter((p: any) =>
+          p.Properties.Roles?.some((r: any) => r.Ref === roleId),
+        )
+        .flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+    }
+
+    // Discovery runs SHOW/DESCRIBE against the Lambda-backed catalog, and Athena
+    // resolves catalog name → connector ARN via GetDataCatalog. The existing
+    // AthenaEnumSampling statement is workgroup-scoped only, so without this the
+    // very first SHOW DATABASES fails AccessDenied.
+    it("grants prefix-scoped athena:GetDataCatalog", () => {
+      expect(
+        discoveryStatements().find(
+          (s: any) => s.Sid === "CustomConnectorCatalogRead",
+        ),
+      ).toEqual({
+        Sid: "CustomConnectorCatalogRead",
+        Effect: "Allow",
+        Action: "athena:GetDataCatalog",
+        Resource:
+          "arn:aws:athena:us-east-1:123456789012:datacatalog/coadevds_*",
+      });
+    });
+
+    // The discovery role reads Glue across the whole account (`database/*`,
+    // `table/*/*`), which is what finding F-8 turned into cross-namespace access.
+    // The tag is the authorization that read is now checked against, so it has to
+    // be readable on the same resources.
+    it("grants the discovery role Glue GetTags alongside its account-wide reads", () => {
+      const stmt = discoveryStatements().find(
+        (s: any) => s.Sid === "GlueCatalogAccess",
+      );
+      expect(stmt.Action).toContain("glue:GetTags");
+      expect(stmt.Resource).toEqual(
+        expect.arrayContaining([
+          "arn:aws:glue:us-east-1:123456789012:database/*",
+        ]),
+      );
+    });
+
+    // The check recognises this deployment's own federated catalogs by the
+    // `{sanitizedPrefix}ds_` shape derived from RESOURCE_PREFIX. Unset, the runtime
+    // default (`coa-dev-`) disagrees with `fedResourcePrefix` and our own catalogs
+    // read as third-party databases.
+    it("gives the discovery Lambda RESOURCE_PREFIX for the ownership check", () => {
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-db-connector$"),
+        Environment: {
+          Variables: Match.objectLike({ RESOURCE_PREFIX: "coa-dev-" }),
+        },
+      });
+    });
+
+    // RESOURCE_TAG_PREFIX is the BARE prefix, deliberately not `prefixed("")`. The
+    // `{prefix}:namespace` tag key is applied by a data owner and must not carry the
+    // environment: `coa-prod:namespace` would make a database tagged in dev
+    // invisible to prod. It cannot be inferred at runtime either — stripping
+    // `-{env}` needs a value that is not on these Lambdas — so CDK passes it.
+    it.each(["sources-db-connector$", "sources-api$"])(
+      "gives %s the bare RESOURCE_TAG_PREFIX, without the environment suffix",
+      (fnName) => {
+        template.hasResourceProperties("AWS::Lambda::Function", {
+          FunctionName: Match.stringLikeRegexp(fnName),
+          Environment: {
+            Variables: Match.objectLike({ RESOURCE_TAG_PREFIX: "coa" }),
+          },
+        });
+      },
+    );
+
+    // Two controls covering different things. `aws:CalledVia` keeps this from being an
+    // invoke primitive usable directly from discovery code; the resource TAG scopes
+    // WHICH functions, since the account must stay a wildcard (the connector lives in
+    // the customer's) and Athena exposes no condition key naming the catalog a
+    // forward-access-session invoke serves. The account is still not excluded — a
+    // connector may be deployed alongside this stack — so the same-account escalation
+    // is closed by the Deny below.
+    it("grants connector invoke only when Athena is the caller, and only for tagged functions", () => {
+      expect(
+        discoveryStatements().find(
+          (s: any) => s.Sid === "AthenaFederationConnectorInvoke",
+        ),
+      ).toEqual({
+        Sid: "AthenaFederationConnectorInvoke",
+        Effect: "Allow",
+        Action: "lambda:InvokeFunction",
+        Resource: "arn:aws:lambda:us-east-1:*:function:*",
+        Condition: {
+          "ForAnyValue:StringEquals": {
+            "aws:CalledVia": "athena.amazonaws.com",
+          },
+          StringEquals: { "aws:ResourceTag/coa:connector": "true" },
+        },
+      });
+    });
+
+    // Without this, an Athena UDF — which needs only StartQueryExecution,
+    // granted above, plus InvokeFunction — reaches every Lambda in OUR account,
+    // including the Lake-Formation-admin federation provisioner.
+    //
+    // Account-wide and region-wide, not scoped to our name prefix: the prefix
+    // form made a naming convention load-bearing for security and silently
+    // refused any connector deployed into this account under the prefix, which
+    // is what scripts/deploy-example-connector.sh does. Breadth is the safe
+    // direction for a Deny.
+    it("denies Athena-mediated invoke of every untagged function in this account", () => {
+      expect(
+        discoveryStatements().find(
+          (s: any) => s.Sid === "DenyAthenaInvokeOfUntaggedFunctions",
+        ),
+      ).toEqual({
+        Sid: "DenyAthenaInvokeOfUntaggedFunctions",
+        Effect: "Deny",
+        Action: "lambda:InvokeFunction",
+        Resource: "arn:aws:lambda:*:123456789012:function:*",
+        Condition: {
+          "ForAnyValue:StringEquals": {
+            "aws:CalledVia": "athena.amazonaws.com",
+          },
+          StringNotEquals: { "aws:ResourceTag/coa:connector": "true" },
+        },
+      });
+    });
+
+    // StringNotEquals matches an ABSENT key, which is what makes the exemption
+    // fail closed. Discovery is the role that runs DESCRIBE, so losing this
+    // exemption presents as a source that scans with no keys rather than as a
+    // permissions error.
+    it("exempts the connector tag by its absence, not by an equality match", () => {
+      const condition = discoveryStatements().find(
+        (s: any) => s.Sid === "DenyAthenaInvokeOfUntaggedFunctions",
+      ).Condition;
+      expect(condition.StringNotEquals).toEqual({
+        "aws:ResourceTag/coa:connector": "true",
+      });
+      expect(condition.StringEquals).toBeUndefined();
+    });
+
+    // Spill is a record-path mechanism; discovery's entire Athena surface
+    // (SHOW/DESCRIBE) is metadata-handler traffic that never spills. Granting it
+    // here would widen a second role for no functional gain.
+    it("does not grant the discovery role the cross-account spill read", () => {
+      const sids = discoveryStatements().map((s: any) => s.Sid);
+      expect(sids).not.toContain("AthenaFederationSpillRead");
+      expect(sids).not.toContain("AthenaFederationSpillDecryptViaS3");
+    });
   });
 
   describe("Federation Provisioner (Option B isolation)", () => {
@@ -282,6 +714,9 @@ describe("SourcesStack", () => {
                 "glue:GetDatabases",
                 "glue:GetTable",
                 "glue:GetTables",
+                // Namespace-ownership tag, re-checked before this LF-admin role
+                // grants the shared serve role SELECT on a native database.
+                "glue:GetTags",
               ],
               // Wildcard suffixes cover ALL native databases, not just scldevds_* federated ones.
               Resource: Match.arrayWith([
@@ -375,6 +810,57 @@ describe("SourcesStack", () => {
               Resource: Match.anyValue(),
             }),
           ]),
+        },
+      });
+    });
+  });
+
+  describe("Cross-account datasource assume (confused-deputy guard)", () => {
+    // The role ARN assumed here comes from the CreateSource caller, so the
+    // ExternalId — derived from the requesting namespace, never from the request
+    // — is what binds an assume to the namespace entitled to it. Without it, a
+    // caller with manageSource on any namespace could point a source at another
+    // tenant's *-datasource-access-* role and read it.
+    const assumeStatements = () => {
+      const policies = template.findResources("AWS::IAM::Policy");
+      return Object.values(policies)
+        .flatMap(
+          (p) =>
+            p.Properties.PolicyDocument.Statement as Record<string, unknown>[],
+        )
+        .filter((st) => {
+          const resource = JSON.stringify(st.Resource ?? "");
+          return (
+            st.Action === "sts:AssumeRole" &&
+            resource.includes("datasource-access-")
+          );
+        });
+    };
+
+    it("grants assume on customer datasource-access roles in both consumers", () => {
+      // The discovery Lambda and the enrichment task each get their own grant.
+      expect(assumeStatements().length).toBe(2);
+    });
+
+    it("requires an ExternalId on every datasource assume grant", () => {
+      const statements = assumeStatements();
+      expect(statements.length).toBeGreaterThan(0);
+      for (const st of statements) {
+        expect(st.Condition).toEqual({
+          Null: { "sts:ExternalId": "false" },
+        });
+      }
+    });
+
+    it("gives the discovery Lambda the prefix it derives the ExternalId from", () => {
+      // discovery_handler._external_id presents `{prefix}{namespaceId}`; an unset
+      // prefix would make two deployments present the same value for a namespace.
+      template.hasResourceProperties("AWS::Lambda::Function", {
+        FunctionName: Match.stringLikeRegexp("sources-db-connector$"),
+        Environment: {
+          Variables: Match.objectLike({
+            RESOURCE_PREFIX: "coa-dev-",
+          }),
         },
       });
     });
@@ -747,17 +1233,16 @@ describe("SourcesStack", () => {
             status: ["TIMED_OUT", "ABORTED", "FAILED"],
           }),
         }),
-        Targets: Match.arrayWith([
-          Match.objectLike({ Arn: Match.anyValue() }),
-        ]),
+        Targets: Match.arrayWith([Match.objectLike({ Arn: Match.anyValue() })]),
       });
     });
 
     it("scopes the reaper rule to the db-scan state machine ARN", () => {
       // The rule must fire only for the db-scan pipeline, not any state machine.
       const rules = template.findResources("AWS::Events::Rule");
-      const reaperRule = Object.values(rules).find((r: any) =>
-        r.Properties?.EventPattern?.detail?.stateMachineArn !== undefined,
+      const reaperRule = Object.values(rules).find(
+        (r: any) =>
+          r.Properties?.EventPattern?.detail?.stateMachineArn !== undefined,
       ) as any;
       expect(reaperRule).toBeDefined();
       expect(
@@ -778,7 +1263,11 @@ describe("SourcesStack", () => {
         env: TEST_ENV,
       });
       return Template.fromStack(
-        new SourcesStack(app, "CtxSources", { network, storage, env: TEST_ENV }),
+        new SourcesStack(app, "CtxSources", {
+          network,
+          storage,
+          env: TEST_ENV,
+        }),
       );
     };
 
@@ -795,9 +1284,9 @@ describe("SourcesStack", () => {
     });
 
     it("rejects a non-positive / non-numeric dbScanEnrichmentTimeoutMinutes at synth", () => {
-      expect(() => synthWithContext({ dbScanEnrichmentTimeoutMinutes: 0 })).toThrow(
-        /dbScanEnrichmentTimeoutMinutes must be a positive number/,
-      );
+      expect(() =>
+        synthWithContext({ dbScanEnrichmentTimeoutMinutes: 0 }),
+      ).toThrow(/dbScanEnrichmentTimeoutMinutes must be a positive number/);
       expect(() =>
         synthWithContext({ dbScanEnrichmentTimeoutMinutes: "abc" }),
       ).toThrow(/dbScanEnrichmentTimeoutMinutes must be a positive number/);
@@ -1101,7 +1590,10 @@ describe("SourcesStack", () => {
       const t = renderWithModels({
         bedrockChatModelId: "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
       });
-      const env = envOf(t, /sources-doc-trigger|documents-trigger|doc.*trigger/i);
+      const env = envOf(
+        t,
+        /sources-doc-trigger|documents-trigger|doc.*trigger/i,
+      );
       expect(JSON.stringify(env.BEDROCK_MODEL_ARN)).toContain(
         "inference-profile/jp.anthropic.claude-haiku-4-5-20251001-v1:0",
       );
@@ -1140,7 +1632,10 @@ describe("SourcesStack", () => {
       const t = renderWithModels({
         bedrockChatModelId: "anthropic.claude-haiku-4-5-20251001-v1:0",
       });
-      const env = envOf(t, /sources-doc-trigger|documents-trigger|doc.*trigger/i);
+      const env = envOf(
+        t,
+        /sources-doc-trigger|documents-trigger|doc.*trigger/i,
+      );
       const arn = JSON.stringify(env.BEDROCK_MODEL_ARN);
       expect(arn).toContain(
         "foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -1152,7 +1647,10 @@ describe("SourcesStack", () => {
 
     it("defaults to the shared us. profile when no config is supplied", () => {
       const t = renderWithModels({});
-      const env = envOf(t, /sources-doc-trigger|documents-trigger|doc.*trigger/i);
+      const env = envOf(
+        t,
+        /sources-doc-trigger|documents-trigger|doc.*trigger/i,
+      );
       expect(JSON.stringify(env.BEDROCK_MODEL_ARN)).toContain(
         "inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
       );
@@ -1187,6 +1685,115 @@ describe("SourcesStack", () => {
       t.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: Match.stringLikeRegexp("sources-doc-preprocessing$"),
         ReservedConcurrentExecutions: Match.absent(),
+      });
+    });
+  });
+
+  describe("Preprocessing bucket authorization IAM", () => {
+    // A caller-named bucket is authorized by its owner-set `{prefix}.namespace`
+    // tag, checked in application code. IAM carries the part code cannot: an
+    // explicit Deny on the platform's own buckets, which are knowable at synth.
+    const preprocessingStatements = (): any[] => {
+      const policies = template.findResources("AWS::IAM::Policy");
+      const out: any[] = [];
+      for (const [id, res] of Object.entries(policies)) {
+        if (!id.includes("PreProcessing")) continue;
+        out.push(
+          ...((res as any).Properties?.PolicyDocument?.Statement ?? []),
+        );
+      }
+      return out;
+    };
+
+    it("grants s3:GetBucketTagging so the authorizing tag can be read", () => {
+      const acts = preprocessingStatements()
+        .filter((st) => st.Effect === "Allow")
+        .flatMap((st) => (Array.isArray(st.Action) ? st.Action : [st.Action]));
+      expect(acts).toContain("s3:GetBucketTagging");
+    });
+
+    it("denies the platform's own buckets outright", () => {
+      const deny = preprocessingStatements().find(
+        (st) => st.Effect === "Deny" && st.Sid === "DenyPlatformOwnedBuckets",
+      );
+      expect(deny).toBeDefined();
+      const acts = Array.isArray(deny.Action) ? deny.Action : [deny.Action];
+      expect(acts).toContain("s3:GetObject");
+      expect(acts).toContain("s3:ListBucket");
+      // Three buckets, each as bucket ARN plus /* for its objects.
+      expect(deny.Resource).toHaveLength(6);
+    });
+
+    it("grants sources-api s3:GetBucketTagging for the registration check", () => {
+      // Registration verifies the tag up front so the customer is told at create
+      // time rather than by a failed scan. Tag metadata only — sources-api must NOT
+      // gain s3:GetObject.
+      const policies = template.findResources("AWS::IAM::Policy");
+      let sawTagRead = false;
+      let sawObjectRead = false;
+      for (const [id, res] of Object.entries(policies)) {
+        if (!id.includes("SourcesApi")) continue;
+        for (const st of (res as any).Properties?.PolicyDocument?.Statement ?? []) {
+          if (st.Effect !== "Allow") continue;
+          const acts = Array.isArray(st.Action) ? st.Action : [st.Action];
+          if (acts.includes("s3:GetBucketTagging")) sawTagRead = true;
+          if (acts.includes("s3:GetObject")) sawObjectRead = true;
+        }
+      }
+      expect(sawTagRead).toBe(true);
+      expect(sawObjectRead).toBe(false);
+    });
+
+    it("denies the same actions it allows, GetBucketTagging included", () => {
+      const policies = template.findResources("AWS::IAM::Policy");
+      let deny: any;
+      for (const [id, res] of Object.entries(policies)) {
+        if (!id.includes("PreProcessing")) continue;
+        for (const st of (res as any).Properties?.PolicyDocument?.Statement ?? []) {
+          if (st.Sid === "DenyPlatformOwnedBuckets") deny = st;
+        }
+      }
+      expect(deny).toBeDefined();
+      const acts = Array.isArray(deny.Action) ? deny.Action : [deny.Action];
+      // A Deny narrower than the Allow it guards lets a future action escape it.
+      expect(acts).toEqual(
+        expect.arrayContaining([
+          "s3:GetObject",
+          "s3:GetObjectTagging",
+          "s3:ListBucket",
+          "s3:GetBucketTagging",
+        ]),
+      );
+    });
+
+    it("does NOT deny the sources data bucket, which uploads depend on", () => {
+      const deny = preprocessingStatements().find(
+        (st) => st.Effect === "Deny" && st.Sid === "DenyPlatformOwnedBuckets",
+      );
+      const rendered = JSON.stringify(deny.Resource);
+      expect(rendered).not.toContain("SourcesDataBucket");
+    });
+  });
+
+  describe("Preprocessing Textract IAM", () => {
+    // The table-extraction path (enable_table_extraction) calls
+    // textract:AnalyzeDocument; the scanned-PDF path calls DetectDocumentText.
+    // The preprocessing role must grant BOTH or the tables path fails at runtime
+    // with AccessDeniedException (unit tests mock the Textract client and cannot
+    // catch a missing IAM grant — only this template assertion does).
+    it("grants the preprocessing role textract:AnalyzeDocument and DetectDocumentText", () => {
+      template.hasResourceProperties("AWS::IAM::Policy", {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Effect: "Allow",
+              Action: Match.arrayWith([
+                "textract:DetectDocumentText",
+                "textract:AnalyzeDocument",
+              ]),
+            }),
+          ]),
+        },
       });
     });
   });

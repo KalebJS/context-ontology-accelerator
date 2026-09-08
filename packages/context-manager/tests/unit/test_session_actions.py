@@ -34,6 +34,21 @@ async def _invoke_collect(payload, context=None):
     return results[0] if len(results) == 1 else results
 
 
+@pytest.fixture(autouse=True)
+def _bypass_namespace_admission():
+    """Bypass the F-2 Cedar namespace-admission gate for these invoke() tests.
+
+    These exercise session persistence / streaming with bare-mock orchestrators
+    and predate the gate (F-2, CWE-862); patch it to a no-op ALLOW so they stay
+    focused on persistence. Session CRUD actions return before the gate anyway;
+    this only affects the query/streaming path. The gate itself is covered in
+    test_main.TestNamespaceAdmissionGate and test_authz_invariants. Returning
+    (None, None) keeps the query path resolving its own profile as before.
+    """
+    with patch("coa_serve.main._authorize_namespace_access", new_callable=AsyncMock, return_value=(None, None)):
+        yield
+
+
 def _make_token(claims: dict) -> str:
     return pyjwt.encode(claims, "secret", algorithm="HS256")
 

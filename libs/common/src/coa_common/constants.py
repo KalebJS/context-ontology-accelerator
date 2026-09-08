@@ -181,6 +181,25 @@ DEFAULT_USE_BATCH_INFERENCE: str = "false"
 DEFAULT_ENABLE_VERSIONING: str = "true"
 DEFAULT_ENABLE_PROPOSITION_EXTRACTION: str = "true"
 DEFAULT_DELETE_PREV_VERSIONS: str = "false"
+# Infer the entity-class vocabulary from the corpus itself instead of inheriting
+# graphrag-toolkit's hardcoded DEFAULT_ENTITY_CLASSIFICATIONS ('Company',
+# 'Sports Team', 'Creative Work', …), which is a news/finance list that steers
+# extraction to the wrong domain on anything else.
+DEFAULT_INFER_ENTITY_CLASSIFICATIONS: str = "true"
+# Explicit vocabulary is empty by default → falls back to infer (or, in a future
+# change, resolves from the namespace's accepted ontology). Represented as an
+# empty JSON array in env vars so the state-machine → ECS pipe can carry it
+# without needing a new SFN field type.
+DEFAULT_PREFERRED_ENTITY_CLASSIFICATIONS_JSON: str = "[]"
+# Table extraction OFF by default. When ON, PDFs route through Textract's
+# AnalyzeDocument(TABLES) instead of unstructured strategy="fast" — preserves
+# row/column structure at materially higher per-page cost. Opt in per source.
+DEFAULT_ENABLE_TABLE_EXTRACTION: str = "false"
+# Chunk size / overlap — 0 means "use the toolkit default" (SentenceSplitter
+# chunk_size=256, chunk_overlap=25). Setting a positive integer overrides. The
+# graphrag benchmark harness pins 1024 for dense/tabular corpora.
+DEFAULT_CHUNK_SIZE: int = 0
+DEFAULT_CHUNK_OVERLAP: int = 0
 
 # Complete extraction config defaults — single source of truth for all handlers.
 EXTRACTION_DEFAULTS: dict[str, object] = {
@@ -189,6 +208,11 @@ EXTRACTION_DEFAULTS: dict[str, object] = {
     "enable_versioning": DEFAULT_ENABLE_VERSIONING.lower() == "true",
     "enable_proposition_extraction": DEFAULT_ENABLE_PROPOSITION_EXTRACTION.lower() == "true",
     "delete_prev_versions": DEFAULT_DELETE_PREV_VERSIONS.lower() == "true",
+    "infer_entity_classifications": DEFAULT_INFER_ENTITY_CLASSIFICATIONS.lower() == "true",
+    "preferred_entity_classifications": [],
+    "enable_table_extraction": DEFAULT_ENABLE_TABLE_EXTRACTION.lower() == "true",
+    "chunk_size": DEFAULT_CHUNK_SIZE,
+    "chunk_overlap": DEFAULT_CHUNK_OVERLAP,
 }
 
 
@@ -535,3 +559,163 @@ class SqlDialect(StrEnum):
 # The ontology_id under which all governed metrics are stored in the
 # per-namespace named graph (same graph scheme as ontology-engine classes).
 GOVERNED_METRICS_ONTOLOGY_ID: str = f"urn:{URN_PREFIX}:vocab#GovernedMetrics"
+
+
+# ---------------------------------------------------------------------------
+# Namespace resource-tag binding
+# ---------------------------------------------------------------------------
+#
+# An AWS resource the platform reads on a namespace's behalf but does NOT own —
+# today a JDBC source's credential secret — is bound to the namespaces entitled
+# to it by a resource tag:
+#
+#     <prefix>:namespace = "<namespaceId> [<namespaceId> ...]"
+#
+# The KEY carries the deployment's resource prefix so two deployments co-located
+# in one AWS account bind independently: a secret onboarded to `scl` is not
+# readable by a `coa` deployment's roles, whose IAM conditions name their own
+# key. (Same reasoning as `eventSourcePrefix` in infra/lib/context.ts — the
+# resource being tagged is account-global and therefore shared.)
+#
+# The VALUE is a whitespace-separated list so one secret can serve several
+# namespaces (a shared read-only reporting credential, say) without a per-
+# namespace copy. It is validated strictly — every entry must be a namespace
+# UUID, in canonical single-space form — because it is written by whoever owns
+# the secret, and both the registration check and the IAM `StringLike`
+# conditions derived from it depend on entries being whole, unambiguous tokens.
+#
+# Secrets Manager caps a tag value at 256 characters, so a single secret binds
+# at most 6 namespaces (37 chars each). That ceiling is AWS-enforced on write;
+# nothing here needs to police it.
+
+NAMESPACE_TAG_SEPARATOR: str = " "
+"""Canonical separator between namespace IDs in a ``<prefix>:namespace`` tag value."""
+
+
+def namespace_tag_key(prefix: str | None = None) -> str:
+    """Resource-tag key binding a resource to one or more namespaces.
+
+    ``prefix`` defaults to the deployment's bare resource prefix from
+    ``RESOURCE_TAG_PREFIX`` (CDK injects ``resolveContext().prefix``), falling
+    back to :data:`BRAND` (``"coa"``).
+
+    Deliberately NOT derived from ``RESOURCE_PREFIX``: that variable means
+    different things in different runtimes — CDK injects ``{prefix}-{env}-``
+    (``scl-dev-``) into compute, while the integ runner sets the bare prefix
+    (``scl``) for SSM paths. A tag key must be one exact string shared by the
+    registration check, the IAM conditions, and whoever tags the secret, so it
+    gets its own unambiguous variable rather than a guess at which form arrived.
+    """
+    resolved = (prefix if prefix is not None else os.environ.get("RESOURCE_TAG_PREFIX", "")) or BRAND
+    return f"{resolved.strip().rstrip('-')}:namespace"
+
+
+def parse_namespace_tag(value: str) -> list[str]:
+    """Parse a ``<prefix>:namespace`` tag value into the namespace IDs it binds.
+
+    Accepts one or more namespace UUIDs separated by single spaces. Returns them
+    in the order written; membership, not order, is what callers check.
+
+    Raises ``ValueError`` when the value is empty, holds an entry that is not a
+    namespace UUID, or is not in canonical form (leading/trailing whitespace,
+    repeated or non-space separators). Canonical form is required, not merely
+    preferred: the IAM conditions that enforce this same binding at the platform
+    layer match entries by literal space boundary (see
+    :func:`namespace_tag_condition_patterns`), so a value this function accepted
+    but IAM could not match would pass registration and then fail every read.
+    """
+    ids = (value or "").split()
+    if not ids:
+        raise ValueError("Namespace tag value is empty. Expected one or more namespace UUIDs separated by a space.")
+    for entry in ids:
+        validate_namespace_id(entry, "namespace tag entry")
+    canonical = NAMESPACE_TAG_SEPARATOR.join(ids)
+    if value != canonical:
+        raise ValueError(
+            f"Namespace tag value is not in canonical form. Expected {canonical!r} "
+            "(namespace UUIDs separated by exactly one space, no leading or trailing whitespace)."
+        )
+    return ids
+
+
+def namespace_tag_condition_patterns(namespace_id: str) -> list[str]:
+    """IAM ``StringLike`` patterns matching *namespace_id* as a whole tag entry.
+
+    A tag value may list several namespaces, so ``StringEquals`` on the id alone
+    would never match a shared secret. IAM has no word-boundary operator, so the
+    four possible positions are enumerated: only entry, first, last, or middle.
+    Anchoring each on a literal space keeps this an entry match rather than a
+    substring one — ``<other><id>`` matches none of these patterns.
+    """
+    return [
+        namespace_id,
+        f"{namespace_id}{NAMESPACE_TAG_SEPARATOR}*",
+        f"*{NAMESPACE_TAG_SEPARATOR}{namespace_id}",
+        f"*{NAMESPACE_TAG_SEPARATOR}{namespace_id}{NAMESPACE_TAG_SEPARATOR}*",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Cross-account datasource onboarding
+# ---------------------------------------------------------------------------
+
+
+def datasource_external_id(namespace_id: str) -> str:
+    """ExternalId the platform presents when assuming a customer's datasource role.
+
+    Derived from the namespace, never from the API request: the cross-account role
+    ARN is caller-supplied, so this is what binds an assume to the namespace
+    entitled to it. A caller with ``manageSource`` on one namespace therefore
+    cannot point a source at a role onboarded for another (confused deputy).
+
+    Single source of truth on purpose. The sources connector sends this value and
+    the control plane shows it to the customer for their trust policy — if the two
+    derivations drifted, every cross-account onboarding would fail ``AccessDenied``
+    with nothing to point at.
+
+    Reads ``RESOURCE_PREFIX`` per call (not the module-level constant above, which
+    is stripped to the bare brand token) so the value matches the deployment's
+    ``{prefix}-{env}-`` naming, the same form as ``athenaWorkgroupName``.
+    """
+    prefix = os.environ.get("RESOURCE_PREFIX", "coa-dev-")
+    return f"{prefix}{namespace_id}"
+
+
+# ---------------------------------------------------------------------------
+# Document source bucket authorization
+# ---------------------------------------------------------------------------
+
+
+def bucket_namespace_tag_key() -> str:
+    """Tag key a bucket owner sets to authorize namespaces to read that bucket.
+
+    Only a principal holding ``s3:TagResource`` on the bucket can set this, so the
+    tag is evidence that the bucket's owner authorized the read. That is the whole
+    control: an S3 document source names a bucket, and creating a source in a
+    namespace says nothing about whether the caller may read what it points at.
+
+    Same key as :func:`namespace_tag_key`, which this delegates to — one tag
+    contract, one implementation, one ``RESOURCE_TAG_PREFIX``. It exists as a named
+    alias because the two uses read differently at the call site: that one binds a
+    credential secret to the namespaces entitled to it, this one records that a
+    bucket's owner authorized namespaces to read it.
+    """
+    return namespace_tag_key()
+
+
+def bucket_grants_namespace(tags: dict[str, str], namespace_id: str) -> bool:
+    """Whether *tags* authorize *namespace_id* to read the bucket.
+
+    The value is a whitespace-separated list of namespace ids, so one bucket can
+    serve several namespaces: ``coa:namespace = "<ns-a> <ns-b>"``. ``str.split()``
+    absorbs repeated, leading and trailing whitespace, so a hand-edited tag with
+    untidy spacing still resolves.
+
+    Fails closed on anything unexpected — a missing tag, an empty value, or a
+    namespace absent from the list all return ``False``. Matching is exact against
+    whole entries, never a substring, so one namespace id cannot authorize another
+    by sharing a prefix.
+    """
+    if not namespace_id:
+        return False
+    return namespace_id in tags.get(bucket_namespace_tag_key(), "").split()

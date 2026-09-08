@@ -553,3 +553,248 @@ class TestHandler:
         assert dimensioned[0]["Dimensions"] == [{"Name": "Namespace", "Value": "some-ns"}]
         # The alarm reads this undimensioned roll-up; it must exist.
         assert len(undimensioned) == 1
+
+
+class TestSweep:
+    """Scheduled-sweep mode: reconcile every per-namespace VKG service."""
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_reconciles_all_vkg_services(self, mock_ssm, mock_sd, mock_ecs):
+        """{"sweep": true} reloads every <prefix>-vkg-* service, skipping non-vkg ones."""
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "img:new"}}
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {
+                "serviceArns": [
+                    "arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-vkg-ns1",
+                    "arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-vkg-ns2",
+                    "arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-notvkg",
+                ]
+            }
+        ]
+        mock_ecs.get_paginator.return_value = paginator
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "img:old"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:rev"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "d"}]}}
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler({"sweep": True}, None)
+
+        assert result["status"] == "sweep_complete"
+        assert result["total"] == 2  # the non-vkg service is filtered out
+        assert result["triggered"] == 2
+        assert mock_ecs.update_service.call_count == 2
+        assert {r["namespace"] for r in result["results"]} == {"ns1", "ns2"}
+        # image resolved once for the whole sweep, not per namespace
+        mock_ssm.get_parameter.assert_called_once_with(Name="/coa/vkg/container-image")
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_continues_after_single_namespace_failure(self, mock_ssm, mock_sd, mock_ecs):
+        """One namespace failing must not abort the others."""
+        mock_ecs.exceptions.ServiceNotFoundException = type("ServiceNotFoundException", (Exception,), {})
+        mock_ecs.exceptions.ServiceNotActiveException = type("ServiceNotActiveException", (Exception,), {})
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "img:new"}}
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {
+                "serviceArns": [
+                    "arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-vkg-ns1",
+                    "arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-vkg-ns2",
+                ]
+            }
+        ]
+        mock_ecs.get_paginator.return_value = paginator
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "img:old"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:rev"}}
+        mock_ecs.update_service.side_effect = [
+            {"service": {"deployments": [{"id": "d1"}]}},  # ns1 OK
+            RuntimeError("ecs boom"),  # ns2 fails
+        ]
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler({"sweep": True}, None)
+
+        assert result["status"] == "sweep_complete"
+        assert result["total"] == 2
+        assert result["triggered"] == 1
+        assert sorted(r["status"] for r in result["results"]) == ["failed", "reload_triggered"]
+        # the failed namespace still emitted a ReloadFailed metric
+        metrics = [c.kwargs["MetricData"][0]["MetricName"] for c in index.cloudwatch.put_metric_data.call_args_list]
+        assert "ReloadFailed" in metrics
+
+    @patch.dict(os.environ, {**ENV, "VKG_IMAGE_PARAM_NAME": ""})
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_fails_fast_when_image_unresolvable(self, mock_ssm, mock_sd, mock_ecs):
+        """If the SSM image can't be resolved, the sweep fails without listing services."""
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler({"sweep": True}, None)
+
+        assert result["status"] == "failed"
+        assert "container image" in result["reason"]
+        mock_ecs.get_paginator.assert_not_called()
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_no_services_is_a_clean_noop(self, mock_ssm, mock_sd, mock_ecs):
+        """A cluster with no VKG services completes as an empty sweep (no reloads)."""
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "img:new"}}
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"serviceArns": []}]
+        mock_ecs.get_paginator.return_value = paginator
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler({"sweep": True}, None)
+        assert result["status"] == "sweep_complete"
+        assert result["total"] == 0
+        assert result["triggered"] == 0
+        mock_ecs.update_service.assert_not_called()
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_walks_paginated_list_services(self, mock_ssm, mock_sd, mock_ecs):
+        """_list_vkg_namespaces must reconcile services across every ListServices page."""
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "img:new"}}
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"serviceArns": ["arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-vkg-ns1"]},
+            {"serviceArns": ["arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-vkg-ns2"]},
+        ]
+        mock_ecs.get_paginator.return_value = paginator
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "img:old"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:rev"}}
+        mock_ecs.update_service.return_value = {"service": {"deployments": [{"id": "d"}]}}
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler({"sweep": True}, None)
+        assert result["total"] == 2
+        assert {r["namespace"] for r in result["results"]} == {"ns1", "ns2"}
+        assert mock_ecs.update_service.call_count == 2
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_reports_all_failures_without_raising(self, mock_ssm, mock_sd, mock_ecs):
+        """When every namespace fails, the sweep still completes with all failures recorded."""
+        mock_ecs.exceptions.ServiceNotFoundException = type("ServiceNotFoundException", (Exception,), {})
+        mock_ecs.exceptions.ServiceNotActiveException = type("ServiceNotActiveException", (Exception,), {})
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "img:new"}}
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {
+                "serviceArns": [
+                    "arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-vkg-ns1",
+                    "arn:aws:ecs:us-west-2:111:service/vkg/coa-dev-vkg-ns2",
+                ]
+            }
+        ]
+        mock_ecs.get_paginator.return_value = paginator
+        mock_ecs.describe_services.return_value = {"services": [{"taskDefinition": "arn:td:old"}]}
+        mock_ecs.describe_task_definition.return_value = {
+            "taskDefinition": {"containerDefinitions": [{"image": "img:old"}]}
+        }
+        mock_ecs.register_task_definition.return_value = {"taskDefinition": {"taskDefinitionArn": "arn:td:rev"}}
+        mock_ecs.update_service.side_effect = RuntimeError("ecs boom")
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler({"sweep": True}, None)
+        assert result["status"] == "sweep_complete"
+        assert result["total"] == 2
+        assert result["triggered"] == 0
+        assert all(r["status"] == "failed" for r in result["results"])
+
+    @patch.dict(os.environ, ENV)
+    @patch("index.ecs")
+    @patch("index.sd")
+    @patch("index.ssm")
+    def test_sweep_handles_list_services_failure(self, mock_ssm, mock_sd, mock_ecs):
+        """A ListServices failure ends the sweep cleanly (failed + ReloadFailed), not an uncaught raise."""
+        mock_ssm.get_parameter.return_value = {"Parameter": {"Value": "img:new"}}
+        paginator = MagicMock()
+        paginator.paginate.side_effect = RuntimeError("Throttling: Rate exceeded")
+        mock_ecs.get_paginator.return_value = paginator
+
+        import importlib
+
+        import index
+
+        importlib.reload(index)
+        index.ecs = mock_ecs
+        index.sd = mock_sd
+        index.ssm = mock_ssm
+
+        result = index.handler({"sweep": True}, None)
+        assert result["status"] == "failed"
+        assert "list services failed" in result["reason"]
+        mock_ecs.update_service.assert_not_called()
+        metrics = [c.kwargs["MetricData"][0]["MetricName"] for c in index.cloudwatch.put_metric_data.call_args_list]
+        assert "ReloadFailed" in metrics

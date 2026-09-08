@@ -15,7 +15,7 @@ import os
 import re
 import time
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
@@ -37,10 +37,10 @@ from .exceptions import (
     QueryTranslationError,
     ServeError,
 )
-from .identity import extract_jwt_identity, resolve_user_id
+from .identity import extract_jwt_identity, resolve_principal, resolve_user_id
 from .models import InvokeRequest, TraceStep
 from .orchestrator import Orchestrator
-from .role_resolver import resolve_profile
+from .role_resolver import ResolvedProfile, resolve_profile
 from .session import SessionManager
 from .session_actions import (
     handle_create_session,
@@ -280,7 +280,7 @@ async def _ensure_initialized():
         )
         # Bounded tool-use agent (iterative schema discovery → generate → execute →
         # self-correct). OPT-IN only: it runs solely when a request pins
-        # options.strategy="agentic" — never as a fallback (see
+        # options.strategy="deep-reasoning" — never as a fallback (see
         # StructuredQueryTier._strategies_for) — so registering it here does not
         # change the default nl_to_sql_first resolution path.
         agentic_strategy = AgenticStrategy(
@@ -289,7 +289,7 @@ async def _ensure_initialized():
             query_executor=query_executor,
             vector_client=opensearch_client,
             oss_ontology_index=oss_ontology_index,
-            # Backs the opt-in explore_graph tool (SERVE_AGENTIC_GRAPH_TRAVERSAL);
+            # Backs the opt-in explore_graph tool (SERVE_DEEP_REASONING_GRAPH_TRAVERSAL);
             # with the flag off the client is simply never used.
             graph_client=neptune_client,
         )
@@ -297,8 +297,9 @@ async def _ensure_initialized():
             strategies=[ontop_strategy, nl_to_sql_strategy, agentic_strategy],
         )
 
-        # Agentic Tier 3 path. Built so a deployment default (TIER3_STRATEGY=agentic)
-        # OR a per-request options.mode="agentic" can engage it; construction is
+        # Deep-reasoning Tier 3 path. Built so a deployment default
+        # (TIER3_STRATEGY=deep-reasoning) OR a per-request
+        # options.mode="deep-reasoning" can engage it; construction is
         # cheap and keeps the graphrag_toolkit import lazy (the registry's
         # strategy/graph tools defer toolkit access to first invoke). Imported here
         # (not at module load) so the serve module import stays graphrag-free. A
@@ -358,7 +359,7 @@ async def _ensure_initialized():
             vector_client=opensearch_client,
             oss_ontology_index=oss_ontology_index,
             agentic_retriever=agentic_retriever,
-            tier3_agentic_default=(config.tier3_strategy == "agentic"),
+            tier3_deep_reasoning_default=(config.tier3_strategy == "deep-reasoning"),
         )
         _config = config
         logger.info(
@@ -783,6 +784,86 @@ async def _handle_streaming_query(payload: dict, request, request_id: str, sessi
         yield emitter.format_error("InternalError", "Query resolution failed", 500)
 
 
+async def _authorize_namespace_access(
+    namespace: str,
+    jwt_user_id: str,
+    jwt_email: str,
+    jwt_groups: list[str],
+    payload_profile: dict,
+    request_id: str,
+) -> tuple[ResolvedProfile | None, dict | None]:
+    """Resolve the caller's roles and run the Cedar namespace-admission gate.
+
+    The SINGLE namespace authorization point for every namespace-scoped surface —
+    the isolated ``translate`` / ``kbSearch`` / ``graphTraverse`` actions AND the
+    Tier-1/2/3 query path. Namespace authorization previously lived only inside
+    ``SQLFirewall`` (the Tier-1/2 SQL execution sites), so the isolated retrieval
+    actions and the whole Tier-3 retrieval/synthesis path reached their data sinks
+    ungated: any authenticated IdP user could read any namespace's document
+    chunks, graph entities and synthesized answers (F-2, CWE-862).
+
+    JWT identity is authoritative; ``payload_profile`` userId/groups are a
+    fallback used only when no JWT was forwarded (local/dev). Fails CLOSED: a
+    grant-lookup error rejects the request, and Cedar itself denies a caller with
+    no resolved roles in prod (``SCL_CEDAR_FAIL_OPEN_NO_ROLES`` governs the dev
+    bypass).
+
+    Both the grant lookup (DynamoDB) and the Cedar evaluation (``cedarpy`` plus a
+    possible policy read) are synchronous/blocking, and this gate now runs on
+    EVERY namespace-scoped request — so both are dispatched via
+    ``asyncio.to_thread`` to keep them off the event loop.
+
+    CANONICAL-ID CONSTRAINT: the decision is evaluated on the namespace string the
+    caller sent, verbatim. The namespace-scoped seed policies match
+    ``resourceRoles.contains({role, resourceUID: resource.id})`` and the control
+    plane writes grants with ``resourceId`` = the namespace **UUID** (see
+    ``grants/create_handler.py``), so a caller must pass the canonical id to be
+    authorized. A namespace *name* — which ``namespace_exists`` does resolve, and
+    which ``_NAMESPACE_PATTERN`` permits — therefore DENIES even for a legitimately
+    granted principal. Deliberate for now: fail-closed is the safe side, and
+    canonicalizing here WITHOUT also canonicalizing the retrieval layer's tenant
+    derivation would admit the caller and then read under a tenant derived from the
+    unresolved name (the separate tenant-scoping issue). All three shipped surfaces
+    send the id — Playground route param, data-layer ``{namespaceId}``, MCP
+    ``namespaceId`` — so no supported caller is affected today.
+
+    Returns:
+        ``(resolved_profile, None)`` when allowed — the resolved profile is handed
+        back so the query path can reuse it instead of resolving a second time.
+        ``(None, error_dict)`` when rejected — the caller must yield ``error_dict``
+        and stop. A policy deny is a 403; an inability to evaluate the policy
+        (grant lookup failed) is a retryable 502, so a transient DynamoDB fault
+        is not reported to every caller as a permissions change.
+    """
+    upstream_user_id, upstream_groups = resolve_principal(payload_profile, jwt_user_id, jwt_email, jwt_groups)
+
+    try:
+        resolved = await asyncio.to_thread(
+            resolve_profile, upstream_user_id, upstream_groups, namespace=namespace, email=jwt_email
+        )
+    except Exception:
+        # A grant-lookup failure must never widen access — reject rather than
+        # dispatch retrieval with an unresolved (empty) profile. Reported as a
+        # retryable 502 (not 403) because the caller's permissions are unknown,
+        # not denied: a DynamoDB blip must not look like mass access revocation.
+        logger.warning("namespace_authz_resolve_failed", namespace=namespace, request_id=request_id, exc_info=True)
+        return None, DataSourceUnavailableError("Unable to verify access").to_dict(request_id)
+
+    gate_profile: dict[str, Any] = {}
+    resolved.inject_into(gate_profile)
+    decision = await asyncio.to_thread(_orchestrator.authorize_namespace, namespace, gate_profile)
+    if decision.denied:
+        logger.warning(
+            "namespace_authz_denied",
+            namespace=namespace,
+            user_id=upstream_user_id or "unknown",
+            request_id=request_id,
+        )
+        return None, AccessDeniedError(decision.reason or "not permitted to query this namespace").to_dict(request_id)
+
+    return resolved, None
+
+
 @app.entrypoint
 async def invoke(payload: dict, context=None):
     """Main entrypoint — AgentCore @app.entrypoint streaming handler.
@@ -898,13 +979,39 @@ async def invoke(payload: dict, context=None):
     # return 404 — otherwise the query path silently falls through to a Tier-3
     # "no information available" 200, masking a caller's typo'd/stale namespace.
     # Session CRUD actions returned above and are intentionally NOT gated here.
-    # namespace_exists() returns None when it cannot check (table unconfigured or
-    # a lookup error); we fail OPEN in that case so a transient failure never
-    # blocks otherwise-valid queries.
+    # namespace_exists() returns None when it cannot check. We fail CLOSED when the
+    # namespaces table IS configured (so None means a genuine lookup error — do not
+    # serve a namespace we could not verify, F-2). When the table is NOT configured
+    # (feature absent, e.g. a minimal/dev deployment) None means "cannot check" and
+    # we proceed, so an unconfigured deployment stays usable.
     if namespace and _sources_registry is not None:
         namespace_present = await _sources_registry.namespace_exists(namespace)
         if namespace_present is False:
             yield NamespaceNotFoundError(f"Namespace '{namespace}' not found").to_dict(request_id)
+            return
+        if namespace_present is None and _sources_registry.namespaces_configured:
+            logger.warning("namespace_exists_indeterminate_fail_closed", namespace=namespace, request_id=request_id)
+            yield DataSourceUnavailableError("Unable to verify namespace").to_dict(request_id)
+            return
+
+    # ── Namespace admission gate (Cedar) ───────────────────────────────────
+    # Run the coarse "may this principal query this namespace at all?" decision
+    # ONCE, here, before dispatching either the isolated retrieval actions
+    # (translate/kbSearch/graphTraverse) or the Tier-1/2/3 query path. Previously
+    # this gate existed only inside SQLFirewall at the Tier-1/2 SQL-execution
+    # sites, so the isolated actions and the entire Tier-3 retrieval/synthesis
+    # path were ungated — any authenticated IdP user could read any namespace's
+    # chunks, graph and synthesized answers (F-2, CWE-862). Session CRUD actions
+    # returned above and are intentionally NOT gated (they are user-scoped, not
+    # namespace-data reads). The resolved profile is reused by the query path
+    # below to avoid a second grant lookup.
+    resolved_profile: ResolvedProfile | None = None
+    if namespace:
+        resolved_profile, authz_error = await _authorize_namespace_access(
+            namespace, _jwt_user_id, _jwt_email, _jwt_groups, payload.get("profile", {}), request_id
+        )
+        if authz_error is not None:
+            yield authz_error
             return
 
     try:
@@ -944,12 +1051,7 @@ async def invoke(payload: dict, context=None):
     # body is attacker-controlled for direct callers (Playground SSE), so we must
     # NOT trust profile.userId/groups over the cryptographically-validated JWT.
     # profile.* values are only used as fallback when no JWT is forwarded.
-    upstream_user_id = _jwt_user_id or _jwt_email or request.profile.get("userId") or request.profile.get("email") or ""
-    # Use JWT groups when JWT identity was extracted (even if groups list is empty).
-    # Only fall back to profile.groups when there's no JWT at all.
-    upstream_groups: list[str] = _jwt_groups if _jwt_user_id or _jwt_email else (request.profile.get("groups") or [])
-    if isinstance(upstream_groups, str):
-        upstream_groups = [g.strip() for g in upstream_groups.split(",") if g.strip()]
+    upstream_user_id, upstream_groups = resolve_principal(request.profile, _jwt_user_id, _jwt_email, _jwt_groups)
     _reserved_keys = (
         "userId",
         "groups",
@@ -971,8 +1073,18 @@ async def invoke(payload: dict, context=None):
         )
     for reserved in _reserved_keys:
         request.profile.pop(reserved, None)
-    if upstream_user_id:
-        resolved = resolve_profile(upstream_user_id, upstream_groups, namespace=request.namespace, email=_jwt_email)
+    if resolved_profile is not None:
+        # Reuse the profile resolved for the admission gate above — same principal,
+        # same namespace — so the query path does not repeat the grant lookup.
+        resolved_profile.inject_into(request.profile)
+    elif upstream_user_id:
+        # Reached only when the admission gate did not run (no namespace on the
+        # request), so this is the non-namespace-scoped fallback. Threaded for the
+        # same reason as the gate's own lookup: resolve_profile does blocking
+        # DynamoDB I/O and must not run on the event loop.
+        resolved = await asyncio.to_thread(
+            resolve_profile, upstream_user_id, upstream_groups, namespace=request.namespace, email=_jwt_email
+        )
         resolved.inject_into(request.profile)
 
     logger.info(

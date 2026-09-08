@@ -27,6 +27,7 @@ import { DynamoDBTable } from "../../constructs/dynamodb-table";
 import { LakeFormationAdmin } from "../../constructs/lakeformation-admin";
 import { SclMonitoring } from "../../constructs";
 import {
+  namespaceTagKey,
   resolveContext,
   resolveLambdaReservedConcurrency,
 } from "../../context";
@@ -38,6 +39,8 @@ import { StorageStack } from "../foundation/storage-stack";
 import { TABLE_NAMES } from "@coa/shared";
 import {
   SourceStatus,
+  CONNECTOR_TAG_KEY,
+  CONNECTOR_TAG_VALUE,
   DEFAULT_MAX_FILE_SIZE_MB,
   DEFAULT_BEDROCK_CHAT_MODEL_ID,
   DEFAULT_BEDROCK_MODEL_ID,
@@ -89,6 +92,10 @@ export class SourcesStack extends SCLStack {
     this.addComponentTag("sources");
 
     const { ssmPrefix } = resolveContext(this.node);
+    // Tag key binding a credential secret to the namespaces entitled to it.
+    // Derived once here so every IAM condition below and the runtime env var
+    // (RESOURCE_TAG_PREFIX) cannot drift from each other.
+    const nsTagKey = namespaceTagKey(this.node);
     const allowedOrigin = props.allowedOrigin ?? "*";
 
     // ── Bedrock model IDs (#94) ────────────────────────────────────────
@@ -310,15 +317,41 @@ export class SourcesStack extends SCLStack {
       }),
     );
     // The AWS-managed federated connector reads the credential secret AS this
-    // role. Allow cross-account secrets (a customer's secret in their own
-    // account) — cross-account access is still gated by the secret's resource
-    // policy, which the customer must grant to this role (see docs). Hence no
-    // aws:ResourceAccount restriction here.
+    // role. Two statements, because the tag condition only applies in-account:
+    //
+    // (1) In-account secrets must carry a `{prefix}:namespace` tag — same
+    //     onboarded-only reduction as the discovery role. ponytail: tag-EXISTS,
+    //     not an exact match (shared role); exact binding is at registration and
+    //     on the serve resource policy.
+    // (2) Cross-account secrets (a customer's secret in their own account) can't
+    //     carry a tag we control, so they stay unconditioned here — access is
+    //     gated by the secret's own resource policy, which the customer grants to
+    //     this role (see cross-account docs).
     federatedCatalogRole.addToPolicy(
       new iam.PolicyStatement({
-        sid: "ReadCredentialSecret",
+        sid: "ReadCredentialSecretInAccount",
         actions: ["secretsmanager:GetSecretValue"],
         resources: ["arn:aws:secretsmanager:*:*:secret:*"],
+        conditions: {
+          StringEquals: { "aws:ResourceAccount": this.account },
+          Null: { [`secretsmanager:ResourceTag/${nsTagKey}`]: "false" },
+        },
+      }),
+    );
+    federatedCatalogRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: "ReadCredentialSecretCrossAccount",
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: ["arn:aws:secretsmanager:*:*:secret:*"],
+        conditions: {
+          StringNotEquals: { "aws:ResourceAccount": this.account },
+          // A negated condition evaluates TRUE when its key is absent, so
+          // StringNotEquals alone would make this statement unconditioned in any
+          // request context that does not populate aws:ResourceAccount. Require
+          // the key to be present, so "not my account" can only be satisfied by
+          // an account that was actually resolved.
+          Null: { "aws:ResourceAccount": "false" },
+        },
       }),
     );
     // Decrypt CMK-encrypted secrets, restricted to Secrets Manager (not
@@ -459,6 +492,13 @@ export class SourcesStack extends SCLStack {
         NAMESPACES_TABLE: namespacesTableName,
         SMUS_DOMAIN_ID: domainId,
         PROJECT_ACCESS_ROLE_ARN: projectAccessRoleArn,
+        // BARE prefix — keys the namespace tag this handler re-verifies against the
+        // STORED row: the credential secret before the connector reads it, and the
+        // Glue database's ownership before it reads the catalog or samples rows.
+        // Must equal the prefix in `nsTagKey`, which the IAM conditions are written
+        // against: derive the key from a different prefix here and discovery would
+        // read a tag nobody writes.
+        RESOURCE_TAG_PREFIX: resolveContext(this.node).prefix,
         // Parallel DataZone asset writes per discovery invocation. The scan
         // queue runs one discovery per source at a time, so this is the only
         // concurrency hitting DataZone from discovery.
@@ -471,6 +511,14 @@ export class SourcesStack extends SCLStack {
         // (SELECT DISTINCT via Athena → coa:distinctValues). When unset the
         // sampler is a no-op; the JDBC sampling path is unaffected.
         ATHENA_SPILL_BUCKET: props.storage.athenaSpillBucket.bucketName,
+        // Two consumers, both needing the `{prefix}-{env}-` form:
+        //  - the ExternalId this deployment presents when assuming a customer
+        //    datasource-access role (discovery_handler._external_id);
+        //  - the Glue namespace-ownership check, which recognises this deployment's
+        //    own federated catalogs by the `{sanitizedPrefix}ds_` shape derived from
+        //    it. Left unset, the runtime default (`coa-dev-`) would disagree with
+        //    `fedResourcePrefix` and our own catalogs would read as third-party.
+        RESOURCE_PREFIX: this.prefixed(""),
       },
     });
 
@@ -496,6 +544,12 @@ export class SourcesStack extends SCLStack {
           "glue:GetTables",
           "glue:GetPartitions",
           "glue:GetConnection",
+          // Reads the `coa:namespace` tag by which a database owner declares
+          // which namespaces may catalog it — the authorization this role's
+          // otherwise account-wide `database/*` read is checked against before
+          // discovery runs. Without it the check fails closed and every native
+          // Glue source is refused.
+          "glue:GetTags",
         ],
         resources: [
           `arn:aws:glue:${this.region}:${this.account}:catalog`,
@@ -520,6 +574,110 @@ export class SourcesStack extends SCLStack {
         resources: [
           `arn:aws:athena:${this.region}:${this.account}:workgroup/*`,
         ],
+      }),
+    );
+    // Athena data-catalog resolution for CUSTOM_CONNECTOR (custom connector)
+    // sources. Discovery runs `SHOW DATABASES` / `SHOW TABLES` / `DESCRIBE`
+    // against the Lambda-backed catalog the sources API registered at source
+    // create, and Athena resolves the catalog name → connector ARN through
+    // GetDataCatalog. Scoped to the same `{sanitizedPrefix}ds_*` names the
+    // registrar derives, so this reaches only catalogs this deployment created.
+    dbConnectorFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "CustomConnectorCatalogRead",
+        actions: ["athena:GetDataCatalog"],
+        resources: [
+          `arn:aws:athena:${this.region}:${this.account}:datacatalog/${fedResourcePrefix}*`,
+        ],
+      }),
+    );
+    // Invoke a customer-authored Athena federation connector — but only when
+    // Athena is the one doing it. The connector Lambda lives in the CUSTOMER's
+    // account and its ARN is unknown at deploy time, so the resource cannot be
+    // enumerated; containment is by condition key plus the customer's own
+    // Lambda resource policy, which must independently name this role.
+    //
+    // `aws:CalledVia` is populated on forward access sessions, so this Allow
+    // matches only while Athena is executing a statement for this role and
+    // never for a direct `lambda:Invoke` from discovery code. It is multi-valued
+    // and its order cannot be constrained, hence ForAnyValue — AWS documents
+    // "somewhere in the chain" as the intended semantics. Evaluation fails
+    // CLOSED: an absent key does not match, so a bug here denies rather than
+    // widens.
+    //
+    // Region-pinned by choice, not by necessity: Athena CAN invoke a connector
+    // in another region when given its full ARN, but we do not support that
+    // topology, and the control-plane rejects such an ARN at source-create.
+    dbConnectorFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "AthenaFederationConnectorInvoke",
+        actions: ["lambda:InvokeFunction"],
+        // The account MUST stay a wildcard — the connector lives in the customer's
+        // — so the ARN cannot scope this. A resource TAG does: Lambda evaluates
+        // aws:ResourceTag natively for InvokeFunction, with no per-resource opt-in,
+        // so an untagged function is simply unreachable. Preferred over a name
+        // convention because a tag cannot be matched by accident.
+        resources: [`arn:aws:lambda:${this.region}:*:function:*`],
+        conditions: {
+          "ForAnyValue:StringEquals": {
+            "aws:CalledVia": "athena.amazonaws.com",
+          },
+          StringEquals: {
+            [`aws:ResourceTag/${CONNECTOR_TAG_KEY}`]: CONNECTOR_TAG_VALUE,
+          },
+        },
+      }),
+    );
+    // The escalation the Allow above would otherwise open, closed explicitly.
+    //
+    // `aws:CalledVia` is satisfied by an Athena UDF
+    // (`USING EXTERNAL FUNCTION ... LAMBDA '<arn>'`), which needs only
+    // StartQueryExecution — already granted above — plus lambda:InvokeFunction. A
+    // same-account invoke also needs no resource policy, so without this Deny the
+    // Allow reaches every in-region Lambda in THIS account, including the
+    // federation provisioner that holds Lake Formation admin.
+    //
+    // A same-account Deny rather than an `aws:ResourceAccount` exclusion on the
+    // Allow, because excluding the account would also rule out a connector deployed
+    // alongside this stack — which is how the reference connector and its
+    // integration test are deployed.
+    //
+    // Conditioned on `aws:CalledVia` so it cannot affect direct invokes; Athena has
+    // no reason to invoke one of ours.
+    //
+    // NOT scoped to our name prefix. It was, and that made a naming convention
+    // load-bearing for security while silently refusing any connector deployed into
+    // this account under the prefix — which is what the reference connector's own
+    // deploy script does. The tag exemption below expresses the real intent
+    // directly, so the prefix is gone and the statement is now account-wide and
+    // region-wide. Breadth is the safe direction for a Deny.
+    dbConnectorFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "DenyAthenaInvokeOfUntaggedFunctions",
+        effect: iam.Effect.DENY,
+        actions: ["lambda:InvokeFunction"],
+        resources: [`arn:aws:lambda:*:${this.account}:function:*`],
+        conditions: {
+          "ForAnyValue:StringEquals": {
+            "aws:CalledVia": "athena.amazonaws.com",
+          },
+          // StringNotEquals matches an ABSENT key, so an untagged function stays
+          // denied — fail-closed, the direction a Deny needs. Same constants as the
+          // Allow above, so the two agree by construction.
+          //
+          // Not a no-op against that Allow: what this still catches is an Athena UDF
+          // (`USING EXTERNAL FUNCTION ... LAMBDA '<arn>'`) pointed at any
+          // same-account function lacking the tag, the federation provisioner that
+          // holds Lake Formation admin included.
+          //
+          // The residual is one of our own functions ACQUIRING the tag, which CDK's
+          // `Tags.of(scope)` propagation makes the realistic path. Closed at build
+          // time by infra/test/app-connector-tag.test.ts, which asserts no
+          // synthesised resource in this app carries it.
+          StringNotEquals: {
+            [`aws:ResourceTag/${CONNECTOR_TAG_KEY}`]: CONNECTOR_TAG_VALUE,
+          },
+        },
       }),
     );
     // Lake Formation data access for governed Glue tables (ignored in
@@ -578,6 +736,9 @@ export class SourcesStack extends SCLStack {
           // SSM param holding the consumer query principal (serve runtime role)
           // ARN; resolved at runtime to grant LF SELECT on the federated catalog.
           CONSUMER_QUERY_ROLE_SSM_PARAM: `${ssmPrefix}/serve/runtime-role-arn`,
+          // BARE prefix — keys the namespace tag this handler conditions the
+          // serve-side secret resource policy on. Same value as `nsTagKey`.
+          RESOURCE_TAG_PREFIX: resolveContext(this.node).prefix,
         },
       },
     );
@@ -673,6 +834,10 @@ export class SourcesStack extends SCLStack {
           "glue:GetDatabases",
           "glue:GetTable",
           "glue:GetTables",
+          // The namespace-ownership tag this role re-checks before granting the
+          // SHARED serve runtime role SELECT on a native Glue database. It holds
+          // Lake Formation admin, so it verifies rather than assumes.
+          "glue:GetTags",
         ],
         resources: [
           `arn:aws:glue:${this.region}:${this.account}:catalog`,
@@ -723,7 +888,31 @@ export class SourcesStack extends SCLStack {
           StringEquals: {
             "aws:ResourceAccount": this.account,
           },
+          // The provisioner attaches a resource policy to the customer's
+          // credential secret. Without this, that PutResourcePolicy is a write
+          // primitive over EVERY in-account secret (a caller could get the
+          // provisioner to mutate the policy of a secret it has no business
+          // touching). Restrict it to secrets already onboarded to a namespace
+          // (carrying a `{prefix}:namespace` tag). ponytail: tag-EXISTS, not an exact
+          // match — the provisioner role is shared across namespaces; the exact
+          // namespace is enforced by the registration check that gates whether
+          // provisioning runs at all, and by the condition the provisioner
+          // writes INTO the resource policy (federation_handler).
+          Null: {
+            [`secretsmanager:ResourceTag/${nsTagKey}`]: "false",
+          },
         },
+      }),
+    );
+    // Read the credential secret's TAGS to re-verify the namespace binding on the
+    // stored row before the provisioner touches the secret. Metadata only — this
+    // role deliberately has no GetSecretValue of its own; the readability precheck
+    // reads the secret as the federated-catalog role instead.
+    fedFnRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: "DescribeSecretForNamespaceBinding",
+        actions: ["secretsmanager:DescribeSecret"],
+        resources: [`arn:aws:secretsmanager:*:${this.account}:secret:*`],
       }),
     );
     // Pass + read the federated-catalog role (Glue connection ROLE_ARN and LF
@@ -822,17 +1011,19 @@ export class SourcesStack extends SCLStack {
         principals: [dbConnectorFn.role!],
       }),
     );
-    // Secrets Manager: Context Ontology Accelerator-managed secrets + customer-provided credential secrets.
-    // Customer secrets are arbitrary ARNs provided at source creation time.
-    dbConnectorFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        sid: "SecretsManagerCoaManaged",
-        actions: ["secretsmanager:GetSecretValue"],
-        resources: [
-          `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${this.prefixed("datasource-")}*`,
-        ],
-      }),
-    );
+    // Secrets Manager: credential secrets provided at source creation time.
+    //
+    // There used to be a second, UNCONDITIONED statement here granting
+    // GetSecretValue on `{prefix}datasource-*` for "accelerator-managed" secrets.
+    // It has been removed rather than tag-gated: its resource set is a strict
+    // subset of the tag-gated statement below (same account, narrower name), so
+    // the only thing it added was an exemption from the namespace-tag requirement
+    // — for exactly the naming convention the platform's own credential secrets
+    // use. IAM statements are additive, so its presence meant the condition below
+    // governed every in-account secret EXCEPT the ones most likely to hold tenant
+    // database credentials. Verified against a live account: with that statement
+    // attached, an untagged secret and a secret tagged for another namespace were
+    // both readable.
     dbConnectorFn.addToRolePolicy(
       new iam.PolicyStatement({
         sid: "SecretsManagerCustomerProvided",
@@ -842,7 +1033,31 @@ export class SourcesStack extends SCLStack {
           StringEquals: {
             "aws:ResourceAccount": this.account,
           },
+          // An in-account credential secret must carry a `{prefix}:namespace`
+          // tag. This shrinks the discovery role's reach from every in-account
+          // secret to only those onboarded to a namespace, so a code path that
+          // bypasses the registration check still can't read an arbitrary
+          // account secret (e.g. another service's DB master secret).
+          // ponytail: this is tag-EXISTS, not an exact namespace match — the
+          // discovery Lambda uses one shared execution role with no per-request
+          // namespace identity. The exact match is enforced at registration
+          // (database_routes) and on the serve-side resource policy. Upgrade
+          // path: session-tag the execution identity per scan and switch to
+          // `secretsmanager:ResourceTag/{prefix}:namespace == ${aws:PrincipalTag/{prefix}:namespace}`.
+          Null: {
+            [`secretsmanager:ResourceTag/${nsTagKey}`]: "false",
+          },
         },
+      }),
+    );
+    // Read the credential secret's TAGS to re-verify the namespace binding at
+    // scan time, before the connector fetches the secret VALUE. Metadata only —
+    // deliberately not GetSecretValue, which the statement above governs.
+    dbConnectorFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "DescribeSecretForNamespaceBinding",
+        actions: ["secretsmanager:DescribeSecret"],
+        resources: [`arn:aws:secretsmanager:*:${this.account}:secret:*`],
       }),
     );
     // STS: assume Context Ontology Accelerator-managed roles + customer-provided cross-account roles.
@@ -853,6 +1068,14 @@ export class SourcesStack extends SCLStack {
         resources: [
           `arn:aws:iam::*:role/${this.prefixed("datasource-access-")}*`,
         ],
+        // Deny any cross-account assume that presents no ExternalId. The role
+        // ARN is caller-supplied, so the ExternalId (derived from the requesting
+        // namespace) is what binds the assume to the namespace that asked for it.
+        // Belt-and-braces: the connectors always send one, this makes a
+        // regression fail closed at IAM instead of silently widening access.
+        conditions: {
+          Null: { "sts:ExternalId": "false" },
+        },
       }),
     );
 
@@ -973,20 +1196,38 @@ export class SourcesStack extends SCLStack {
         },
       }),
     );
+    // Same namespace-tag requirement as the discovery role: an in-account
+    // credential secret is only readable once it has been onboarded to a
+    // namespace. This role reaches source credentials through the same JDBC
+    // connector code, so leaving it unconditioned would have kept an untagged
+    // read path open on a role that is easy to overlook.
     dbEnrichmentTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
+        sid: "ReadNamespaceBoundCredentialSecret",
         actions: ["secretsmanager:GetSecretValue"],
         resources: [
           `arn:aws:secretsmanager:${this.region}:${this.account}:secret:${this.prefixed("datasource-")}*`,
         ],
+        conditions: {
+          Null: { [`secretsmanager:ResourceTag/${nsTagKey}`]: "false" },
+        },
       }),
     );
     dbEnrichmentTaskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
+        sid: "AssumeRoleCustomerProvided",
         actions: ["sts:AssumeRole"],
         resources: [
           `arn:aws:iam::*:role/${this.prefixed("datasource-access-")}*`,
         ],
+        // Deny any cross-account assume that presents no ExternalId. The role
+        // ARN is caller-supplied, so the ExternalId (derived from the requesting
+        // namespace) is what binds the assume to the namespace that asked for it.
+        // Belt-and-braces: the connectors always send one, this makes a
+        // regression fail closed at IAM instead of silently widening access.
+        conditions: {
+          Null: { "sts:ExternalId": "false" },
+        },
       }),
     );
     dbEnrichmentTaskDef.taskRole.addToPrincipalPolicy(
@@ -1439,6 +1680,12 @@ export class SourcesStack extends SCLStack {
           DOC_SOURCES_TABLE: this.sourcesTable.tableName,
           MAX_FILE_SIZE_MB: DEFAULT_MAX_FILE_SIZE_MB.toString(),
           CROSS_ACCOUNT_ROLE_PREFIX: resolveContext(this.node).prefix,
+          // BARE prefix — feeds `bucket_namespace_tag_key()`, the tag a bucket
+          // owner sets to authorize namespaces to read it. Without it the handler
+          // falls back to the bare `coa` default and looks for a tag no customer
+          // was told to set. Same variable the secret-binding check uses; a second
+          // one for the same value could drift from it.
+          RESOURCE_TAG_PREFIX: resolveContext(this.node).prefix,
         },
         vpc,
         vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
@@ -1449,9 +1696,54 @@ export class SourcesStack extends SCLStack {
     this.sourcesTable.grantReadWriteData(preprocessingFn);
     preprocessingFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["s3:GetObject", "s3:GetObjectTagging", "s3:ListBucket"],
-        // Wildcard required: customers provide their own bucket names.
+        sid: "ReadCustomerSourceBuckets",
+        actions: [
+          "s3:GetObject",
+          "s3:GetObjectTagging",
+          "s3:ListBucket",
+          // Reads the `{prefix}:namespace` tag that authorizes a bucket for a
+          // namespace. Must be on the wildcard too: whether we may read a bucket
+          // is exactly what this call answers, so it cannot be scoped by the
+          // answer. It returns tag metadata, never object data.
+          "s3:GetBucketTagging",
+        ],
+        // Wildcard required: customers provide their own bucket names, which are
+        // not knowable at synth time. Authorization for these buckets is the
+        // owner-set `{prefix}:namespace` tag, verified at source registration and
+        // again in the preprocessing handler.
         resources: ["*"],
+      }),
+    );
+    // The platform's own buckets ARE knowable at synth time, so they are carved
+    // out here rather than left to the tag check. An explicit Deny cannot be
+    // defeated by a bug in that check, and these buckets hold other namespaces'
+    // data: Athena results and spill carry sampled query output, and the ontology
+    // bucket carries generated artifacts. The sources data bucket is deliberately
+    // absent — uploads and staging depend on the grantReadWrite above, which a
+    // Deny would override.
+    preprocessingFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "DenyPlatformOwnedBuckets",
+        effect: iam.Effect.DENY,
+        // Mirrors the Allow above action-for-action, GetBucketTagging included.
+        // Reading a platform bucket's tags discloses nothing (they never carry the
+        // namespace tag), but a Deny that covers less than the Allow it guards
+        // invites the question of why — and the next action added to the Allow
+        // would silently escape it.
+        actions: [
+          "s3:GetObject",
+          "s3:GetObjectTagging",
+          "s3:ListBucket",
+          "s3:GetBucketTagging",
+        ],
+        resources: [
+          props.storage.athenaResultsBucket.bucketArn,
+          `${props.storage.athenaResultsBucket.bucketArn}/*`,
+          props.storage.athenaSpillBucket.bucketArn,
+          `${props.storage.athenaSpillBucket.bucketArn}/*`,
+          props.storage.ontologyArtifactsBucket.bucketArn,
+          `${props.storage.ontologyArtifactsBucket.bucketArn}/*`,
+        ],
       }),
     );
     preprocessingFn.addToRolePolicy(
@@ -1465,7 +1757,11 @@ export class SourcesStack extends SCLStack {
     );
     preprocessingFn.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["textract:DetectDocumentText"],
+        // DetectDocumentText: scanned-PDF OCR path (is_scanned_pdf -> process_pdf_textract).
+        // AnalyzeDocument: table-extraction path (enable_table_extraction ->
+        //   process_pdf_textract_tables calls AnalyzeDocument with FeatureTypes=[TABLES]).
+        //   Without this action the tables path fails at runtime with AccessDeniedException.
+        actions: ["textract:DetectDocumentText", "textract:AnalyzeDocument"],
         resources: ["*"],
       }),
     );
@@ -1852,6 +2148,43 @@ export class SourcesStack extends SCLStack {
               ),
             },
             {
+              // Whether to derive the entity-class vocabulary from the corpus
+              // itself instead of inheriting graphrag's hardcoded news/finance
+              // defaults. See graph_build.py:_build_indexing_config.
+              name: "INFER_ENTITY_CLASSIFICATIONS",
+              value: sfn.JsonPath.stringAt(
+                "$.extraction_config.infer_entity_classifications",
+              ),
+            },
+            {
+              // JSON-encoded list of explicit entity-class labels. Trigger
+              // Lambda json.dumps()es it so the state-machine input carries
+              // a string. Empty JSON array "[]" is the default.
+              name: "PREFERRED_ENTITY_CLASSIFICATIONS",
+              value: sfn.JsonPath.stringAt(
+                "$.extraction_config.preferred_entity_classifications",
+              ),
+            },
+            {
+              // Route PDFs through Textract AnalyzeDocument(TABLES) instead of
+              // unstructured strategy="fast" — preserves table structure at
+              // materially higher per-page cost.
+              name: "ENABLE_TABLE_EXTRACTION",
+              value: sfn.JsonPath.stringAt(
+                "$.extraction_config.enable_table_extraction",
+              ),
+            },
+            {
+              // "0" means "use the graphrag-toolkit default (256)".
+              name: "CHUNK_SIZE",
+              value: sfn.JsonPath.stringAt("$.extraction_config.chunk_size"),
+            },
+            {
+              // "0" means "use the graphrag-toolkit default (25)".
+              name: "CHUNK_OVERLAP",
+              value: sfn.JsonPath.stringAt("$.extraction_config.chunk_overlap"),
+            },
+            {
               name: "BEDROCK_MODEL_ARN",
               value: sfn.JsonPath.stringAt(
                 "$.extraction_config.bedrock_model_arn",
@@ -2215,10 +2548,30 @@ export class SourcesStack extends SCLStack {
         // data-catalog name registered at source create. Without it the handler
         // falls back to its hard-coded `coa-dev-` default in every environment.
         RESOURCE_PREFIX: this.prefixed(""),
+        // BARE prefix (not `{prefix}-{env}-`) — keys the `{prefix}:namespace` tag on
+        // every resource this role checks at registration: a JDBC credential secret,
+        // a document source bucket, and a Glue database's ownership. Checking at
+        // create time is what tells a customer then, rather than by a failed scan.
+        // Must equal the prefix in `nsTagKey` above, which the IAM conditions are
+        // written against. Inferring it from RESOURCE_PREFIX would put the
+        // environment in the key (`coa-prod:namespace`), hiding a dev-tagged
+        // resource from prod.
+        RESOURCE_TAG_PREFIX: resolveContext(this.node).prefix,
       },
     });
 
     this.sourcesTable.grantReadWriteData(sourcesApiFn);
+    // Registration verifies that a caller-named bucket carries the
+    // `{prefix}:namespace` tag authorizing this namespace, so the customer is told
+    // at create time instead of discovering it as a failed scan. Tag metadata only
+    // — sources-api is deliberately NOT granted s3:GetObject.
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "ReadSourceBucketTags",
+        actions: ["s3:GetBucketTagging"],
+        resources: ["*"],
+      }),
+    );
     // On delete, sources-api assumes the federation provisioner's role (a Lake
     // Formation admin able to DROP the federated catalog) to run teardown.
     sourcesApiFn.addToRolePolicy(
@@ -2260,9 +2613,38 @@ export class SourcesStack extends SCLStack {
     // Federation teardown on delete-source runs under the federation
     // provisioner's Lake Formation admin role, which sources-api assumes (see
     // above). The sources-api role therefore needs no Glue/Lake Formation
-    // catalog permissions of its own.
+    // catalog permissions of its own — with one exception below.
 
-    // Athena data-catalog lifecycle for custom-connector (ATHENA_CONNECTOR)
+    // Read-only tag lookup for the Glue namespace-ownership check at
+    // source-create. `catalogId`/`databaseName` arrive from the caller and decide
+    // what discovery will read, so create refuses a database whose owner has not
+    // tagged it for the caller's namespace (see
+    // coa_sources.database.glue_ownership).
+    //
+    // `glue:GetDatabase` is NOT optional here, however much this would prefer to be
+    // a tag read alone: Glue authorizes `GetTags` on a database ARN against
+    // `glue:GetDatabase` on the CATALOG as well, so GetTags by itself yields
+    //   "not authorized to perform: glue:GetDatabase on resource: ...:catalog"
+    // and the check — which fails closed — then refuses every legitimate source.
+    // Verified end-to-end in a live account; the narrower policy this originally
+    // shipped with made every Glue-source create return 403.
+    //
+    // The residual is that the control plane can read database metadata (name,
+    // description, location URI) account-wide. That is strictly more than reading
+    // the authorization, and it is the minimum AWS permits for reading it. It is
+    // still metadata only: no table schemas, no Lake Formation grant, no data.
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "GlueOwnershipTagRead",
+        actions: ["glue:GetTags", "glue:GetDatabase"],
+        resources: [
+          `arn:aws:glue:${this.region}:${this.account}:catalog`,
+          `arn:aws:glue:${this.region}:${this.account}:database/*`,
+        ],
+      }),
+    );
+
+    // Athena data-catalog lifecycle for custom-connector (CUSTOM_CONNECTOR)
     // sources: sources-api registers a `LAMBDA`-type catalog at source-create
     // time and deletes it at teardown, so create and delete stay co-located on
     // the control-plane role. `GetDataCatalog` is required because registration
@@ -2270,9 +2652,8 @@ export class SourcesStack extends SCLStack {
     // declares no `AlreadyExistsException`, so a duplicate name is a 400
     // indistinguishable from a malformed request.
     //
-    // This grant is deployed ahead of the registrar. When that handler lands it
-    // must derive the catalog name with
-    // `glue_connection_provisioner._build_catalog_name`
+    // The registrar derives the catalog name with
+    // `glue_connection_provisioner.build_catalog_name`
     // (`{sanitizedPrefix}ds_{sha256(sourceId)[:16]}`) — the same derivation the
     // federated-JDBC path uses — which is what lets `fedResourcePrefix` scope
     // this to catalogs this deployment created rather than every catalog in the
@@ -2310,6 +2691,25 @@ export class SourcesStack extends SCLStack {
       new iam.PolicyStatement({
         actions: ["s3:PutObject"],
         resources: [`${sourcesBucket.bucketArn}/*/raw/*`],
+      }),
+    );
+
+    // Namespace-binding check for JDBC credential secrets. At source
+    // registration the API reads the secret's TAGS (DescribeSecret — metadata
+    // only, never GetSecretValue) to require a `{prefix}:namespace` tag LISTING the
+    // registering namespace, so a source can only be registered against a
+    // credential secret bound to its own namespace. Scoped to in-account
+    // secrets: cross-account credential secrets are gated by the customer's own
+    // resource policy + assume-role, not by tags this deployment cannot set.
+    sourcesApiFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        sid: "DescribeSecretForNamespaceBinding",
+        actions: ["secretsmanager:DescribeSecret"],
+        // Region-wildcard, in-account: matches the region-wildcard read grants
+        // on the discovery/federated roles, so a same-account secret in another
+        // region can still be verified at registration (the binding check calls
+        // DescribeSecret in the secret's own region).
+        resources: [`arn:aws:secretsmanager:*:${this.account}:secret:*`],
       }),
     );
 

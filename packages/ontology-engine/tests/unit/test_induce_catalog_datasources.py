@@ -82,6 +82,34 @@ class TestListDatasourcesFiltering:
         assert len(result) == 1
         assert result[0]["datasourceId"] == "jdbc1"
 
+    def test_includes_custom_connector_source(self):
+        """The DATABASE sub-types are an inline literal tuple here rather than the
+        Smithy enum, so a sub-type renamed or added upstream drops out of induction
+        silently — the source simply stops appearing, with no error anywhere."""
+        from coa_ontology.induce_catalog import list_datasources
+
+        request, mock_resource = _make_request(
+            [
+                {
+                    "PK": "NS#ns1",
+                    "SK": "SRC#conn1",
+                    "name": "acme-sap",
+                    "status": "APPROVED",
+                    "sourceType": "DATABASE",
+                    "sourceSubType": "CUSTOM_CONNECTOR",
+                    "tablesDiscovered": 4,
+                    "tablesApproved": 4,
+                    "namespaceId": "ns1",
+                },
+            ]
+        )
+
+        with patch("boto3.resource", return_value=mock_resource):
+            result = list_datasources(request, "ns1")
+
+        assert len(result) == 1
+        assert result[0]["datasourceId"] == "conn1"
+
     def test_excludes_document_s3_source(self):
         from coa_ontology.induce_catalog import list_datasources
 

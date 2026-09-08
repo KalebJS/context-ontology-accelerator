@@ -94,19 +94,19 @@ Both fail **open** — any uncertainty runs the tier.
 | Option | Source | Description |
 |--------|--------|-------------|
 | `tierOverride` | Request `options` field | Force routing to a specific tier (1, 2, or 3); disables pruning |
-| `strategy` | Request `options` field | Pin a Tier-2 strategy (`best`/`ontop`/`nl_to_sql`/`ontop_first`/`nl_to_sql_first` default/`agentic`); disables per-query pruning. `agentic` is opt-in only — a Strands tool-use agent, never part of an automatic or fallback chain. See the strategy table in [../README.md](../README.md#query-routing). |
+| `strategy` | Request `options` field | Pin a Tier-2 strategy (`best`/`ontop`/`nl_to_sql`/`ontop_first`/`nl_to_sql_first` default/`deep-reasoning`); disables per-query pruning. `deep-reasoning` is opt-in only — a Strands tool-use agent, never part of an automatic or fallback chain; `agentic` is the deprecated pre-rename spelling and is still accepted. Distinct from `options.mode="deep-reasoning"`, which replaces the whole tier cascade with the Tier-3 loop. See the strategy table in [../README.md](../README.md#query-routing). |
 | `SERVE_TIER2_SKIP_MODE` | Environment variable | `aoss` (default, on for mixed namespaces) or `off` to disable unmapped-classes pruning |
-| `TIER3_STRATEGY` | Environment variable | Tier 3 retrieval strategy: `hand-rolled` (default) or `lexical-baseline` |
-| `LEXICAL_RETRIEVER_STRATEGY` | Environment variable | Deployment-default graphrag retriever strategy, applied only under `TIER3_STRATEGY=lexical-baseline`: `chunk_based_semantic` (default), `traversal`, or `topic-beam-chunk_only`. Invalid values log `invalid_lexical_retriever_strategy` and fall back to `chunk_based_semantic`. |
+| `TIER3_STRATEGY` | Environment variable | Tier 3 retrieval strategy: `lexical-baseline` (**default**), `hand-rolled`, or `deep-reasoning` (the multi-step reasoning loop as the deployment default). `agentic` is the deprecated spelling of `deep-reasoning` and is still accepted with a warning. |
+| `LEXICAL_RETRIEVER_STRATEGY` | Environment variable | Deployment-default graphrag retriever strategy, applied only under `TIER3_STRATEGY=lexical-baseline`: `topic_beam` (**default**), `chunk_based_semantic`, or `traversal`. Invalid values log `invalid_lexical_retriever_strategy` and fall back to `chunk_based_semantic`. |
 | `retrieverStrategy` | Request `options` field | Per-request graphrag strategy; engages graphrag on-demand on any deployment (wins over `LEXICAL_RETRIEVER_STRATEGY`). An unknown value is rejected with a 400 `ValidationError`. |
 
 ## Tier 3 Retrieval Strategies
 
 Tier 3 supports two retrieval strategies, selected via the `TIER3_STRATEGY` environment variable:
 
-- **`hand-rolled`** (default): Uses VectorRetriever (OpenSearch k-NN on `chunk_{ns}` index) + GraphTraverser (Neptune SPARQL 1-2 hop traversal). This is the original implementation.
+- **`lexical-baseline`** (default): Uses the graphrag-toolkit's built-in retrievers against the lexical knowledge graph that `kg-build` produces — the same graph the unstructured document ingestion pipeline writes to. The deployment-default sub-strategy is `topic_beam` (strongest single-shot on the SEC-10-Q benchmark: 45.13% strict vs 34.36% for hand-rolled, 195 questions). The published ontology graph (`urn:coa:{namespace}:published`) is not consulted — this strategy serves as the baseline against which future ontology-aware retrieval will be measured.
 
-- **`lexical-baseline`**: Uses the graphrag-toolkit's built-in retrievers against the lexical knowledge graph that `kg-build` produces. This retrieves from the same graph that the unstructured document ingestion pipeline writes to, using the toolkit's purpose-built retrieval logic. The published ontology graph (`urn:coa:{namespace}:published`) is not consulted — this strategy serves as the baseline against which future ontology-aware retrieval will be measured.
+- **`hand-rolled`**: Uses VectorRetriever (OpenSearch k-NN on `chunk_{ns}` index) + GraphTraverser (Neptune SPARQL 1-2 hop traversal). The original implementation, now selectable via `TIER3_STRATEGY=hand-rolled`.
 
 ### Selectable graphrag retriever strategy
 
@@ -114,23 +114,23 @@ The graphrag retrieval approach is selectable from a named set (single source of
 
 | Strategy | Engine family | Notes |
 |----------|---------------|-------|
-| `chunk_based_semantic` | `for_traversal_based_search` | The `lexical-baseline` deployment default. Fastest in the toolkit benchmark and more accurate than `traversal`. |
+| `topic_beam` | `for_semantic_guided_search` | **The `lexical-baseline` deployment default** (`LEXICAL_RETRIEVER_STRATEGY`). Strongest single-shot on the SEC-10-Q benchmark. |
+| `chunk_based_semantic` | `for_traversal_based_search` | Fast traversal-based search; the safety fallback when an invalid strategy is configured. |
 | `traversal` | `for_traversal_based_search` | The previously-hardcoded weighted set (ChunkBasedSearch@1.0 + EntityNetworkSearch@1.0 + TopicBasedSearch@0.5). |
-| `topic-beam-chunk_only` | `for_semantic_guided_search` | ChunkCosineSimilaritySearch + SemanticChunkBeamGraphSearch. |
 
 The lexical retriever is built on every deployment (when the Neptune + OpenSearch endpoints are set), so a request can engage graphrag **on-demand** by passing `options.retrieverStrategy`, regardless of `TIER3_STRATEGY`. The strategy is resolved once per request with precedence **request > deployment default**:
 
 - **Per-request override** — `options.retrieverStrategy`, validated at the model layer so an unknown value returns a **400**. When present it engages graphrag with that strategy on any deployment. Absence is valid.
-- **Deployment default** — `LEXICAL_RETRIEVER_STRATEGY` env var (`ServiceConfig.lexical_retriever_strategy`, default `chunk_based_semantic`), applied **only when `TIER3_STRATEGY=lexical-baseline`**. An invalid value warns (`invalid_lexical_retriever_strategy`) and falls back to `chunk_based_semantic`. Under `hand-rolled` there is no deployment default, so a request with no `retrieverStrategy` runs the hand-rolled path.
+- **Deployment default** — `LEXICAL_RETRIEVER_STRATEGY` env var (`ServiceConfig.lexical_retriever_strategy`, default `topic_beam`), applied **only when `TIER3_STRATEGY=lexical-baseline`**. An invalid value warns (`invalid_lexical_retriever_strategy`) and falls back to `chunk_based_semantic`. Under `hand-rolled` there is no deployment default, so a request with no `retrieverStrategy` runs the hand-rolled path.
 
 Resolution by deployment:
 
 | `TIER3_STRATEGY` | no `retrieverStrategy` | `retrieverStrategy` passed |
 |------------------|------------------------|----------------------------|
-| `hand-rolled` (default) | hand-rolled (vector + graph) | graphrag with that strategy |
-| `lexical-baseline` | graphrag with `LEXICAL_RETRIEVER_STRATEGY` | graphrag with that strategy |
+| `lexical-baseline` (default) | graphrag with `LEXICAL_RETRIEVER_STRATEGY` (`topic_beam`) | graphrag with that strategy |
+| `hand-rolled` | hand-rolled (vector + graph) | graphrag with that strategy |
 
-The resolved strategy name is recorded in the trace / response metadata. When graphrag is engaged with no explicit strategy (the `lexical-baseline` default), it is `chunk_based_semantic` — a deliberate change from the old hardcoded `traversal` weighting.
+The resolved strategy name is recorded in the trace / response metadata. When graphrag is engaged with no explicit strategy (the `lexical-baseline` default), it is `topic_beam`.
 
 ### Backend-aware store URIs
 

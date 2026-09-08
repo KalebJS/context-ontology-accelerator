@@ -40,7 +40,8 @@ Edit `public/runtime-config.json`:
   "authority": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_XXXXX",
   "clientId": "your-oauth-client-id",
   "apiEndpoint": "https://your-api.execute-api.us-east-1.amazonaws.com/prod/",
-  "wsEndpoint": "wss://your-api.execute-api.us-east-1.amazonaws.com/prod"
+  "wsEndpoint": "wss://your-api.execute-api.us-east-1.amazonaws.com/prod",
+  "version": "0.1.0"
 }
 ```
 
@@ -51,6 +52,7 @@ Edit `public/runtime-config.json`:
 | `clientId`    | Yes      | OAuth client ID                                               |
 | `apiEndpoint` | No       | Backend API base URL (falls back to relative `/api`)          |
 | `wsEndpoint`  | No       | WebSocket endpoint for Playground chat (relative or absolute) |
+| `version`     | No       | Deployed monorepo version, auto-populated from the repo-root `VERSION` file at deploy time; shown as a badge in the UI |
 
 ### Run
 

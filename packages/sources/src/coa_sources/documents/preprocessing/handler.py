@@ -30,10 +30,13 @@ from coa_common import async_boto_config
 from coa_common.constants import (
     DEFAULT_MAX_FILE_SIZE_MB,
     SUPPORTED_EXTENSIONS,
+    bucket_grants_namespace,
+    bucket_namespace_tag_key,
     validate_id,
     validate_s3_prefix,
 )
 from coa_common.s3 import (
+    get_bucket_tags,
     get_object_metadata_and_tags,
     get_s3_client,
     list_objects,
@@ -158,12 +161,42 @@ def handler(event: dict, context: Any) -> dict:
     s3_prefixes: list[str] = event.get("s3_prefixes") or []
     source_bucket_arn: str | None = event.get("source_bucket_arn")
     role_arn: str | None = event.get("role_arn")
+    # extraction_config is stringified by the trigger Lambda so it can ride the
+    # state-machine → Lambda-invoke pipe; only booleans need parsing here (the
+    # rest are consumed downstream by the KG-build container).
+    ec = event.get("extraction_config") or {}
+    enable_table_extraction = str(ec.get("enable_table_extraction", "false")).lower() == "true"
 
     try:
         validate_id(namespace_id, "namespace_id")
         validate_id(doc_source_id, "doc_source_id")
         for prefix in s3_prefixes:
             validate_s3_prefix(prefix, "s3_prefixes")
+        # Defense-in-depth: upload-type sources read from the
+        # shared platform bucket, so a prefix must be scoped to this job's
+        # namespace. The create path already reconstructs the prefix server-side
+        # as {namespace_id}/raw/{uploadId}/; this guard is a second line that
+        # refuses a foreign-namespace prefix if a job ever reaches here without
+        # going through create. S3-type prefixes live in the customer's own
+        # bucket (source_bucket_arn set) and are exempt. Mirrors
+        # deletion/cleanup_handler.py. The reason is intentionally generic so it
+        # does not echo the offending prefix back through GetSource.
+        # (An empty prefix — whole shared bucket — cannot occur for upload type:
+        # create always derives a concrete non-empty prefix, so it is not a
+        # reachable path and is not special-cased here.)
+        if not source_bucket_arn:
+            for prefix in s3_prefixes:
+                if not prefix.startswith(f"{namespace_id}/"):
+                    raise ValueError("source prefix is not scoped to the namespace")
+        # Cross-account role names must follow the deployment's naming
+        # convention. Validated here (inside the try) so a non-conforming name
+        # returns a structured SCAN_FAILED instead of raising uncaught and
+        # failing the Lambda. The message names the required prefix only, not
+        # the caller-supplied role name.
+        if source_bucket_arn and role_arn:
+            role_name = role_arn.rsplit("/", 1)[-1] if "/" in role_arn else ""
+            if not role_name.startswith(f"{_ROLE_PREFIX}-"):
+                raise ValueError(f"role_arn role name must start with '{_ROLE_PREFIX}-'")
     except ValueError as exc:
         logger.error("Input validation failed: %s", exc)
         return {
@@ -196,12 +229,32 @@ def handler(event: dict, context: Any) -> dict:
     # -- Determine source bucket & S3 clients ------------------------------
     if source_bucket_arn:
         source_bucket = parse_bucket_from_arn(source_bucket_arn)
-        if role_arn:
-            # Enforce naming convention: role name must start with the configured prefix.
-            role_name = role_arn.rsplit("/", 1)[-1] if "/" in role_arn else ""
-            expected_prefix = f"{_ROLE_PREFIX}-"
-            if not role_name.startswith(expected_prefix):
-                raise ValueError(f"role_arn role name must start with '{expected_prefix}', got: {role_name!r}")
+        # Role-name convention is validated above (inside the input-validation
+        # try block) so a bad name returns a structured error, not a crash.
+        #
+        # The bucket is caller-named, and holding manageSource on a namespace says
+        # nothing about whether the caller may read it. The bucket's own tag is the
+        # authorization: setting it takes a bucket-level write permission, so its
+        # presence is the owner's consent. Read it with the ambient client — we
+        # cannot know whether we may assume anything until we know the bucket is
+        # authorized at all, and this reads metadata, not data.
+        #
+        # Checked here as well as at registration because this handler is a
+        # separate entry point; the sibling deletion path guards the same way
+        # (cleanup_handler.py refuses a prefix outside its own namespace).
+        #
+        # Deliberately NOT moved into the input-validation try above, unlike the
+        # role-name check: this makes an S3 call, and a throttle or transport fault
+        # there must stay retryable rather than being converted into a terminal
+        # SCAN_FAILED. An unauthorized bucket raises, which the state machine's
+        # Catch turns into SCAN_FAILED.
+        bucket_tags = get_bucket_tags(get_s3_client(), source_bucket)
+        if not bucket_grants_namespace(bucket_tags, namespace_id):
+            raise ValueError(
+                f"bucket {source_bucket!r} does not authorize namespace {namespace_id}: "
+                f"tag the bucket {bucket_namespace_tag_key()}=<namespaceId> "
+                f"(space-separated for several namespaces)"
+            )
         source_s3 = get_s3_client(role_arn=role_arn)
     else:
         source_bucket = our_bucket
@@ -228,7 +281,7 @@ def handler(event: dict, context: Any) -> dict:
                 "files_preprocessed": 0,
                 "files_skipped": 0,
                 "files_errored": 0,
-                "issues": [{"filename": "", "type": "error", "reason": f"Failed to list source files: {exc}"}],
+                "issues": [{"filename": "", "type": "error", "reason": "Failed to list source files"}],
                 "elapsed_seconds": round(time.time() - start_ts, 2),
             }
 
@@ -306,8 +359,12 @@ def handler(event: dict, context: Any) -> dict:
                     content_bytes,
                     filename,
                     textract_client,
+                    enable_table_extraction=enable_table_extraction,
                 )
-                processing_method = "textract" if out_ext == ".txt" else "unstructured_partition_pdf"
+                if enable_table_extraction:
+                    processing_method = "textract_analyze_document_tables"
+                else:
+                    processing_method = "textract" if out_ext == ".txt" else "unstructured_partition_pdf"
             elif ext in _PROCESSORS:
                 processed_text, out_ext = _PROCESSORS[ext](content_bytes, filename)
                 processing_method = (

@@ -17,6 +17,7 @@ from coa_common import ontology_vector_index_name
 from .clients.base import LLMClient, QueryExecutor, VectorClient
 from .exceptions import AccessDeniedError, DataSourceUnavailableError, NoResultError
 from .identity import display_principal
+from .mode import Mode, resolve_mode
 
 if TYPE_CHECKING:
     from .clients.sources_registry import SourceComposition, SourcesRegistry
@@ -28,7 +29,7 @@ from .response_assembler import ResponseAssembler
 from .step_ids import StepId
 from .tier1.metric_resolver import MetricMatch, MetricResolver
 from .tier2.skip import Tier2SkipDecision
-from .tier2.sql_firewall import SQLFirewall
+from .tier2.sql_firewall import FirewallResult, SQLFirewall
 from .tier2.strategy import (
     DEFAULT_STRATEGY,
     EMPTY_RESULT_CONFIDENCE_FLOOR,
@@ -37,6 +38,7 @@ from .tier2.strategy import (
     StrategyResult,
     StructuredQueryTier,
     capped_max_rows,
+    normalize_strategy_option,
 )
 from .tier3.knowledge_retriever import VECTOR_SEARCH_TIMEOUT_S, KnowledgeRetriever
 from .trace import TraceCollector
@@ -116,7 +118,7 @@ class Orchestrator:
         vector_client: VectorClient | None = None,
         oss_ontology_index: str | None = None,
         agentic_retriever: AgenticRetriever | None = None,
-        tier3_agentic_default: bool = False,
+        tier3_deep_reasoning_default: bool = False,
     ):
         """Wire the per-tier resolvers and optional gating/skip helpers.
 
@@ -135,11 +137,12 @@ class Orchestrator:
                 multilingual ontology-concept vector search.
             oss_ontology_index: Optional AOSS ontology index name backing the
                 Tier-3 seed-URI vector search.
-            agentic_retriever: Optional agentic Tier-3 retriever. When present it
-                can be engaged per-request (options.mode=="agentic") or as the
-                deployment default; when None the agentic path is unavailable.
-            tier3_agentic_default: Whether the agentic path is the deployment
-                default for Tier 3 (set when config.tier3_strategy=="agentic").
+            agentic_retriever: Optional deep-reasoning Tier-3 retriever. When present
+                it can be engaged per-request (options.mode=="deep-reasoning") or as
+                the deployment default; when None deep reasoning is unavailable.
+            tier3_deep_reasoning_default: Whether deep reasoning is the deployment
+                default for Tier 3 (set when
+                config.tier3_strategy=="deep-reasoning").
         """
         self._metric_resolver = metric_resolver
         self._knowledge_retriever = knowledge_retriever
@@ -167,13 +170,14 @@ class Orchestrator:
         # _resolve_seed_uris() returns [] and Tier 3 behaves exactly as before.
         self._vector_client = vector_client
         self._oss_ontology_index = oss_ontology_index
-        # Optional agentic Tier-3 path. When present it can be engaged per-request
-        # (options.mode=="agentic") or as the deployment default
-        # (tier3_agentic_default, set when config.tier3_strategy=="agentic"). When
-        # None the agentic path is simply unavailable and Tier-3 always runs the
+        # Optional deep-reasoning Tier-3 path. When present it can be engaged
+        # per-request (options.mode=="deep-reasoning") or as the deployment default
+        # (tier3_deep_reasoning_default, set when
+        # config.tier3_strategy=="deep-reasoning"). When None deep reasoning is simply
+        # unavailable and Tier-3 always runs the
         # existing hand-rolled / lexical KnowledgeRetriever — purely additive.
         self._agentic_retriever = agentic_retriever
-        self._tier3_agentic_default = tier3_agentic_default
+        self._tier3_deep_reasoning_default = tier3_deep_reasoning_default
 
     async def resolve(
         self,
@@ -238,8 +242,9 @@ class Orchestrator:
         tier2_sparql: str | None = None
         metric_definitions: list[dict] | None = None
 
-        # ── Agentic mode owns the whole request ──────────────────────
-        # Mode is an execution policy, not a tier: an explicit options.mode="agentic"
+        # ── Deep-reasoning mode owns the whole request ───────────────
+        # Mode is an execution policy, not a tier: an explicit
+        # options.mode="deep-reasoning"
         # hands the request to the reasoning loop directly instead of running the
         # T1 -> T2 cascade first. Without this, a question the cascade can answer
         # returns at Tier 1/2 and the loop never runs, so the mode selector appears
@@ -252,7 +257,7 @@ class Orchestrator:
         #
         # An explicit tierOverride still wins: it is a direct instruction about which
         # tier to run, so it is honored over the mode's routing.
-        if tier_override is None and self._is_agentic_engaged(options):
+        if tier_override is None and self._is_deep_reasoning_engaged(options):
             return await self._run_tier3(
                 query,
                 namespace,
@@ -339,6 +344,18 @@ class Orchestrator:
             f"No result for the requested tier (tierOverride={tier_override})",
             tier=tier_override if isinstance(tier_override, int) else None,
         )
+
+    def authorize_namespace(self, namespace: str, profile: dict) -> FirewallResult:
+        """Coarse "may this principal query this namespace?" admission decision.
+
+        Delegates to the SQL firewall's Cedar gate so there is exactly one policy
+        source/cache. This is the single authorization point for the retrieval
+        surfaces that never build SQL — the isolated kbSearch/graphTraverse/
+        translate actions and the Tier-3 path — which otherwise reach a data sink
+        without any namespace authorization (F-2, CWE-862). The Tier-1/2 SQL path
+        keeps its own firewall.evaluate() gate; this runs upstream of dispatch.
+        """
+        return self._firewall.authorize_namespace(namespace, profile)
 
     # ── Tier run/skip decisions ──────────────────────────────────────
     # Each tier's guard is a named predicate so resolve() reads as a plain
@@ -572,14 +589,14 @@ class Orchestrator:
             StrategyOption.NL_TO_SQL,
             StrategyOption.ONTOP_FIRST,
             StrategyOption.NL_TO_SQL_FIRST,
-            StrategyOption.AGENTIC,
+            StrategyOption.DEEP_REASONING,
         }
     )
 
     @classmethod
     def _has_explicit_strategy(cls, options: dict) -> bool:
         """True when the caller pinned a specific Tier-2 strategy."""
-        return options.get("strategy") in cls._EXPLICIT_STRATEGY_OPTIONS
+        return normalize_strategy_option(options.get("strategy")) in cls._EXPLICIT_STRATEGY_OPTIONS
 
     @classmethod
     def _resolve_strategy_selection(cls, options: dict, tier_override: int | None) -> StrategyOption | None:
@@ -591,7 +608,10 @@ class Orchestrator:
         ``_should_run_tier2``.
         """
         # An explicit strategy pin takes highest precedence (caller intent).
-        strategy = options.get("strategy")
+        # Normalized so the pre-rename "agentic" spelling still counts as a pin —
+        # otherwise it drops through to DEFAULT_STRATEGY and silently runs the cheap
+        # fallback chain instead of the agent the caller asked for.
+        strategy = normalize_strategy_option(options.get("strategy"))
         if strategy in cls._EXPLICIT_STRATEGY_OPTIONS:
             return strategy
 
@@ -1019,30 +1039,28 @@ class Orchestrator:
         # TODO(serve): populate from the Tier-1 trace when catalog grounding lands.
         return None
 
-    def _is_agentic_engaged(self, options: dict) -> bool:
-        """Whether the agentic execution path should handle this request.
+    def _is_deep_reasoning_engaged(self, options: dict) -> bool:
+        """Whether the deep-reasoning execution path should handle this request.
 
         Mode is the per-request execution policy, orthogonal to the tier cascade.
         The request field is ``options.mode``. Precedence: request wins over the
         deployment default (``config.tier3_strategy``).
 
-        * ``"agentic"``  → engage the loop (unless no retriever was built).
-        * ``"standard"`` → explicit OPT-OUT, even under an agentic default.
+        * ``"deep-reasoning"`` → engage the loop (unless no retriever was built).
+        * ``"standard"`` → explicit OPT-OUT, even under a deep-reasoning default.
         * absent        → follow the deployment default, which ships as standard
-          (``TIER3_STRATEGY=lexical-baseline``); agentic is opt-in.
+          (``TIER3_STRATEGY=lexical-baseline``); deep reasoning is opt-in.
 
-        ``False`` when no agentic retriever is configured, regardless of mode.
+        ``False`` when no deep-reasoning retriever is configured, regardless of mode.
         """
-        from .mode import Mode, resolve_mode
-
         request_mode = options.get("mode")
-        deployment_default = Mode.AGENTIC if self._tier3_agentic_default else Mode.STANDARD
+        deployment_default = Mode.DEEP_REASONING if self._tier3_deep_reasoning_default else Mode.STANDARD
         resolved, _ = resolve_mode(
             request_mode,
             deployment_default=deployment_default,
-            agentic_available=self._agentic_retriever is not None,
+            deep_reasoning_available=self._agentic_retriever is not None,
         )
-        return resolved is Mode.AGENTIC
+        return resolved is Mode.DEEP_REASONING
 
     async def _run_tier3(
         self,
@@ -1062,11 +1080,11 @@ class Orchestrator:
         has_structured_source: bool = True,
         has_unstructured_source: bool = True,
     ) -> InvokeResponse:
-        # Agentic Tier-3 path (opt-in). Engaged per-request via
-        # options.mode=="agentic" or as the deployment default. Returns the
+        # Deep-reasoning Tier-3 path (opt-in). Engaged per-request via
+        # options.mode=="deep-reasoning" or as the deployment default. Returns the
         # same Tier3Result contract, so the assembler tail below is shared. When
         # not engaged, fall through to the existing hand-rolled / lexical path.
-        if self._is_agentic_engaged(options or {}):
+        if self._is_deep_reasoning_engaged(options or {}):
             tier3_result = await self._agentic_retriever.resolve(
                 query,
                 namespace,
@@ -1103,7 +1121,7 @@ class Orchestrator:
                 model_id=model_id,
                 partial=tier3_result.partial,
             )
-            result.metadata = {**(result.metadata or {}), "mode": "agentic"}
+            result.metadata = {**(result.metadata or {}), "mode": Mode.DEEP_REASONING.value}
             return InvokeResponse(result=result)
 
         # Resolve the graphrag retriever strategy. The lexical retriever is built

@@ -167,6 +167,29 @@ def get_object_metadata_and_tags(
     return user_metadata, tags
 
 
+def get_bucket_tags(s3_client: Any, bucket: str) -> dict[str, str]:
+    """Return *bucket*'s tag set as a plain ``{key: value}`` dict.
+
+    Unlike :func:`get_object_metadata_and_tags` above, this does **not** swallow
+    errors. That function's tags are enrichment, so losing them degrades a result;
+    these tags are an authorization input, so losing them must not read as "no
+    tags" and therefore "not authorized for anything" by accident — an
+    ``AccessDenied`` on the tag read is an operational fault, not a decision. Every
+    error except a genuinely absent tag set propagates so the caller fails closed
+    on a fault rather than silently treating it as a denial it can report.
+
+    ``NoSuchTagSet`` is the one exception: it means the bucket really carries no
+    tags, which is a legitimate answer, and an empty dict authorizes nothing.
+    """
+    try:
+        resp = s3_client.get_bucket_tagging(Bucket=bucket)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "NoSuchTagSet":
+            return {}
+        raise
+    return {t["Key"]: t["Value"] for t in resp.get("TagSet", [])}
+
+
 def parse_bucket_from_arn(arn: str) -> str:
     """Extract the bucket name from an S3 bucket ARN.
 

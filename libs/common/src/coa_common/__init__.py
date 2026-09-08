@@ -3,7 +3,7 @@
 
 """Semantic Context Common - shared config, logging, exceptions, constants, S3 utilities, auth, and DAO."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.3"
 
 from coa_common.authnz_types import (
     PrincipalType,

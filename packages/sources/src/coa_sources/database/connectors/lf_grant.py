@@ -129,13 +129,29 @@ def _grant(lf, principal_arn: str, database: str, catalog_id: str, table_perms: 
     )
 
 
-def attempt_self_grant(database: str, catalog_id: str, region: str) -> bool:
+def attempt_self_grant(database: str, catalog_id: str, region: str, *, owner_verified: bool) -> bool:
     """Best-effort: grant the connector (DESCRIBE) and serve role (SELECT) LF access.
 
     Returns ``True`` when grants were issued (caller should retry the Glue call),
     ``False`` when self-heal is unavailable (no grantor configured, assume failed,
     or cross-account) so the caller surfaces an actionable error instead.
+
+    ``owner_verified`` MUST be the result of a namespace-ownership check on
+    ``(catalog_id, database)`` — see ``coa_sources.database.glue_ownership``. This
+    function is the platform's privilege-escalation primitive: it assumes a Lake
+    Formation admin role and can unlock SELECT on any database in the account, for
+    the shared serve role as well as itself. A caller that cannot say the target
+    belongs to the requesting namespace gets no grant. Required rather than
+    defaulted so that a new call site has to answer the question, and answering it
+    wrong is a visible argument rather than an omission.
     """
+    if not owner_verified:
+        logger.warning(
+            "lf_self_grant_refused_owner_unverified",
+            extra={"database": database, "catalog_id": catalog_id},
+        )
+        return False
+
     lf = _lf_client_via_grantor(region)
     if lf is None:
         return False

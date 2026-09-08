@@ -2,9 +2,9 @@
 # This file is kept for compatibility with the existing Dockerfile build
 # step and mirrors [project.dependencies] in pyproject.toml.
 fastapi>=0.141.1
-uvicorn>=0.52.1
+uvicorn>=0.52.4
 httpx>=0.28.1
-boto3>=1.43.69
+boto3>=1.43.80
 rdflib>=7.6.0
 owlready2>=0.51
 pyshacl>=0.40.1

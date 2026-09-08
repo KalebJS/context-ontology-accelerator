@@ -23,3 +23,4 @@ export { InfoPopover } from "./InfoPopover";
 export type { InfoPopoverProps } from "./InfoPopover";
 export { ButtonWithHint } from "./ButtonWithHint";
 export type { ButtonWithHintProps } from "./ButtonWithHint";
+export { VersionBadge } from "./VersionBadge";

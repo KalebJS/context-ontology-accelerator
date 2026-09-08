@@ -26,6 +26,18 @@ Environment variables:
     BATCH_INFERENCE_ROLE_ARN — IAM role for Bedrock batch inference (required if USE_BATCH_INFERENCE=true)
     ENABLE_VERSIONING        — "true" (default) or "false"
     ENABLE_PROPOSITION_EXTRACTION — "true" (default) or "false" — skip for ~50% fewer LLM calls
+    INFER_ENTITY_CLASSIFICATIONS — "true" (default) or "false" — derive the entity-class
+                                   vocabulary from THIS corpus at ingest start rather than
+                                   inheriting graphrag's hardcoded news/finance defaults
+                                   ('Company', 'Sports Team', 'Creative Work', …).
+    PREFERRED_ENTITY_CLASSIFICATIONS — JSON-encoded list of entity-class labels (e.g.
+                                   '["Policy","Claim","Loss Ratio"]'). Non-empty overrides
+                                   INFER_ENTITY_CLASSIFICATIONS. Default: "[]".
+    CHUNK_SIZE                — Positive integer to override the toolkit's default
+                                SentenceSplitter chunk_size=256; "0" (default) keeps the
+                                toolkit default.
+    CHUNK_OVERLAP             — Positive integer to override the toolkit's default 25 tokens
+                                of overlap; "0" (default) keeps the toolkit default.
     DELETE_PREV_VERSIONS      — "true" or "false" (default) — delete archived versions after ingestion
     BEDROCK_MODEL_ARN        — Bedrock inference profile ARN (set by Trigger Lambda, no default)
     AWS_REGION               — AWS region (default: us-east-1)
@@ -52,12 +64,16 @@ import traceback
 import structlog
 from coa_common.config import resolve_region
 from coa_common.constants import (
+    DEFAULT_CHUNK_OVERLAP,
+    DEFAULT_CHUNK_SIZE,
     DEFAULT_DELETE_PREV_VERSIONS,
     DEFAULT_EMBED_DIMENSIONS,
     DEFAULT_EMBED_MODEL_ID,
     DEFAULT_ENABLE_PROPOSITION_EXTRACTION,
     DEFAULT_ENABLE_VERSIONING,
     DEFAULT_EXTRACTION_MODE,
+    DEFAULT_INFER_ENTITY_CLASSIFICATIONS,
+    DEFAULT_PREFERRED_ENTITY_CLASSIFICATIONS_JSON,
     DEFAULT_USE_BATCH_INFERENCE,
     EXTRACTION_BATCH_SIZE,
     STAGED_TEXT_EXTENSIONS,
@@ -97,6 +113,58 @@ ENABLE_VERSIONING = os.environ.get("ENABLE_VERSIONING", DEFAULT_ENABLE_VERSIONIN
 ENABLE_PROPOSITION_EXTRACTION = (
     os.environ.get("ENABLE_PROPOSITION_EXTRACTION", DEFAULT_ENABLE_PROPOSITION_EXTRACTION).lower() == "true"
 )
+# When True, graphrag runs a lightweight LLM sweep at ingest start that derives
+# the entity-class vocabulary from THIS corpus and replaces the toolkit's
+# hardcoded DEFAULT_ENTITY_CLASSIFICATIONS. The toolkit's default is the news/
+# finance list ('Company', 'Sports Team', 'Creative Work', …) — inheriting it
+# on a non-news corpus mis-guides extraction, so we opt in by default. Costs
+# one extra LLM sweep per ingest (see InferClassificationsConfig defaults:
+# num_samples=5, num_iterations=1, num_classifications=15).
+INFER_ENTITY_CLASSIFICATIONS = (
+    os.environ.get("INFER_ENTITY_CLASSIFICATIONS", DEFAULT_INFER_ENTITY_CLASSIFICATIONS).lower() == "true"
+)
+
+# Explicit vocabulary supplied by the user (or, in a future change, resolved
+# from the namespace's accepted ontology). Arrives as a JSON-encoded list from
+# the trigger Lambda — an object/array can't be inlined into a Step Functions
+# container-override JsonPath, so it must be pre-stringified. When non-empty
+# this WINS over INFER_ENTITY_CLASSIFICATIONS: the user asked for these exact
+# labels, so don't second-guess them with an inference pass.
+_PREFERRED_JSON = os.environ.get("PREFERRED_ENTITY_CLASSIFICATIONS", DEFAULT_PREFERRED_ENTITY_CLASSIFICATIONS_JSON)
+try:
+    _decoded = json.loads(_PREFERRED_JSON) if _PREFERRED_JSON else []
+    if not isinstance(_decoded, list) or not all(isinstance(x, str) for x in _decoded):
+        raise ValueError("must be a JSON array of strings")
+    PREFERRED_ENTITY_CLASSIFICATIONS: list[str] = [x.strip() for x in _decoded if x.strip()]
+except (ValueError, json.JSONDecodeError) as _exc:
+    logger.warning(
+        "invalid PREFERRED_ENTITY_CLASSIFICATIONS, ignoring",
+        value=_PREFERRED_JSON,
+        error=str(_exc),
+    )
+    PREFERRED_ENTITY_CLASSIFICATIONS = []
+
+# Optional chunk-size / chunk-overlap override. 0 (default) means "use the
+# graphrag-toolkit default" — SentenceSplitter(chunk_size=256, chunk_overlap=25).
+# The benchmark harness pins 1024 for dense/tabular corpora; use that as the
+# starting point when tables dominate the corpus.
+# These arrive as stringified integers from the trigger Lambda via the SFN ->
+# ECS env pipe. Guard the parse: a malformed value must degrade to the toolkit
+# default with a logged warning, never crash the container at import time
+# (which would fail the whole KG build before any diagnostic is emitted).
+try:
+    CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", str(DEFAULT_CHUNK_SIZE)))
+    CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", str(DEFAULT_CHUNK_OVERLAP)))
+except (TypeError, ValueError) as _chunk_exc:
+    logger.warning(
+        "invalid CHUNK_SIZE/CHUNK_OVERLAP, using toolkit defaults",
+        chunk_size=os.environ.get("CHUNK_SIZE"),
+        chunk_overlap=os.environ.get("CHUNK_OVERLAP"),
+        error=str(_chunk_exc),
+    )
+    CHUNK_SIZE = DEFAULT_CHUNK_SIZE
+    CHUNK_OVERLAP = DEFAULT_CHUNK_OVERLAP
+
 DELETE_PREV_VERSIONS = os.environ.get("DELETE_PREV_VERSIONS", DEFAULT_DELETE_PREV_VERSIONS).lower() == "true"
 BATCH_INFERENCE_ROLE_ARN = os.environ.get("BATCH_INFERENCE_ROLE_ARN", "")
 BEDROCK_MODEL_ARN = os.environ.get("BEDROCK_MODEL_ARN", "")
@@ -658,13 +726,99 @@ def _setup_graphrag(tenant_id: str):
 
 
 def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: str):
-    """Build IndexingConfig based on feature flags.  Returns None if no flags are active."""
+    """Build the IndexingConfig handed to LexicalGraphIndex.
+
+    ALWAYS returns an IndexingConfig with a fully-specified ExtractionConfig —
+    never None, and never a bare ``ExtractionConfig()``. Without this, when
+    the default flags applied, ``_build_indexing_config``
+    returned None, the toolkit built its own ``ExtractionConfig()``, and
+    ``preferred_entity_classifications`` silently defaulted to
+    ``DEFAULT_ENTITY_CLASSIFICATIONS`` (``['Company', 'Location', 'Event',
+    'Sports Team', 'Person', 'Role', 'Product', 'Service', 'Creative Work',
+    'Software', 'Financial Instrument']``, ``graphrag/indexing/constants.py``).
+    That is a news/finance list — inheriting it steers the extraction LLM
+    away from any non-news domain (insurance, healthcare, manufacturing, …).
+
+    Vocabulary source (checked in this order):
+    1. ``PREFERRED_ENTITY_CLASSIFICATIONS`` (JSON list) — an explicit list from
+       the user is authoritative; no inference runs.
+    2. ``INFER_ENTITY_CLASSIFICATIONS=true`` (default) — the toolkit runs a
+       short LLM sweep at ingest start (``InferClassifications`` in
+       ``graphrag/indexing/extract/infer_classifications.py``, default 5
+       samples × 1 iteration → 15 labels) and uses the labels it discovered
+       in this corpus. ``preferred_entity_classifications=[]`` +
+       ``replace_default_classifications=True`` together mean "start from
+       nothing, keep only what the corpus proves".
+    3. Both off — the extractor runs unguided (empty list). Do not enable
+       both off unless the toolkit-default vocabulary has been checked to be
+       inappropriate for this corpus.
+
+    Chunking: ``CHUNK_SIZE`` / ``CHUNK_OVERLAP`` are ``0`` by default, in
+    which case the toolkit's ``SentenceSplitter(chunk_size=256,
+    chunk_overlap=25)`` is used. Setting a positive integer switches the
+    IndexingConfig to that splitter — 1024 is the graphrag benchmark
+    harness value for dense/tabular corpora.
+
+    Future enhancement: when ``PREFERRED_ENTITY_CLASSIFICATIONS`` is
+    empty AND the namespace has an accepted ontology, resolve its class
+    labels here. Deferred because it requires a cross-service HTTP call to
+    ontology-engine (or a direct SPARQL client), neither of which
+    ``packages/sources`` has today.
+    """
     from graphrag_toolkit.lexical_graph import ExtractionConfig, IndexingConfig
+    from graphrag_toolkit.lexical_graph.indexing.extract import InferClassificationsConfig
+    from llama_index.core.node_parser import SentenceSplitter
 
     # --- Extraction config ---
-    extraction_config: ExtractionConfig | None = None
-    if not ENABLE_PROPOSITION_EXTRACTION:
-        extraction_config = ExtractionConfig(enable_proposition_extraction=False)
+    infer_config: InferClassificationsConfig | bool
+    if PREFERRED_ENTITY_CLASSIFICATIONS:
+        # Explicit list wins. Never run inference on top: the user asked for
+        # THESE labels, not "these plus whatever else the LLM proposes".
+        preferred = list(PREFERRED_ENTITY_CLASSIFICATIONS)
+        infer_config = False
+    elif INFER_ENTITY_CLASSIFICATIONS:
+        # Corpus-inferred vocabulary. ``preferred_entity_classifications=[]``
+        # is NOT the same as "unset": the toolkit reads an empty list as the
+        # seed vocabulary (see ``lexical_graph_index.py`` ~line 377); with
+        # ``replace_default_classifications=True`` the inferer replaces that
+        # seed with what it derives from THIS corpus, so the final vocabulary
+        # is entirely corpus-driven. Leaving the argument unset would have
+        # fallen back to the news/finance list — the exact bug this fixes.
+        preferred = []
+        infer_config = InferClassificationsConfig(replace_default_classifications=True)
+    else:
+        # Both off → unguided extraction. Logged loudly, since this is the
+        # only configuration where the LLM types entities from scratch.
+        logger.warning(
+            "Both PREFERRED_ENTITY_CLASSIFICATIONS and INFER_ENTITY_CLASSIFICATIONS are off — "
+            "extraction runs unguided. Set one of them to steer entity typing."
+        )
+        preferred = []
+        infer_config = False
+
+    extraction_config = ExtractionConfig(
+        enable_proposition_extraction=ENABLE_PROPOSITION_EXTRACTION,
+        preferred_entity_classifications=preferred,
+        infer_entity_classifications=infer_config,
+    )
+
+    # --- Chunking ---
+    chunking = None
+    if CHUNK_SIZE > 0:
+        overlap = CHUNK_OVERLAP if CHUNK_OVERLAP > 0 else 25
+        # @range on chunkSize/chunkOverlap is per-field; it cannot express the
+        # cross-field invariant overlap < size. A SentenceSplitter with
+        # overlap >= size produces degenerate/empty chunks, so clamp defensively.
+        if overlap >= CHUNK_SIZE:
+            clamped = max(1, CHUNK_SIZE - 1)
+            logger.warning(
+                "CHUNK_OVERLAP >= CHUNK_SIZE, clamping",
+                chunk_size=CHUNK_SIZE,
+                requested_overlap=overlap,
+                clamped_overlap=clamped,
+            )
+            overlap = clamped
+        chunking = [SentenceSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=overlap)]
 
     # --- Batch config ---
     batch_config = None
@@ -683,13 +837,20 @@ def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: s
                 "USE_BATCH_INFERENCE=true but BATCH_INFERENCE_ROLE_ARN not set — falling back to real-time inference"
             )
 
-    if extraction_config is None and batch_config is None:
-        return None
-
-    return IndexingConfig(
-        extraction=extraction_config,
-        batch_config=batch_config,
+    logger.info(
+        "Extraction config built",
+        proposition_extraction=ENABLE_PROPOSITION_EXTRACTION,
+        preferred_entity_classifications_count=len(preferred),
+        infer_entity_classifications=bool(infer_config),
+        chunk_size=CHUNK_SIZE if CHUNK_SIZE > 0 else "256 (toolkit default)",
+        chunk_overlap=CHUNK_OVERLAP if CHUNK_OVERLAP > 0 else "25 (toolkit default)",
+        batch_inference=USE_BATCH_INFERENCE and batch_config is not None,
     )
+
+    kwargs: dict = {"extraction": extraction_config, "batch_config": batch_config}
+    if chunking is not None:
+        kwargs["chunking"] = chunking
+    return IndexingConfig(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -726,7 +887,7 @@ def _run_continuous(
             vector_store,
             tenant_id=tenant_id,
             extraction_dir=CHECKPOINT_DIR,
-            **({"indexing_config": indexing_config} if indexing_config else {}),
+            indexing_config=indexing_config,
         )
 
         # Checkpoint helps with within-process retries (Bedrock throttle →
@@ -861,7 +1022,7 @@ def _run_separated(
             graph_store,
             vector_store,
             tenant_id=tenant_id,
-            **({"indexing_config": indexing_config} if indexing_config else {}),
+            indexing_config=indexing_config,
         )
 
         # Stage 1: Extract

@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from coa_common.constants import RESOURCE_PREFIX
-from coa_serve.clients.athena import AthenaQueryExecutor
+from coa_serve.clients.athena import AthenaQueryError, AthenaQueryExecutor
+from coa_serve.clients.sources_registry import SQLNamespaceScope
 from coa_serve.tier2.sql_firewall import UnsafeSQLError
 
 
@@ -108,6 +109,43 @@ class TestAthenaExecution:
                 namespace="demo",
             )
 
+    async def test_foreign_qualified_database_is_denied_before_submission(self):
+        with patch("boto3.client") as mock_boto, patch("boto3.resource"):
+            athena_client = MagicMock()
+            mock_boto.return_value = athena_client
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="t")
+
+        executor._sources.sql_namespace_scope = AsyncMock(
+            return_value=SQLNamespaceScope(
+                native_databases=frozenset({"tenant_a_db"}),
+                federated_catalog_schemas=frozenset(),
+            )
+        )
+        with pytest.raises(AthenaQueryError, match="outside the requested namespace"):
+            await executor.execute(
+                "SELECT * FROM AwsDataCatalog.tenant_b_db.customers",
+                namespace="tenant-a",
+                database="tenant_a_db",
+            )
+
+        athena_client.start_query_execution.assert_not_called()
+
+    async def test_qualified_database_is_denied_when_namespace_scope_is_unavailable(self):
+        with patch("boto3.client") as mock_boto, patch("boto3.resource"):
+            athena_client = MagicMock()
+            mock_boto.return_value = athena_client
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="t")
+
+        executor._sources.sql_namespace_scope = AsyncMock(return_value=None)
+        with pytest.raises(AthenaQueryError, match="Unable to verify SQL references"):
+            await executor.execute(
+                "SELECT * FROM AwsDataCatalog.tenant_a_db.customers",
+                namespace="tenant-a",
+                database="tenant_a_db",
+            )
+
+        athena_client.start_query_execution.assert_not_called()
+
 
 @pytest.mark.unit
 class TestTableNameRewrite:
@@ -142,6 +180,123 @@ class TestTableNameRewrite:
         sql = "NOT VALID SQL {{{"
         result = AthenaQueryExecutor._rewrite_table_names_for_federation(sql, "public")
         assert result == sql
+
+
+@pytest.mark.unit
+class TestTableAliasDisambiguation:
+    """Test _disambiguate_table_aliases.
+
+    ``ONTOP_SQL`` is the real statement Ontop generated for a question about the
+    largest orders against a custom-connector source. It failed against a live
+    LAMBDA catalog with ``TYPE_MISMATCH: line 1:285: Expression V1 is not of
+    type ROW``.
+    """
+
+    ONTOP_SQL = (
+        'SELECT V1."order_id" AS "order_id1m11", V1."order_ts" AS "order_ts1m16", '
+        'CAST(V1."total_amount" AS DOUBLE) AS "v1" FROM "orders" AS V1 '
+        'WHERE V1."total_amount" IS NOT NULL '
+        'ORDER BY CAST(V1."total_amount" AS DOUBLE) DESC LIMIT 10'
+    )
+
+    def test_renames_the_table_alias_that_collides_with_a_projection_alias(self):
+        result = AthenaQueryExecutor._disambiguate_table_aliases(self.ONTOP_SQL)
+        # The projection alias must survive: callers bind result columns by name,
+        # so renaming that side instead would break them.
+        assert '"v1"' in result
+        # No bare V1 qualifier may remain in any case, or ORDER BY still resolves
+        # it to the projection alias.
+        assert "V1." not in result
+
+    def test_keeps_every_column_bound_to_its_renamed_table(self):
+        result = AthenaQueryExecutor._disambiguate_table_aliases(self.ONTOP_SQL)
+        # Every reference must move together; a partial rename yields "column
+        # cannot be resolved" rather than a clean failure. Asserted as a count
+        # conservation rather than a literal, so the test states the invariant
+        # instead of restating the fixture.
+        qualified_before = self.ONTOP_SQL.count("V1.")
+        assert result.count("V1_t.") == qualified_before
+        assert result.lower().count("total_amount") == self.ONTOP_SQL.lower().count("total_amount")
+        assert "order_id" in result and "order_ts" in result
+
+    def test_no_collision_leaves_sql_untouched(self):
+        # V1 vs v0 — the numbers do not meet, so nothing needs repairing.
+        sql = 'SELECT V1."amount" AS "v0" FROM "orders" AS V1 ORDER BY V1."amount" DESC'
+        assert AthenaQueryExecutor._disambiguate_table_aliases(sql) == sql
+
+    def test_collision_is_detected_across_case(self):
+        # Trino folds identifiers regardless of quoting, so "V1" and "v1" are one
+        # name to it even though they differ as Python strings.
+        sql = 'SELECT CAST(v1."amount" AS DOUBLE) AS "V1" FROM "orders" AS v1 ORDER BY v1."amount"'
+        assert AthenaQueryExecutor._disambiguate_table_aliases(sql) != sql
+
+    def test_generated_alias_avoids_a_second_collision(self):
+        # A table already aliased V1_t must not be collided with by the rename.
+        sql = (
+            'SELECT CAST(V1."amount" AS DOUBLE) AS "v1", V1_t."x" AS "c" '
+            'FROM "orders" AS V1 JOIN "other" AS V1_t ON V1."id" = V1_t."id"'
+        )
+        result = AthenaQueryExecutor._disambiguate_table_aliases(sql)
+        assert "v1_t1" in result.lower()
+
+    def test_multiple_colliding_aliases_are_each_renamed(self):
+        sql = (
+            'SELECT CAST(V1."a" AS DOUBLE) AS "v1", CAST(V2."b" AS DOUBLE) AS "v2" '
+            'FROM "x" AS V1 JOIN "y" AS V2 ON V1."id" = V2."id"'
+        )
+        result = AthenaQueryExecutor._disambiguate_table_aliases(sql)
+        assert "V1." not in result
+        assert "V2." not in result
+
+    def test_invalid_sql_returns_original(self):
+        sql = "NOT VALID SQL {{{"
+        assert AthenaQueryExecutor._disambiguate_table_aliases(sql) == sql
+
+    def test_unaliased_tables_are_left_alone(self):
+        sql = 'SELECT "amount" AS "v1" FROM "orders"'
+        assert AthenaQueryExecutor._disambiguate_table_aliases(sql) == sql
+
+
+@pytest.mark.unit
+class TestFederationFailureExplanation:
+    """Test _explain_federation_failure."""
+
+    def test_invoke_denial_names_the_grant_and_the_role(self):
+        exc = AthenaQueryError("Athena query FAILED: Insufficient permissions to execute the query.")
+        result = AthenaQueryExecutor._explain_federation_failure(exc, "scldevds_abc123")
+        assert "lambda:InvokeFunction" in str(result)
+        assert "serve runtime role" in str(result)
+        assert "coa:connector" in str(result)
+        assert "scldevds_abc123" in str(result)
+
+    def test_spill_denial_names_the_bucket_policy_and_prefix(self):
+        exc = AthenaQueryError(
+            "Athena query FAILED: Access Denied (Service: Amazon S3; Status Code: 403; "
+            "Error Code: AccessDenied; Request ID: ABC)"
+        )
+        result = AthenaQueryExecutor._explain_federation_failure(exc, "scldevds_abc123")
+        assert "s3:GetObject" in str(result)
+        assert "connectors/<connectorId>/spills/" in str(result)
+        # SSE-KMS with a tagged key is mandatory, so the hint must name both.
+        assert "coa:connector-spill" in str(result)
+        assert "kms:Decrypt" in str(result)
+
+    def test_the_original_message_is_preserved(self):
+        # Operators grep for Athena's own wording, and the request id is the only
+        # handle AWS support can act on — neither may be dropped.
+        exc = AthenaQueryError("Athena query FAILED: Access Denied (Service: Amazon S3; Request ID: XYZ789)")
+        assert "Request ID: XYZ789" in str(AthenaQueryExecutor._explain_federation_failure(exc, "cat"))
+
+    def test_glue_native_path_is_untouched(self):
+        # No catalog means no federation, so the connector hints would be wrong.
+        exc = AthenaQueryError("Athena query FAILED: Insufficient permissions to execute the query.")
+        assert AthenaQueryExecutor._explain_federation_failure(exc, "") is exc
+
+    def test_unrecognised_failures_pass_through_unchanged(self):
+        # Guessing a cause for a syntax error would send the reader to IAM for a
+        # problem that is in their query.
+        exc = AthenaQueryError("Athena query FAILED: SYNTAX_ERROR: line 1:8: mismatched input")
+        assert AthenaQueryExecutor._explain_federation_failure(exc, "scldevds_abc123") is exc
 
 
 @pytest.mark.unit
@@ -484,3 +639,257 @@ class TestInjectLimitTrailingComment:
     def test_existing_outer_limit_within_cap_unchanged(self):
         sql = "SELECT a FROM t LIMIT 5"
         assert AthenaQueryExecutor._inject_limit(sql, 100) == sql
+
+
+@pytest.mark.unit
+class TestCustomConnectorCatalogResolution:
+    """A custom-connector source resolves its own Lambda-backed catalog, and must
+    NOT be put through the Glue-crawler name rewrite."""
+
+    @staticmethod
+    def _wire(mock_boto, mock_res, item):
+        import json
+
+        mock_athena = MagicMock()
+        mock_boto.return_value = mock_athena
+        mock_table = MagicMock()
+        mock_res.return_value.Table.return_value = mock_table
+        mock_table.query.return_value = {"Items": [{"configuration": json.dumps({}), **item}]}
+        mock_table.get_item.return_value = {"Item": {"athenaWorkgroupName": f"{RESOURCE_PREFIX}-dev-ns-123"}}
+        mock_athena.start_query_execution.return_value = {"QueryExecutionId": "qid-conn"}
+        mock_athena.get_query_execution.return_value = {"QueryExecution": {"Status": {"State": "SUCCEEDED"}}}
+        mock_athena.get_query_results.return_value = {
+            "ResultSet": {
+                "ResultSetMetadata": {"ColumnInfo": [{"Name": "cnt"}]},
+                "Rows": [{"Data": [{"VarCharValue": "cnt"}]}, {"Data": [{"VarCharValue": "7"}]}],
+            }
+        }
+        return mock_athena
+
+    async def _execute(self, item, sql="SELECT COUNT(*) FROM orders"):
+        with patch("boto3.client") as mock_boto, patch("boto3.resource") as mock_res:
+            mock_athena = self._wire(mock_boto, mock_res, item)
+            executor = AthenaQueryExecutor(region="us-east-1", sources_table="coa-sources")
+            executor._sources._table_name = "coa-sources"
+        await executor.execute(sql, namespace="ns-123")
+        return mock_athena.start_query_execution.call_args[1]
+
+    async def test_uses_the_lambda_catalog_and_discovered_database(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "CUSTOM_CONNECTOR",
+                "athenaDataCatalogName": "coadevds_abc123",
+                "athenaDatabase": "widgets",
+                "discoveredSchemas": ["widgets"],
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Catalog"] == "coadevds_abc123"
+        assert kwargs["QueryExecutionContext"]["Database"] == "widgets"
+
+    # The rewrite strips a `{database}_` substring from every table name. For a
+    # custom connector that is not a no-op but a corruption: `widgets_orders` is a
+    # real table its connector exposes, and `orders` is one it has never heard of.
+    async def test_does_not_rewrite_a_table_name_that_starts_with_the_database(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "CUSTOM_CONNECTOR",
+                "athenaDataCatalogName": "coadevds_abc123",
+                "athenaDatabase": "widgets",
+                "discoveredSchemas": ["widgets"],
+                "queryable": True,
+            },
+            sql="SELECT COUNT(*) FROM widgets_orders",
+        )
+        assert "widgets_orders" in kwargs["QueryString"]
+
+    # A federated JDBC source still gets the rewrite it exists for.
+    async def test_a_federated_jdbc_source_is_still_rewritten(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "JDBC_DATABASE",
+                "athenaDataCatalogName": "coadevds_abc123",
+                "glueConnectionName": "coadevds_abc123",
+                "discoveredSchemas": ["public"],
+                "queryable": True,
+            },
+            sql="SELECT COUNT(*) FROM BIRD_PUBLIC_INCOME",
+        )
+        assert '"income"' in kwargs["QueryString"]
+
+    # Reachable when a scan discovers zero tables (an over-narrow filter, or a
+    # connector exposing none). Falling back to a hardcoded "public" would target
+    # a database that has nothing to do with this connector.
+    async def test_falls_back_to_the_configured_database_when_none_were_discovered(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "CUSTOM_CONNECTOR",
+                "athenaDataCatalogName": "coadevds_abc123",
+                "athenaDatabase": "widgets",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Database"] == "widgets"
+
+    # The `athenaCatalog` fallback added for nested Glue sources also reaches a
+    # custom-connector row that somehow lacks `athenaDataCatalogName` — create writes
+    # both attributes to the same derived name, so such a row resolves to the right
+    # Lambda catalog instead of falling through to the Glue-native path. What must
+    # NOT follow from taking that fallback is the crawled-name rewrite: this is still
+    # a custom connector, where the strip corrupts real table names.
+    async def test_a_custom_connector_without_the_system_attribute_resolves_and_is_not_rewritten(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "CUSTOM_CONNECTOR",
+                "athenaCatalog": "coadevds_abc123",
+                "athenaDatabase": "widgets",
+                "discoveredSchemas": ["widgets"],
+                "queryable": True,
+            },
+            sql="SELECT COUNT(*) FROM widgets_orders",
+        )
+        assert kwargs["QueryExecutionContext"]["Catalog"] == "coadevds_abc123"
+        assert kwargs["QueryExecutionContext"]["Database"] == "widgets"
+        assert "widgets_orders" in kwargs["QueryString"]
+
+    # ...while a federated JDBC source keeps its long-standing "public" default,
+    # where the Athena database is a PostgreSQL schema rather than the source's own
+    # database name.
+    async def test_a_federated_jdbc_source_keeps_the_public_default(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "JDBC_DATABASE",
+                "athenaDataCatalogName": "coadevds_abc123",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Database"] == "public"
+
+    # A JDBC source's configured `databaseName` is its DATABASE, while the federated
+    # catalog is keyed by SCHEMA — so the configured-database fallback that serves the
+    # other two kinds must not divert this one to `postgres`.
+    async def test_a_federated_jdbc_source_ignores_its_configured_database_name(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "JDBC_DATABASE",
+                "athenaDataCatalogName": "coadevds_abc123",
+                "athenaDatabase": "postgres",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Database"] == "public"
+
+
+@pytest.mark.unit
+class TestNestedGlueCatalogResolution:
+    """A native Glue source whose database lives in a non-root catalog is addressed
+    through that nested catalog, read from `athenaCatalog`.
+
+    It is NOT read from `athenaDataCatalogName`: that attribute is system-managed and
+    DELETE runs a Lake-Formation-admin teardown against the name it finds there, so a
+    caller-declared catalog is deliberately kept out of it (see
+    `database_routes._create_database_source`).
+    """
+
+    # Same DDB/Athena wiring as the custom-connector class; re-wrapped as a
+    # staticmethod because reading it off the other class yields the plain function.
+    _execute = TestCustomConnectorCatalogResolution._execute
+    _wire = staticmethod(TestCustomConnectorCatalogResolution._wire)
+
+    async def test_uses_the_declared_nested_catalog(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "GLUE_DATABASE",
+                "athenaCatalog": "customer_fed_cat",
+                "athenaDatabase": "sales",
+                "discoveredSchemas": ["sales"],
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Catalog"] == "customer_fed_cat"
+        assert kwargs["QueryExecutionContext"]["Database"] == "sales"
+
+    async def test_falls_back_to_the_configured_database_when_none_were_discovered(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "GLUE_DATABASE",
+                "athenaCatalog": "customer_fed_cat",
+                "athenaDatabase": "sales",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Catalog"] == "customer_fed_cat"
+        # Not "public" — that is the federated-JDBC default and names nothing here.
+        assert kwargs["QueryExecutionContext"]["Database"] == "sales"
+
+    # Every DATABASE source records `athenaCatalog`, and for most it is the root
+    # catalog. That means "no nested catalog", so it must not be sent as one — and
+    # the source must stay on the Glue-native path.
+    async def test_the_root_catalog_is_not_treated_as_a_nested_one(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "GLUE_DATABASE",
+                "athenaCatalog": "AwsDataCatalog",
+                "athenaDatabase": "sales",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Catalog"] == "AwsDataCatalog"
+        assert kwargs["QueryExecutionContext"]["Database"] == "sales"
+
+    # A source with no catalog information at all still resolves its database from
+    # the configuration blob, as it did before the nested-catalog branch existed.
+    async def test_a_source_with_no_catalog_falls_back_to_the_configured_database(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "GLUE_DATABASE",
+                "queryable": True,
+            }
+        )
+        assert kwargs["QueryExecutionContext"]["Catalog"] == "AwsDataCatalog"
+
+    # The rewrite strips a `{database}_` substring from every table name. A native
+    # Glue source's R2RML names are generated from Glue table metadata, so they
+    # already ARE the catalog's own names — there is no crawler-added prefix to
+    # strip, and stripping one corrupts any table whose name begins with its
+    # database name. `sales_orders` in database `sales` is a real table here, not a
+    # prefixed alias for `orders`.
+    async def test_a_nested_glue_source_is_not_rewritten(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "GLUE_DATABASE",
+                "athenaCatalog": "customer_fed_cat",
+                "athenaDatabase": "sales",
+                "discoveredSchemas": ["sales"],
+                "queryable": True,
+            },
+            sql="SELECT COUNT(*) FROM sales_orders",
+        )
+        assert "sales_orders" in kwargs["QueryString"]
+
+    # ...while a genuinely federated JDBC source keeps the rewrite, which is the path
+    # it was written for. Guards against fixing the above by disabling it everywhere.
+    async def test_a_federated_jdbc_source_still_gets_the_rewrite(self):
+        kwargs = await self._execute(
+            {
+                "sourceType": "DATABASE",
+                "sourceSubType": "JDBC_DATABASE",
+                "athenaDataCatalogName": "coadevds_abc123",
+                "discoveredSchemas": ["sales"],
+                "queryable": True,
+            },
+            sql="SELECT COUNT(*) FROM BIRD_SALES_ORDERS",
+        )
+        assert '"orders"' in kwargs["QueryString"]

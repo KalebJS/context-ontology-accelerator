@@ -3,13 +3,13 @@
 
 """Agentic NL-to-SQL strategy — the Tier-2 adapter for the NL→SQL agent.
 
-This is the production (AgentCore-runtime) counterpart of the local agentic
+This is the production (AgentCore-runtime) counterpart of the local deep-reasoning
 harness. Where :class:`NLtoSQLStrategy` does a fixed retrieve → generate →
 (correct) pipeline, this strategy delegates to :class:`SqlAgent`, which
 *iteratively* discovers the right tables (inspecting candidate schemas, following
 FKs) before writing SQL, then executes and self-corrects. On the multi-source
 Spider 2.0 regime that iterative schema inspection is the main lever over
-single-shot retrieval (it is the doc's "agentic" column, ~50% vs single-shot ~26%).
+single-shot retrieval (it was the doc's "agentic" column, ~50% vs single-shot ~26%).
 
 The strategy itself holds no prompt, no tools and no agent loop. It is the seam
 between the ``StructuredQueryStrategy`` protocol and the reusable pieces:
@@ -17,7 +17,8 @@ between the ``StructuredQueryStrategy`` protocol and the reusable pieces:
   * :class:`~coa_serve.tier2.tools.TableCatalog` — ``search_tables`` / ``get_table_schema``
   * :class:`~coa_serve.tier2.tools.SqlAuthoringTool` — ``generate_sql``
   * :class:`~coa_serve.tier2.tools.OntologyGraphTool` — ``explore_graph`` (opt-in:
-    ``SERVE_AGENTIC_GRAPH_TRAVERSAL`` deployment-wide, ``options.agenticGraphTraversal``
+    ``SERVE_DEEP_REASONING_GRAPH_TRAVERSAL`` deployment-wide,
+    ``options.deepReasoningGraphTraversal``
     per request, withheld by ``options.excludeTools = ["explore_graph"]``)
   * :class:`~coa_serve.sql_execution.SqlExecutionService` — firewall + executor
   * :class:`~coa_serve.agents.SqlAgent` — the prompt + the bounded tool-use loop
@@ -29,19 +30,18 @@ other consumer (an MCP tool, an HTTP route) without going through this strategy.
 Worst-case latency and token spend are bounded by the orchestrator's request
 deadline and the per-statement execution timeout, not by a turn count (see
 :mod:`coa_serve.agents.sql_agent`). It is an OPT-IN strategy: it runs only when
-the request pins ``options.strategy = "agentic"`` (see
+the request pins ``options.strategy = "deep-reasoning"`` (see
 ``StructuredQueryTier._strategies_for``), never as an implicit fallback.
 """
 
 from __future__ import annotations
-
-import os
 
 import structlog
 from coa_common import ontology_vector_index_name
 
 from ...agents import SqlAgent
 from ...clients.base import GraphClient, QueryExecutor, VectorClient
+from ...config import env_with_legacy_name
 from ...exceptions import AccessDeniedError
 from ...sql_execution import SqlExecutionService
 from ...step_ids import StepId
@@ -60,6 +60,9 @@ from .sql_generator import SQLGenerator
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_REGION = "us-east-1"
+
+# The truthy set every serve boolean flag accepts (matches config._guardrails_disabled).
+_TRUTHY = ("1", "true", "on", "yes")
 
 
 def _reported_confidence(outcome_confidence: float) -> float:
@@ -91,29 +94,36 @@ def _graph_traversal_enabled(options: dict | None = None) -> bool:
     Three toggles, in precedence order:
 
     1. ``options.excludeTools = ["explore_graph"]`` withholds it for one request
-       — the ablation key the Tier-3 agentic path already honours, and a veto so
-       it wins over the two enables below.
-    2. ``options.agenticGraphTraversal`` turns it on for one request, the same
+       — the ablation key the Tier-3 deep-reasoning path already honours, and a veto
+       so it wins over the two enables below.
+    2. ``options.deepReasoningGraphTraversal`` turns it on for one request, the same
        per-request shape as the FK-evidence, reranker and sample-row flags.
-    3. ``SERVE_AGENTIC_GRAPH_TRAVERSAL`` sets the deployment default (off).
+       ``options.agenticGraphTraversal`` is the accepted pre-rename spelling.
+    3. ``SERVE_DEEP_REASONING_GRAPH_TRAVERSAL`` sets the deployment default (off);
+       ``SERVE_AGENTIC_GRAPH_TRAVERSAL`` is still read.
 
-    Without a per-request enable, comparing "agentic" against "agentic +
-    traversal" needs two deployments, so every measured difference is confounded
+    Without a per-request enable, comparing "deep reasoning" against "deep reasoning
+    + traversal" needs two deployments, so every measured difference is confounded
     with whatever else changed between the two images. Off (by any route) the
     agent gets the same four tools and the same prompt as before, so that arm is
     unchanged.
     """
     if "explore_graph" in ((options or {}).get("excludeTools") or ()):
         return False
-    if options and str(options.get("agenticGraphTraversal", "")).strip().lower() in ("1", "true", "on", "yes"):
+    if options and any(
+        str(options.get(key, "")).strip().lower() in _TRUTHY
+        # Pre-rename spelling accepted so a benchmark script pinned to it keeps
+        # enabling the tool rather than silently measuring the no-traversal arm.
+        for key in ("deepReasoningGraphTraversal", "agenticGraphTraversal")
+    ):
         return True
-    return os.environ.get("SERVE_AGENTIC_GRAPH_TRAVERSAL", "").strip().lower() in ("1", "true", "on", "yes")
+    return env_with_legacy_name("SERVE_DEEP_REASONING_GRAPH_TRAVERSAL").strip().lower() in _TRUTHY
 
 
 class AgenticStrategy:
     """StructuredQueryStrategy: bounded tool-use agent over the serve clients."""
 
-    name: str = StrategyOption.AGENTIC
+    name: str = StrategyOption.DEEP_REASONING
 
     def __init__(
         self,
@@ -128,7 +138,7 @@ class AgenticStrategy:
         """Wire the strategy to the shared serve clients (see module docstring).
 
         ``graph_client`` is optional: it backs the opt-in ``explore_graph`` tool
-        (flag ``SERVE_AGENTIC_GRAPH_TRAVERSAL``). With it unset or the flag off, no
+        (flag ``SERVE_DEEP_REASONING_GRAPH_TRAVERSAL``). With it unset or the flag off, no
         graph tool is built and the agent runs exactly as it did before.
         """
         self._sql_generator = sql_generator
@@ -208,7 +218,7 @@ class AgenticStrategy:
             detail={
                 "rowCount": outcome.row_count,
                 "tables": outcome.tables,
-                "agentic": True,
+                "deepReasoning": True,
                 "confidence": confidence,
             },
             tool_used="bedrock",
@@ -218,7 +228,7 @@ class AgenticStrategy:
             rows=outcome.rows,
             columns=outcome.columns,
             confidence=confidence,
-            strategy_name=StrategyOption.AGENTIC,
+            strategy_name=StrategyOption.DEEP_REASONING,
             trace_steps=[],
             row_count=outcome.row_count,
             truncated=False,

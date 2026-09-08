@@ -8,11 +8,17 @@ import re
 
 import pytest
 from coa_common.constants import (
+    bucket_grants_namespace,
+    bucket_namespace_tag_key,
     canonical_col,
+    datasource_external_id,
     graphrag_chunk_index_name,
     graphrag_index_names,
+    namespace_tag_condition_patterns,
+    namespace_tag_key,
     ontology_artifact_s3_key,
     ontology_vector_index_name,
+    parse_namespace_tag,
     sql_ident,
     to_graphrag_tenant_id,
     validate_id,
@@ -271,3 +277,228 @@ class TestGraphragIndexNames:
         a = graphrag_index_names("550e8400-e29b-41d4-a716-446655440000")
         b = graphrag_index_names("f47ac10b-58cc-4372-a567-0e02b2c3d479")
         assert not set(a) & set(b)
+
+
+@pytest.mark.unit
+class TestDatasourceExternalId:
+    """The ExternalId presented when assuming a customer's cross-account role.
+
+    The cross-account role ARN is caller-supplied, so this value — derived from
+    the namespace, never from the request — is what binds an assume to the
+    namespace entitled to it.
+    """
+
+    def test_derives_from_prefix_and_namespace(self, monkeypatch):
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
+        assert datasource_external_id("ns-1") == "coa-dev-ns-1"
+
+    def test_distinct_namespaces_get_distinct_values(self, monkeypatch):
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
+        a = datasource_external_id("550e8400-e29b-41d4-a716-446655440000")
+        b = datasource_external_id("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+        assert a != b
+
+    def test_distinct_deployments_get_distinct_values(self, monkeypatch):
+        """Two deployments must not present the same value for one namespace id."""
+        ns = "550e8400-e29b-41d4-a716-446655440000"
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-dev-")
+        dev = datasource_external_id(ns)
+        monkeypatch.setenv("RESOURCE_PREFIX", "coa-prod-")
+        assert datasource_external_id(ns) != dev
+
+    def test_reads_prefix_per_call_not_at_import(self, monkeypatch):
+        """The value is read live so a redeploy under a new prefix takes effect."""
+        monkeypatch.setenv("RESOURCE_PREFIX", "a-")
+        assert datasource_external_id("ns") == "a-ns"
+        monkeypatch.setenv("RESOURCE_PREFIX", "b-")
+        assert datasource_external_id("ns") == "b-ns"
+
+
+_NS_A = "550e8400-e29b-41d4-a716-446655440000"
+_NS_B = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+_NS_C = "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+
+
+class TestNamespaceTagKey:
+    """The resource-tag key binding a secret to the namespaces entitled to it."""
+
+    def test_defaults_to_brand_when_unset(self, monkeypatch):
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        assert namespace_tag_key() == "coa:namespace"
+
+    def test_uses_deployment_prefix(self, monkeypatch):
+        monkeypatch.setenv("RESOURCE_TAG_PREFIX", "scl")
+        assert namespace_tag_key() == "scl:namespace"
+
+    def test_explicit_prefix_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("RESOURCE_TAG_PREFIX", "scl")
+        assert namespace_tag_key("acme") == "acme:namespace"
+
+    def test_empty_env_falls_back_to_brand(self, monkeypatch):
+        monkeypatch.setenv("RESOURCE_TAG_PREFIX", "")
+        assert namespace_tag_key() == "coa:namespace"
+
+    def test_trailing_hyphen_is_stripped(self, monkeypatch):
+        """Guards against `{prefix}-{env}-` style values reaching the key."""
+        monkeypatch.setenv("RESOURCE_TAG_PREFIX", "scl-")
+        assert namespace_tag_key() == "scl:namespace"
+
+    def test_distinct_deployments_get_distinct_keys(self, monkeypatch):
+        """Two deployments in one account must not share a binding."""
+        assert namespace_tag_key("scl") != namespace_tag_key("coa")
+
+
+class TestParseNamespaceTag:
+    """Tag values are written by whoever owns the secret, so parsing is strict."""
+
+    def test_single_namespace(self):
+        assert parse_namespace_tag(_NS_A) == [_NS_A]
+
+    def test_multiple_namespaces_preserve_order(self):
+        assert parse_namespace_tag(f"{_NS_A} {_NS_B} {_NS_C}") == [_NS_A, _NS_B, _NS_C]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "   ",
+            "not-a-uuid",
+            f"{_NS_A} not-a-uuid",
+            f"not-a-uuid {_NS_A}",
+            # v1 UUID — namespace ids are v4, and a relaxed check here would let a
+            # non-namespace identifier bind a secret.
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            _NS_A.upper(),
+        ],
+    )
+    def test_rejects_non_namespace_entries(self, value):
+        with pytest.raises(ValueError):
+            parse_namespace_tag(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            f" {_NS_A}",
+            f"{_NS_A} ",
+            f"{_NS_A}  {_NS_B}",
+            f"{_NS_A}\t{_NS_B}",
+            f"{_NS_A}\n{_NS_B}",
+        ],
+    )
+    def test_rejects_non_canonical_separators(self, value):
+        """Whitespace IAM cannot match must fail here, not silently at read time.
+
+        The IAM conditions match entries on a literal single space, so a value
+        this accepted but IAM could not would pass registration and then break
+        every read of the secret.
+        """
+        with pytest.raises(ValueError):
+            parse_namespace_tag(value)
+
+
+class TestNamespaceTagConditionPatterns:
+    """IAM has no word-boundary operator, so entry matching is enumerated."""
+
+    def _matches(self, pattern: str, value: str) -> bool:
+        """Evaluate one IAM StringLike pattern (``*`` = zero or more chars)."""
+        return re.fullmatch(".*".join(re.escape(p) for p in pattern.split("*")), value) is not None
+
+    def _binds(self, namespace_id: str, value: str) -> bool:
+        return any(self._matches(p, value) for p in namespace_tag_condition_patterns(namespace_id))
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            _NS_A,
+            f"{_NS_A} {_NS_B}",
+            f"{_NS_B} {_NS_A}",
+            f"{_NS_B} {_NS_A} {_NS_C}",
+        ],
+    )
+    def test_matches_every_entry_position(self, value):
+        assert self._binds(_NS_A, value)
+
+    def test_does_not_match_a_value_without_the_namespace(self):
+        assert not self._binds(_NS_A, f"{_NS_B} {_NS_C}")
+
+    def test_does_not_match_a_substring_occurrence(self):
+        """An id embedded in a longer token is not an entry."""
+        assert not self._binds(_NS_A, f"prefixed{_NS_A}suffix")
+        assert not self._binds(_NS_A, f"prefixed{_NS_A} {_NS_B}")
+
+    def test_every_pattern_a_parsed_value_can_produce_is_covered(self):
+        """Cross-check: whatever parse accepts, the IAM patterns must match."""
+        for value in (_NS_A, f"{_NS_A} {_NS_B}", f"{_NS_B} {_NS_A}", f"{_NS_B} {_NS_A} {_NS_C}"):
+            assert _NS_A in parse_namespace_tag(value)
+            assert self._binds(_NS_A, value)
+
+
+class TestBucketNamespaceTag:
+    """The tag a bucket owner sets to authorize namespaces to read that bucket.
+
+    Only a principal holding ``s3:TagResource`` on the bucket can set it, so the
+    tag is the evidence that the owner authorized the read. Every case that is not
+    an explicit, exact match must deny.
+    """
+
+    def test_key_derives_from_tag_prefix(self, monkeypatch):
+        monkeypatch.setenv("RESOURCE_TAG_PREFIX", "acme")
+        assert bucket_namespace_tag_key() == "acme:namespace"
+
+    def test_key_falls_back_to_brand(self, monkeypatch):
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        assert bucket_namespace_tag_key() == "coa:namespace"
+
+    def test_key_matches_the_platform_namespace_tag(self, monkeypatch):
+        """Same key as ``namespace_tag_key``, deliberately: one tag contract, one
+        implementation. The two uses differ in what the tag names — namespaces
+        entitled to a secret, versus namespaces a bucket owner authorized to read
+        it — not in the key."""
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        assert bucket_namespace_tag_key() == namespace_tag_key()
+
+    def test_grants_a_listed_namespace(self, monkeypatch):
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        tags = {"coa:namespace": "ns-a ns-b ns-c"}
+        assert bucket_grants_namespace(tags, "ns-a")
+        assert bucket_grants_namespace(tags, "ns-b")
+        assert bucket_grants_namespace(tags, "ns-c")
+
+    def test_denies_a_namespace_not_listed(self, monkeypatch):
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        assert not bucket_grants_namespace({"coa:namespace": "ns-a ns-b"}, "ns-z")
+
+    def test_tolerates_untidy_whitespace(self, monkeypatch):
+        """Hand-edited tags acquire stray spacing; that must not deny a member."""
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        tags = {"coa:namespace": "   ns-a    ns-b\tns-c  "}
+        assert bucket_grants_namespace(tags, "ns-a")
+        assert bucket_grants_namespace(tags, "ns-c")
+
+    def test_matches_whole_entries_not_substrings(self, monkeypatch):
+        """A namespace id must not be authorized by sharing a prefix with one."""
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        assert not bucket_grants_namespace({"coa:namespace": "ns-abc"}, "ns-a")
+        assert not bucket_grants_namespace({"coa:namespace": "ns-a"}, "ns-abc")
+
+    def test_denies_when_the_tag_is_absent(self, monkeypatch):
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        assert not bucket_grants_namespace({}, "ns-a")
+        assert not bucket_grants_namespace({"unrelated": "ns-a"}, "ns-a")
+
+    def test_denies_an_empty_tag_value(self, monkeypatch):
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        assert not bucket_grants_namespace({"coa:namespace": ""}, "ns-a")
+        assert not bucket_grants_namespace({"coa:namespace": "   "}, "ns-a")
+
+    def test_denies_an_empty_namespace_id(self, monkeypatch):
+        """An empty job namespace must never match, whatever the tag says."""
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        assert not bucket_grants_namespace({"coa:namespace": "ns-a"}, "")
+
+    def test_one_bucket_can_serve_several_namespaces(self, monkeypatch):
+        monkeypatch.delenv("RESOURCE_TAG_PREFIX", raising=False)
+        tags = {"coa:namespace": "550e8400-e29b-41d4-a716-446655440000 f47ac10b-58cc-4372-a567-0e02b2c3d479"}
+        assert bucket_grants_namespace(tags, "550e8400-e29b-41d4-a716-446655440000")
+        assert bucket_grants_namespace(tags, "f47ac10b-58cc-4372-a567-0e02b2c3d479")
+        assert not bucket_grants_namespace(tags, "00000000-0000-0000-0000-000000000000")

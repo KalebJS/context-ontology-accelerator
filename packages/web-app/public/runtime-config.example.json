@@ -3,5 +3,6 @@
   "authority": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EXAMPLE",
   "clientId": "EXAMPLE_CLIENT_ID",
   "apiEndpoint": "https://EXAMPLE.execute-api.us-east-1.amazonaws.com/prod",
-  "serveRuntimeArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-runtime"
+  "serveRuntimeArn": "arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/my-runtime",
+  "version": "0.1.0"
 }

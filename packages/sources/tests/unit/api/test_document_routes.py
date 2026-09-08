@@ -26,6 +26,7 @@ _NAMESPACE_ID = "550e8400-e29b-41d4-a716-446655440000"
 _SOURCE_ID = "src-doc-001"
 
 # Import sources_handler FIRST to resolve circular import, then document_routes
+from coa_common.constants import bucket_namespace_tag_key  # noqa: E402, I001
 import coa_sources.api.sources_handler  # noqa: F401, I001
 import coa_sources.api.document_routes as _docr  # noqa: E402, I001
 
@@ -80,6 +81,7 @@ def _make_doc_req(
     s3_prefixes=None,
     role_arn=None,
     extraction_config=None,
+    upload_id="11111111-1111-4111-8111-111111111111",
 ):
     req = MagicMock()
     req.name = name
@@ -87,6 +89,7 @@ def _make_doc_req(
     req.s3_prefixes = s3_prefixes or ["uploads/"]
     req.role_arn = role_arn
     req.extraction_config = extraction_config
+    req.upload_id = upload_id
     return req
 
 
@@ -113,6 +116,9 @@ class TestCreateDocumentSource:
         assert "sourceId" in body
         mock_dao.put.assert_called_once()
         mock_sqs.send_message.assert_called_once()
+        # Prefix is derived server-side from the uploadId, never taken from s3Prefixes.
+        put_item = mock_dao.put.call_args[0][0]
+        assert put_item["s3Prefixes"] == [f"{_NAMESPACE_ID}/raw/11111111-1111-4111-8111-111111111111/"]
 
     def test_create_s3_source_happy_path(self):
         mock_dao = MagicMock()
@@ -126,6 +132,7 @@ class TestCreateDocumentSource:
         )
 
         with (
+            patch(f"{_DOCR}.get_bucket_tags", return_value={bucket_namespace_tag_key(): _NAMESPACE_ID}),
             patch(f"{_DOCR}._get_dao", return_value=mock_dao),
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
@@ -212,6 +219,7 @@ class TestCreateDocumentSource:
         )
 
         with (
+            patch(f"{_DOCR}.get_bucket_tags", return_value={bucket_namespace_tag_key(): _NAMESPACE_ID}),
             patch(f"{_DOCR}._get_dao", return_value=mock_dao),
             patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
             patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
@@ -281,6 +289,75 @@ class TestCreateDocumentSource:
         put_item = mock_dao.put.call_args[0][0]
         assert put_item["sourceSubType"] == "LOCAL_UPLOAD"
         assert put_item["docSourceType"] == "upload"
+
+    def test_upload_ignores_caller_supplied_prefix(self):
+        """A caller-supplied s3Prefixes pointing at another
+        namespace is ignored; the stored and enqueued prefix is derived
+        server-side from the uploadId under the caller's own namespace."""
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        mock_sqs = MagicMock()
+
+        foreign = "99999999-9999-4999-8999-999999999999"
+        req = _make_doc_req(
+            s3_prefixes=[f"{foreign}/raw/"],
+            upload_id="22222222-2222-4222-8222-222222222222",
+        )
+
+        with (
+            patch(f"{_DOCR}._get_dao", return_value=mock_dao),
+            patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
+            patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
+        ):
+            status, _ = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+
+        assert status == 201
+        derived = f"{_NAMESPACE_ID}/raw/22222222-2222-4222-8222-222222222222/"
+        put_item = mock_dao.put.call_args[0][0]
+        assert put_item["s3Prefixes"] == [derived]
+        # The foreign namespace prefix must never reach the ingestion job.
+        sqs_body = json.loads(mock_sqs.send_message.call_args.kwargs["MessageBody"])
+        assert sqs_body["s3_prefixes"] == [derived]
+        assert foreign not in json.dumps(sqs_body)
+
+    def test_upload_missing_upload_id_returns_400(self):
+        req = _make_doc_req(upload_id=None)
+        status, body = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+        assert status == 400
+        assert "uploadId" in body["error"]
+
+    def test_upload_id_with_path_traversal_rejected(self):
+        """A malformed uploadId that could smuggle a path separator or traversal
+        segment is rejected, so the derived prefix can never escape the
+        namespace. Guards the validate_id() check from silent removal."""
+        for bad in ("../other-ns", "ns/path", "..", "ns\\path", "a b"):
+            req = _make_doc_req(upload_id=bad)
+            status, body = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+            assert status == 400, f"expected 400 for uploadId={bad!r}, got {status}"
+            assert "uploadId" in body["error"]
+
+    def test_s3_whitespace_only_prefix_filtered(self):
+        """Whitespace-only S3 prefixes are dropped rather than becoming an empty
+        (whole-bucket) prefix; real prefixes are kept."""
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        mock_sqs = MagicMock()
+        req = _make_doc_req(
+            name="s3-ws",
+            source_bucket_arn="arn:aws:s3:::my-bucket",
+            s3_prefixes=["  ", "data/"],
+        )
+        with (
+            patch(f"{_DOCR}._get_dao", return_value=mock_dao),
+            patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
+            patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/ingestion-queue"),
+            # S3 sources are authorized by the bucket's own namespace tag.
+            patch(f"{_DOCR}.get_bucket_tags", return_value={bucket_namespace_tag_key(): _NAMESPACE_ID}),
+        ):
+            status, _ = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+        assert status == 201
+        put_item = mock_dao.put.call_args[0][0]
+        assert put_item["s3Prefixes"] == ["data/"]
 
 
 # ===================================================================
@@ -362,6 +439,9 @@ class TestHandleUploadUrls:
         assert len(body["uploadUrls"]) == 1
         assert body["uploadUrls"][0]["filename"] == "doc.pdf"
         assert "uploadUrl" in body["uploadUrls"][0]
+        # Regression: never sign ContentLength — under SigV4 it forces the
+        # browser to PUT exactly that many bytes or get a 403 (see !1018).
+        assert "ContentLength" not in mock_s3.generate_presigned_url.call_args.kwargs["Params"]
 
     def test_upload_urls_multiple_files(self):
         mock_s3 = MagicMock()
@@ -471,3 +551,122 @@ class TestHandleUploadUrls:
         assert "s3Prefix" in body
         assert _NAMESPACE_ID in body["s3Prefix"]
         assert body["expiresIn"] == 900
+
+
+class TestBucketNamespaceAuthorizationAtCreate:
+    """An S3 source is persisted only when the bucket's own tag authorizes the
+    namespace. Checked here so the customer learns at create time rather than from
+    a SCAN_FAILED an hour later; the preprocessing handler re-checks independently.
+    """
+
+    def _req(self, **kw):
+        return _make_doc_req(
+            name=kw.pop("name", "s3-src"),
+            source_bucket_arn="arn:aws:s3:::customer-bucket",
+            s3_prefixes=["data/"],
+            **kw,
+        )
+
+    def test_untagged_bucket_returns_400_and_persists_nothing(self):
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        with (
+            patch(f"{_DOCR}._get_dao", return_value=mock_dao),
+            patch(f"{_DOCR}.get_bucket_tags", return_value={}),
+        ):
+            status, body = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+        assert status == 400
+        assert bucket_namespace_tag_key() in body["error"]
+        mock_dao.put.assert_not_called()
+
+    def test_bucket_tagged_for_another_namespace_returns_400(self):
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        with (
+            patch(f"{_DOCR}._get_dao", return_value=mock_dao),
+            patch(f"{_DOCR}.get_bucket_tags", return_value={bucket_namespace_tag_key(): "some-other-namespace"}),
+        ):
+            status, body = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+        assert status == 400
+        mock_dao.put.assert_not_called()
+
+    def test_unreadable_tags_fail_closed(self):
+        """We never persist a bucket we cannot prove is authorized."""
+        from botocore.exceptions import ClientError
+
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        with (
+            patch(f"{_DOCR}._get_dao", return_value=mock_dao),
+            patch(
+                f"{_DOCR}.get_bucket_tags",
+                side_effect=ClientError({"Error": {"Code": "AccessDenied"}}, "GetBucketTagging"),
+            ),
+        ):
+            status, body = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+        assert status == 400
+        assert "s3:GetBucketTagging" in body["error"]
+        mock_dao.put.assert_not_called()
+
+    def test_malformed_arn_returns_400_not_500(self):
+        """parse_bucket_from_arn raises rather than returning empty, so an unguarded
+        call would surface as a 500. The Smithy pattern normally rejects this
+        upstream; this must not depend on that."""
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        req = _make_doc_req(name="bad-arn", source_bucket_arn="not-an-arn", s3_prefixes=["data/"])
+        with patch(f"{_DOCR}._get_dao", return_value=mock_dao):
+            status, body = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+        assert status == 400
+        assert "malformed" in body["error"]
+        mock_dao.put.assert_not_called()
+
+    def test_transient_fault_returns_retryable_503_not_a_permissions_400(self):
+        """A DNS/TLS/timeout fault is not the caller's request being wrong — telling
+        them to fix a tag would misdirect them. Still fails closed."""
+        from botocore.exceptions import EndpointConnectionError
+
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        with (
+            patch(f"{_DOCR}._get_dao", return_value=mock_dao),
+            patch(
+                f"{_DOCR}.get_bucket_tags",
+                side_effect=EndpointConnectionError(endpoint_url="https://s3.amazonaws.com"),
+            ),
+        ):
+            status, body = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+        assert status == 503
+        assert "retry" in body["error"].lower()
+        assert "GetBucketTagging" not in body["error"]
+        mock_dao.put.assert_not_called()
+
+    def test_bucket_shared_across_namespaces_is_accepted(self):
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        mock_sqs = MagicMock()
+        shared = f"other-ns {_NAMESPACE_ID} third-ns"
+        with (
+            patch(f"{_DOCR}._get_dao", return_value=mock_dao),
+            patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
+            patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/q"),
+            patch(f"{_DOCR}.get_bucket_tags", return_value={bucket_namespace_tag_key(): shared}),
+        ):
+            status, _ = _parse(_docr._create_document_source(self._req(), _NAMESPACE_ID, _make_event()))
+        assert status == 201
+
+    def test_upload_sources_are_not_tag_checked(self):
+        """Upload sources read the platform's own bucket, which no customer tags."""
+        mock_dao = MagicMock()
+        mock_dao.query.return_value = MagicMock(items=[], last_evaluated_key=None)
+        mock_sqs = MagicMock()
+        req = _make_doc_req(name="upload-src", s3_prefixes=[f"{_NAMESPACE_ID}/raw/abc/"])
+        with (
+            patch(f"{_DOCR}._get_dao", return_value=mock_dao),
+            patch(f"{_DOCR}._get_sqs", return_value=mock_sqs),
+            patch(f"{_DOCR}._INGESTION_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/q"),
+            patch(f"{_DOCR}.get_bucket_tags") as mock_tags,
+        ):
+            status, _ = _parse(_docr._create_document_source(req, _NAMESPACE_ID, _make_event()))
+        assert status == 201
+        mock_tags.assert_not_called()

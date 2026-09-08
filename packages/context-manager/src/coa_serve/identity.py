@@ -74,6 +74,50 @@ def resolve_user_id(payload: dict, jwt_user_id: str, jwt_email: str) -> str:
     return profile.get("userId", "") if isinstance(profile, dict) else ""
 
 
+def resolve_principal(
+    profile: dict,
+    jwt_user_id: str,
+    jwt_email: str,
+    jwt_groups: list[str],
+) -> tuple[str, list[str]]:
+    """Resolve the authoritative ``(user_id, groups)`` for authorization.
+
+    The single source of truth for the JWT-over-body precedence that both the
+    namespace admission gate and the Tier-1/2/3 query path feed into
+    ``resolve_profile`` / Cedar. Extending :func:`resolve_user_id` to also return
+    ``groups`` keeps that trust decision in one place instead of duplicated inline.
+
+    Precedence (JWT is authoritative — the body is attacker-controlled for direct
+    Playground callers, so it must never override the AgentCore-validated token):
+
+    * ``user_id``: JWT sub → JWT email → ``profile.userId`` → ``profile.email``.
+    * ``groups``: the JWT groups whenever a JWT identity was extracted (even if the
+      list is empty — an authenticated caller with no groups is not the same as an
+      unauthenticated one); only with NO JWT at all do we fall back to
+      ``profile.groups``. A comma-joined string is normalized to a list, and any
+      other type is discarded — ``profile`` is attacker-controlled on the direct
+      path, so a malformed ``groups`` (int, dict, nested list) must not escape this
+      function and violate the ``list[str]`` contract its callers rely on.
+
+    Does NOT validate the token — AgentCore did that upstream (see module docstring).
+    """
+    profile = profile or {}
+    user_id = jwt_user_id or jwt_email or profile.get("userId") or profile.get("email") or ""
+    groups = jwt_groups if (jwt_user_id or jwt_email) else (profile.get("groups") or [])
+    if isinstance(groups, str):
+        groups = [g.strip() for g in groups.split(",") if g.strip()]
+    elif not isinstance(groups, list):
+        # Fail closed on a malformed body value: no groups rather than a value the
+        # grant resolver / Cedar would then have to interpret.
+        logger.warning("resolve_principal_groups_malformed", groups_type=type(groups).__name__)
+        groups = []
+    else:
+        # A list whose members are not strings would reach Cedar as-is; keep only
+        # the usable entries so the return type is honoured element-wise too.
+        groups = [g for g in groups if isinstance(g, str) and g.strip()]
+    return user_id, groups
+
+
 def display_principal(profile: dict | None) -> str | None:
     """Human-readable caller identity for response metadata and trace details.
 

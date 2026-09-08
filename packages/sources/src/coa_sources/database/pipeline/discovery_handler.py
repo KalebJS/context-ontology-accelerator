@@ -24,6 +24,7 @@ import time
 from datetime import UTC
 from typing import Any
 
+from coa_common.constants import datasource_external_id
 from coa_common.dao import DynamoDBDAO
 from coa_common.domain_models import DiscoveredMetadata
 from coa_control_plane_server.models.source_status import SourceStatus
@@ -33,8 +34,13 @@ from coa_sources.database.connectors import (
     MetadataConnector,
     get_connector,
 )
+from coa_sources.database.glue_ownership import (
+    GlueOwnershipError,
+    assert_namespace_may_catalog,
+)
 from coa_sources.database.metadata_writer import write_to_datazone
 from coa_sources.database.metrics import emit_metric
+from coa_sources.database.secret_binding import require_secret_namespace_binding
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -58,6 +64,11 @@ except ValueError:
         os.environ.get("MAX_TABLES_PER_SOURCE"),
     )
     MAX_TABLES_PER_SOURCE = 0
+
+# Cap on the failed-table names stored on the scan-job record. A DynamoDB item is
+# limited to 400 KB and this list is a signal, not an inventory — the count next
+# to it is always exact.
+_MAX_REPORTED_FAILED_TABLES = 50
 
 _ds_dao: DynamoDBDAO | None = None
 _scan_dao: DynamoDBDAO | None = None
@@ -132,6 +143,24 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         raw_config = item.get("configuration", "{}")
         config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
 
+        # Re-verify the credential secret still lists this namespace BEFORE
+        # anything reads it. Registration checks the ARN the caller supplies, but
+        # this handler takes the ARN from the stored row — so registration alone
+        # does not cover a row written before the binding rule existed, or a secret
+        # whose tag list changed after the source was registered. Without this
+        # re-check the discovery connector would fetch the secret and open a
+        # connection to the host in the same row, which is where the credentials
+        # leave the account.
+        #
+        # The IAM conditions on this role can only assert the tag EXISTS — a shared
+        # execution role has no per-request namespace identity — so the membership
+        # test has to happen here.
+        #
+        # Raises on refusal: the scan fails and the source goes SCAN_FAILED, which
+        # is the signal the operator needs (add this namespace to the secret's tag,
+        # then re-scan). Cross-account secrets are skipped — see secret_binding.
+        require_secret_namespace_binding(config.get("credentialSecretArn"), namespace_id, datasource_id)
+
         # Athena federation for JDBC sources is provisioned by a separate,
         # dedicated Step Functions step (FederationProvisionerFn) — kept out of
         # discovery so its Lake Formation admin privilege stays isolated.
@@ -140,7 +169,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         # are discovered directly via their driver dialect (see connectors/dialects.py).
         connector = get_connector(source_type)
         scan_start = time.monotonic()
-        metadata = _discover(connector, config, datasource_id, namespace_id, source_type)
+        metadata = _discover(connector, config, datasource_id, namespace_id, source_type, item)
 
         # Guardrail: fail fast on sources too large to register within the
         # Lambda timeout. Discovery is cheap; the per-table DataZone asset write
@@ -165,17 +194,36 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         )
 
         # Update scan job with discovery counts
+        scan_job_update: dict[str, Any] = {
+            "tablesDiscovered": len(metadata.tables),
+            "columnsDiscovered": metadata.total_columns,
+        }
+        # A connector that reads each table separately can lose a table without
+        # failing the scan, and that table reaches review with no columns, no
+        # comments, and no keys while enrichment backfills AI descriptions over
+        # the gap. Recording it on the scan job makes the degradation visible to
+        # the steward reviewing the result rather than only to whoever reads the
+        # logs. The names are capped because this is a signal, not an inventory —
+        # the count is the part that must always be right.
+        if metadata.failed_tables:
+            scan_job_update["tablesFailed"] = len(metadata.failed_tables)
+            scan_job_update["failedTables"] = metadata.failed_tables[:_MAX_REPORTED_FAILED_TABLES]
         _get_scan_dao().update(
             key=scan_job_key,
-            update_fields={
-                "tablesDiscovered": len(metadata.tables),
-                "columnsDiscovered": metadata.total_columns,
-            },
+            update_fields=scan_job_update,
             condition="attribute_exists(PK)",
         )
 
         emit_metric("ScanDuration", (time.monotonic() - scan_start) * 1000, "Milliseconds", SourceType=source_type)
         emit_metric("TablesDiscovered", len(metadata.tables), "Count", SourceType=source_type)
+        if metadata.failed_tables:
+            emit_metric("TablesFailed", len(metadata.failed_tables), "Count", SourceType=source_type)
+            logger.warning(
+                "Discovery completed with %d unreadable table(s) for %s: %s",
+                len(metadata.failed_tables),
+                datasource_id,
+                metadata.failed_tables[:_MAX_REPORTED_FAILED_TABLES],
+            )
 
         # Update source record with discovery results
         from datetime import datetime
@@ -235,22 +283,64 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     }
 
 
+def _external_id(namespace_id: str, config: dict) -> str:
+    """ExternalId COA presents when assuming a customer datasource-access role.
+
+    Derived from the requesting namespace, never read from the request. The role
+    ARN is caller-supplied, so this is what stops a caller with ``manageSource``
+    on one namespace from pointing a source at another tenant's
+    ``*-datasource-access-*`` role and reading its data (confused deputy).
+
+    The derivation itself lives in ``coa_common.constants.datasource_external_id``
+    because the control plane shows the same value to the customer for their trust
+    policy — the two must not drift.
+
+    LEGACY BRIDGE: sources onboarded before this control carry an operator-chosen
+    ``externalId`` in their stored configuration which their trust policy pins;
+    those keep working until the trust policy is migrated to the derived value.
+    New and updated sources never store the field (``database_routes`` strips it),
+    so a stored value can only predate this change. Delete this branch once no
+    stored configuration carries ``externalId``.
+    """
+    stored = str(config.get("externalId") or "").strip()
+    if stored:
+        logger.warning(
+            "datasource_legacy_external_id namespace_id=%s — migrate the role trust policy to the derived ExternalId",
+            namespace_id,
+        )
+        return stored
+    return datasource_external_id(namespace_id)
+
+
 def _discover(
     connector: MetadataConnector,
     config: dict,
     datasource_id: str,
     namespace_id: str,
     source_type: str = "",
+    source_item: dict[str, Any] | None = None,
 ) -> DiscoveredMetadata:
-    """Run discovery with the given connector and configuration."""
+    """Run discovery with the given connector and configuration.
+
+    ``source_item`` is the sources-table record. It carries attributes that are
+    not part of the stored ``configuration`` blob — notably the Athena data
+    catalog name a custom-connector source is registered under, which the control
+    plane derives at create time rather than accepting from the caller.
+    """
+    item = source_item or {}
     connector_config = {
         "database_name": config["databaseName"],
+        # Custom-connector (CUSTOM_CONNECTOR) sources only. Read from the source
+        # record, not from `config`: the name is derived by the control plane and
+        # stored as a top-level attribute, so it is not in the configuration blob
+        # the caller supplied. Other connectors ignore it.
+        "athena_data_catalog_name": item.get("athenaDataCatalogName", ""),
         "catalog_id": config.get("catalogId", ""),
         "region": config.get("region", AWS_REGION),
         "cross_account_role_arn": config.get("crossAccountRoleArn"),
-        # ExternalId for the cross-account role's trust policy (JDBC secret
-        # fetch + Glue metadata fetch). Optional; ignored when no role is set.
-        "external_id": config.get("externalId"),
+        # ExternalId presented on the cross-account assume (JDBC secret fetch +
+        # Glue metadata read). Derived from the namespace, NOT from the request.
+        "external_id": _external_id(namespace_id, config),
         # JDBC-only — passed through for schema-aware discovery (PG/Redshift).
         # Glue connector ignores these.
         "schema_filter": config.get("schemaFilter"),
@@ -268,6 +358,31 @@ def _discover(
         "data_source_id": datasource_id,
         "namespace_id": namespace_id,
     }
+
+    # Re-check the Glue target's namespace ownership here, not only at
+    # source-create. This is the last gate before the connector reads the Glue
+    # catalog, samples rows through Athena and — in strict-LF accounts — grants
+    # itself Lake Formation access, and it is reached from the stored
+    # configuration blob rather than from the checked request, so it holds even if
+    # a future write path stops going through the control-plane check.
+    #
+    # ``lf_self_grant_allowed`` carries the same verdict into the connector: the
+    # self-grant assumes a Lake Formation admin role, so it must be positively
+    # authorized rather than merely not-forbidden. See
+    # ``coa_sources.database.glue_ownership``.
+    if (source_item or {}).get("sourceSubType") == SourceSubType.GLUE_DATABASE:
+        try:
+            assert_namespace_may_catalog(
+                _get_ds_dao(),
+                namespace_id=namespace_id,
+                catalog_id=connector_config["catalog_id"],
+                database_name=connector_config["database_name"],
+                region=connector_config["region"],
+                cross_account_role_arn=connector_config["cross_account_role_arn"],
+            )
+        except GlueOwnershipError as exc:
+            raise RuntimeError(str(exc)) from exc
+        connector_config["lf_self_grant_allowed"] = True
 
     # Test connection first
     validate_start = time.monotonic()

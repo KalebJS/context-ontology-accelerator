@@ -20,4 +20,6 @@ export interface RuntimeConfig {
   readonly apiEndpoint?: string;
   /** AgentCore Runtime ARN for SSE streaming queries. Frontend constructs the invocations URL. */
   readonly serveRuntimeArn?: string;
+  /** Monorepo version (repo-root VERSION file) surfaced in the UI. E.g. "0.2.2". */
+  readonly version?: string;
 }

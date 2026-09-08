@@ -47,6 +47,7 @@ from coa_common.domain_models import (
 from .base import ConnectionCheck, ConnectionTestResult
 from .dialects import MAX_ENUM_DISTINCT, Dialect, get_dialect
 from .filters import compile_filter, split_glob_list
+from .sts_assume import assume_datasource_session
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,7 @@ class JdbcConnector:
                 config.get("region", "us-east-1"),
                 config.get("cross_account_role_arn"),
                 config.get("external_id"),
+                config.get("namespace_id", ""),
             )
             checks.append(
                 ConnectionCheck(check="auth", status="ok", message="Credentials retrieved from Secrets Manager")
@@ -220,6 +222,7 @@ class JdbcConnector:
             config.get("region", "us-east-1"),
             config.get("cross_account_role_arn"),
             config.get("external_id"),
+            config.get("namespace_id", ""),
         )
 
         try:
@@ -561,9 +564,10 @@ class JdbcConnector:
         region: str,
         cross_account_role_arn: str | None,
         external_id: str | None = None,
+        namespace_id: str = "",
     ) -> tuple[str, str]:
         """Retrieve username/password from Secrets Manager."""
-        session = self._get_session(region, cross_account_role_arn, external_id)
+        session = self._get_session(region, cross_account_role_arn, external_id, namespace_id)
         client = session.client("secretsmanager", region_name=region)
         try:
             resp = client.get_secret_value(SecretId=secret_arn)
@@ -586,22 +590,20 @@ class JdbcConnector:
         region: str,
         cross_account_role_arn: str | None,
         external_id: str | None = None,
+        namespace_id: str = "",
     ) -> boto3.Session:
-        """Get a boto3 session, optionally assuming a cross-account role."""
+        """Get a boto3 session, optionally assuming a cross-account role.
+
+        A cross-account assume REQUIRES ``external_id``; it is derived from the
+        requesting namespace by ``discovery_handler``, never taken from the API
+        request. See ``sts_assume.assume_datasource_session``.
+        """
         if cross_account_role_arn:
-            sts = boto3.client("sts", region_name=region)
-            assume_params: dict = {"RoleArn": cross_account_role_arn, "RoleSessionName": "coa-jdbc-connector"}
-            if external_id:
-                assume_params["ExternalId"] = external_id
-            try:
-                creds = sts.assume_role(**assume_params)["Credentials"]
-            except ClientError as e:
-                raise ValueError(f"Failed to assume role: {e.response['Error']['Code']}") from e
-            return boto3.Session(
-                aws_access_key_id=creds["AccessKeyId"],
-                aws_secret_access_key=creds["SecretAccessKey"],
-                aws_session_token=creds["SessionToken"],
-                region_name=region,
+            return assume_datasource_session(
+                role_arn=cross_account_role_arn,
+                external_id=external_id or "",
+                region=region,
+                session_name=f"coa-jdbc-{namespace_id}",
             )
         return boto3.Session(region_name=region)
 

@@ -78,6 +78,15 @@ aws secretsmanager put-resource-policy \
 add all three role ARNs to the key policy with `kms:Decrypt` (Context Ontology Accelerator's roles
 already scope their KMS use to `kms:ViaService = secretsmanager.*`).
 
+!!! note "No `<prefix>:namespace` tag needed cross-account"
+    The `<prefix>:namespace` tag that in-account credential secrets must carry (see
+    [Data Sources](sources.md)) does **not** apply to a cross-account secret —
+    the accelerator does not own the owner account and cannot tag its secrets.
+    Authorization here comes entirely from the secret's resource policy above
+    (and the KMS key policy). The registration-time namespace-binding check
+    detects that the secret ARN is in a different account and skips the tag
+    requirement accordingly.
+
 ### 3. Register the source
 
 Pass the owner-account secret ARN. No `crossAccountRoleArn` is needed when the
@@ -106,9 +115,48 @@ If you use `crossAccountRoleArn`, that role's trust policy must allow the
 `{prefix}-sources-db-connector` role to assume it, and its permissions must allow
 `secretsmanager:GetSecretValue` (and `kms:Decrypt` if applicable) on the secret.
 
+!!! important "The trust policy must require an ExternalId"
+    Every cross-account assume presents an **ExternalId derived from the namespace
+    the source belongs to**: `{prefix}-{env}-{namespaceId}`. The value is computed
+    server-side and is **not** accepted from the API request — that is what stops a
+    caller who can create sources in one namespace from pointing a source at a role
+    onboarded for a different namespace and reading its data.
+
+    Condition your trust policy on that exact value. An assume with no ExternalId
+    is denied by the platform's own IAM policy, so a role whose trust policy omits
+    the condition is assumable by any namespace in the deployment — the condition
+    is what makes the trust policy an authorization list.
+
+    ```json
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": [
+          "arn:aws:iam::<coa-account>:role/{prefix}-{env}-sources-db-connector",
+          "arn:aws:iam::<coa-account>:role/{prefix}-{env}-sources-db-enrichment-agent"
+        ]
+      },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": { "sts:ExternalId": "{prefix}-{env}-{namespaceId}" }
+      }
+    }
+    ```
+
+    `tests/cdk/lib/datasource-access-role.ts` builds this for you — pass
+    `-c namespace_id=<namespaceId>` and it derives the same value.
+
+    **Existing sources:** a source onboarded before this control keeps using the
+    `externalId` stored on its record, so nothing breaks. New sources ignore any
+    `externalId` in the request. To migrate one, update the trust policy to the
+    derived value above and re-register the source.
+
 !!! note "Role naming convention is a web-app-only guardrail"
     The example above sends `crossAccountRoleArn`. The role name must
     contain `{prefix}-datasource-access-` (e.g. `{prefix}-datasource-access-{customer}`).
+    This is enforced in the Connect Source form, not by the API — the backing
+    control is the platform's `sts:AssumeRole` policy, which only matches
+    `*-datasource-access-*` names.
 
 ---
 

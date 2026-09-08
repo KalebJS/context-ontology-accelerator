@@ -156,6 +156,14 @@ platform-only gate.
     runtime), which uses its own JWT authorizer. They remain in the schema and
     seed policies because that path shares the same role model.
 
+    On that path, `query` is evaluated by the **namespace admission gate** at the
+    top of the runtime entrypoint — before any dispatch, and for every
+    namespace-scoped surface (the Tier-1/2/3 query path plus the isolated
+    `translate` / `kbSearch` / `graphTraverse` operations) — and again at SQL
+    execution time for Tier 1/2 statements. The admission gate is what covers the
+    paths that generate no SQL (Tier-3 retrieval and synthesis). See the
+    [context-manager README](../../context-manager/README.md#cedar-authorization).
+
 ## Role × Action Access Matrix
 
 ✅ = Allowed | ❌ = Denied

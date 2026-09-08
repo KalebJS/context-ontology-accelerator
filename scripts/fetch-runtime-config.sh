@@ -68,6 +68,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_FILE="${SCRIPT_DIR}/../packages/web-app/public/runtime-config.json"
 
+# Repo-root VERSION is the single source of truth (see scripts/sync_version.py).
+# Carry it into local runtime-config so the UI version badge matches a deploy.
+VERSION="$(tr -d '[:space:]' < "${SCRIPT_DIR}/../VERSION" 2>/dev/null || true)"
+
 cat > "$OUT_FILE" <<EOF
 {
   "region": "${REGION}",
@@ -75,7 +79,8 @@ cat > "$OUT_FILE" <<EOF
   "authority": "${AUTHORITY}",
   "clientId": "${CLIENT_ID}",
   "apiEndpoint": "${API_ENDPOINT}",
-  "serveRuntimeArn": "${SERVE_RUNTIME_ARN}"
+  "serveRuntimeArn": "${SERVE_RUNTIME_ARN}",
+  "version": "${VERSION}"
 }
 EOF
 

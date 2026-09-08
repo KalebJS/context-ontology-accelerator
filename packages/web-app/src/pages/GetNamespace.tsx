@@ -375,17 +375,17 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
             navigate(`/namespaces/${namespaceId}/ontology`);
           }}
         >
-          {o.title || o.ontology_id}
+          {o.title || o.ontologyId}
         </Link>
       ),
     },
-    { id: "type", header: "Type", cell: (o) => o.ontology_type },
-    { id: "classes", header: "Classes", cell: (o) => o.class_count },
-    { id: "properties", header: "Properties", cell: (o) => o.property_count },
+    { id: "type", header: "Type", cell: (o) => o.ontologyType },
+    { id: "classes", header: "Classes", cell: (o) => o.classCount },
+    { id: "properties", header: "Properties", cell: (o) => o.propertyCount },
     {
       id: "created",
       header: "Created",
-      cell: (o) => formatDate(o.created_at),
+      cell: (o) => formatDate(o.createdAt),
     },
   ];
 
@@ -393,7 +393,7 @@ const OntologiesTab: React.FC<{ namespaceId: string }> = ({ namespaceId }) => {
     <Table<OntologyRecord>
       variant="container"
       items={items}
-      trackBy="ontology_id"
+      trackBy="ontologyId"
       loading={loading}
       loadingText="Loading ontologies…"
       columnDefinitions={columns}

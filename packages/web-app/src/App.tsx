@@ -58,6 +58,7 @@ import {
 import BreadcrumbGroup from "@cloudscape-design/components/breadcrumb-group";
 import { PlaygroundHelpPanel } from "./pages/PlaygroundHelpPanel";
 import { PageErrorBoundary } from "@components/PageErrorBoundary";
+import { VersionBadge } from "@components/VersionBadge";
 
 const DARK_MODE_KEY = "scl.darkMode";
 const DENSITY_KEY = "scl.densityCompact";
@@ -572,6 +573,7 @@ function AppShell() {
           </PageErrorBoundary>
         }
       />
+      <VersionBadge />
     </>
   );
 }
