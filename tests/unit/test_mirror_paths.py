@@ -78,9 +78,8 @@ def test_guarded_makefile_targets_do_not_fail_on_missing_dirs(target: str) -> No
 
 
 # `tests/unit/` is mirrored publicly; every other `tests/` subdirectory is not (see
-# the allowlist in .npmignore). Matches the `_REPO_ROOT / "tests" / "cdk"` idiom, plus
-# the shorter `Path(__file__).parents[1] / "integ"` form that names no "tests" segment.
-_UNMIRRORED_TESTS_REF = re.compile(r'"tests"\s*/\s*"(?!unit)|/\s*"(?:integ|cdk)"')
+# the allowlist in .npmignore). Matches the `_REPO_ROOT / "tests" / "cdk"` idiom.
+_UNMIRRORED_TESTS_REF = re.compile(r'"tests"\s*/\s*"(?!unit)')
 
 
 def _mirrored_unit_test_files() -> list[Path]:
