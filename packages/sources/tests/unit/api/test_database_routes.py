@@ -34,9 +34,32 @@ _SOURCE_ID = "src-db-001"
 # Import sources_handler FIRST to resolve circular import, then database_routes
 import coa_sources.api.sources_handler  # noqa: F401, I001
 import coa_sources.api.database_routes as _dr  # noqa: E402, I001
+from coa_sources.database import glue_ownership as _go  # noqa: E402, I001
 
 _DR = "coa_sources.api.database_routes"
 _SH = "coa_sources.api.sources_handler"
+
+
+def _source_puts(mock_dao) -> list[dict]:
+    """Every ``put`` that wrote a SOURCE row.
+
+    Creating a JDBC or custom-connector source also writes a ``GLUECAT#`` claim
+    recording which namespace owns the catalog it will be given, so ``put`` is no
+    longer called once and its last call is not the source row.
+    """
+    return [c.args[0] for c in mock_dao.put.call_args_list if str(c.args[0].get("SK", "")).startswith("SRC#")]
+
+
+def _source_put(mock_dao) -> dict:
+    """The single source row written by a create. Fails loudly if there wasn't one."""
+    puts = _source_puts(mock_dao)
+    assert len(puts) == 1, f"expected exactly one source row put, got {len(puts)}"
+    return puts[0]
+
+
+def _source_deletes(mock_dao) -> list[dict]:
+    """Every ``delete`` that removed a SOURCE row (i.e. not a catalog claim)."""
+    return [c.args[0] for c in mock_dao.delete.call_args_list if str(c.args[0].get("SK", "")).startswith("SRC#")]
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +75,14 @@ def reset_lazy_clients():
     sh._scan_dao = None
     sh._ns_dao = None
     nc._ns_dao = None
-    with patch("coa_sources.api.database_routes.adjust_namespace_source_count"):
+    # The credential-secret → namespace binding check (DescribeSecret + tag
+    # match) is exercised in test_credential_secret_binding.py. Stub it to a pass
+    # here so the create-source tests can assert routing/metadata without setting
+    # up a tagged secret.
+    with (
+        patch("coa_sources.api.database_routes.adjust_namespace_source_count"),
+        patch("coa_sources.api.database_routes._validate_credential_secret_binding", return_value=None),
+    ):
         yield
     sh._dao = None
     sh._sqs = None
@@ -71,7 +101,16 @@ def _make_glue_db_req(athena_data_catalog_name=None, execution_engine=None, reds
     req = MagicMock()
     req.name = "my-glue-db"
     req.glue_configuration = MagicMock()
-    req.glue_configuration.to_dict.return_value = {"databaseName": "mydb", "region": "us-east-1"}
+    # Mirror the real GlueConfiguration.to_dict(), which carries every member the
+    # caller set — including athenaDataCatalogName. The blob is the only place a
+    # caller's declared catalog is echoed back on GetSource now that it is kept out
+    # of the system-managed top-level attribute, so a to_dict() that dropped it
+    # would hide that regression rather than catch it.
+    req.glue_configuration.to_dict.return_value = {
+        "databaseName": "mydb",
+        "region": "us-east-1",
+        **({"athenaDataCatalogName": athena_data_catalog_name} if athena_data_catalog_name else {}),
+    }
     req.glue_configuration.database_name = "mydb"
     req.glue_configuration.region = "us-east-1"
     req.glue_configuration.catalog_id = "123456789012"
@@ -82,6 +121,7 @@ def _make_glue_db_req(athena_data_catalog_name=None, execution_engine=None, reds
     req.glue_configuration.execution_engine = execution_engine
     req.glue_configuration.redshift_workgroup = redshift_workgroup
     req.jdbc_configuration = None
+    req.custom_connector_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -93,6 +133,7 @@ def _make_jdbc_db_req(engine="POSTGRESQL"):
     req.jdbc_configuration.engine = engine
     req.jdbc_configuration.to_dict.return_value = {"jdbcUrl": "jdbc:mysql://host/db"}
     req.glue_configuration = None
+    req.custom_connector_configuration = None
     req.metadata_enrichment_enabled = None
     return req
 
@@ -120,13 +161,19 @@ class TestCreateDatabaseSource:
         assert "sourceId" in body
         assert body["status"] == "REGISTERED"
         assert "scanJobId" in body
-        mock_dao.put.assert_called_once()
+        assert len(_source_puts(mock_dao)) == 1
         mock_sqs.send_message.assert_called_once()
 
-    def test_create_glue_source_persists_athena_data_catalog_name(self):
-        """Glue federated-backed sources record the user-supplied catalog name
-        at the top level so the query layer can resolve it (record-only flow —
-        no federation is provisioned for Glue sources)."""
+    def test_create_glue_source_records_the_declared_catalog_without_system_authority(self):
+        """A caller's nested catalog must reach the query layer via `athenaCatalog`
+        and NOT via `athenaDataCatalogName`.
+
+        `athenaDataCatalogName` is system-managed: DELETE derives the name it expects
+        there and runs a Lake-Formation-admin teardown against it under IAM scoped to
+        the whole deployment's `{prefix}ds_*` window, not to one namespace. Writing a
+        caller's value there once let a steward name another namespace's federated
+        catalog and have their own delete tear it down.
+        """
         mock_dao = MagicMock()
 
         with (
@@ -136,8 +183,11 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(_make_glue_db_req(athena_data_catalog_name="my_cat"), _NAMESPACE_ID)
 
-        put_item = mock_dao.put.call_args[0][0]
-        assert put_item["athenaDataCatalogName"] == "my_cat"
+        put_item = _source_put(mock_dao)
+        assert put_item["athenaCatalog"] == "my_cat"
+        assert "athenaDataCatalogName" not in put_item
+        # Still round-trips to the client, out of the configuration blob.
+        assert json.loads(put_item["configuration"])["athenaDataCatalogName"] == "my_cat"
 
     def test_create_glue_source_persists_query_metadata(self):
         mock_dao = MagicMock()
@@ -148,7 +198,7 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(_make_glue_db_req(), _NAMESPACE_ID)
 
-        put_item = mock_dao.put.call_args[0][0]
+        put_item = _source_put(mock_dao)
         assert put_item["athenaCatalog"] == "AwsDataCatalog"
         assert put_item["athenaDatabase"] == "mydb"
         assert put_item["region"] == "us-east-1"
@@ -165,7 +215,7 @@ class TestCreateDatabaseSource:
             patch(f"{_DR}._get_sqs", return_value=MagicMock()),
         ):
             _dr._create_database_source(req, _NAMESPACE_ID)
-        assert mock_dao.put.call_args[0][0]["athenaCatalog"] == "salescat"
+        assert _source_put(mock_dao)["athenaCatalog"] == "salescat"
 
     def test_glue_explicit_athena_catalog_name_wins(self):
         mock_dao = MagicMock()
@@ -177,7 +227,7 @@ class TestCreateDatabaseSource:
             patch(f"{_DR}._get_sqs", return_value=MagicMock()),
         ):
             _dr._create_database_source(req, _NAMESPACE_ID)
-        assert mock_dao.put.call_args[0][0]["athenaCatalog"] == "explicit_cat"
+        assert _source_put(mock_dao)["athenaCatalog"] == "explicit_cat"
 
     def test_create_jdbc_source_persists_query_metadata(self):
         mock_dao = MagicMock()
@@ -188,7 +238,7 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(_make_jdbc_db_req(), _NAMESPACE_ID)
 
-        put_item = mock_dao.put.call_args[0][0]
+        put_item = _source_put(mock_dao)
         assert put_item["athenaCatalog"] == "AwsDataCatalog"
         assert put_item["queryable"] is False
         assert put_item["region"]  # deployment region
@@ -207,7 +257,7 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(_make_jdbc_db_req(engine="MYSQL"), _NAMESPACE_ID)
 
-        assert mock_dao.put.call_args[0][0]["queryEngine"] == "JDBC"
+        assert _source_put(mock_dao)["queryEngine"] == "JDBC"
 
     def test_create_jdbc_source_sqlserver_uses_direct_jdbc(self):
         # SQL Server now has a direct-JDBC serve adapter (python-tds).
@@ -219,7 +269,7 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(_make_jdbc_db_req(engine="SQLSERVER"), _NAMESPACE_ID)
 
-        assert mock_dao.put.call_args[0][0]["queryEngine"] == "JDBC"
+        assert _source_put(mock_dao)["queryEngine"] == "JDBC"
 
     def test_create_jdbc_source_without_direct_dialect_uses_athena(self):
         # An engine with no direct dialect yet (e.g. Snowflake) must fall back to
@@ -232,7 +282,7 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(_make_jdbc_db_req(engine="SNOWFLAKE"), _NAMESPACE_ID)
 
-        assert mock_dao.put.call_args[0][0]["queryEngine"] == "ATHENA"
+        assert _source_put(mock_dao)["queryEngine"] == "ATHENA"
 
     def test_create_glue_source_omits_catalog_name_when_absent(self):
         mock_dao = MagicMock()
@@ -244,7 +294,7 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(_make_glue_db_req(), _NAMESPACE_ID)
 
-        assert "athenaDataCatalogName" not in mock_dao.put.call_args[0][0]
+        assert "athenaDataCatalogName" not in _source_put(mock_dao)
 
     # ── Redshift execution engine for Glue sources ──────────────
 
@@ -258,7 +308,7 @@ class TestCreateDatabaseSource:
             patch(f"{_DR}._get_sqs", return_value=MagicMock()),
         ):
             _dr._create_database_source(_make_glue_db_req(), _NAMESPACE_ID)
-        put_item = mock_dao.put.call_args[0][0]
+        put_item = _source_put(mock_dao)
         assert put_item["queryEngine"] == "ATHENA"
         assert "redshiftWorkgroup" not in put_item
 
@@ -272,7 +322,7 @@ class TestCreateDatabaseSource:
             patch(f"{_DR}._get_sqs", return_value=MagicMock()),
         ):
             _dr._create_database_source(req, _NAMESPACE_ID)
-        put_item = mock_dao.put.call_args[0][0]
+        put_item = _source_put(mock_dao)
         assert put_item["queryEngine"] == "REDSHIFT"
         assert put_item["redshiftWorkgroup"] == "my-wg"
 
@@ -289,7 +339,7 @@ class TestCreateDatabaseSource:
             patch(f"{_DR}._get_sqs", return_value=MagicMock()),
         ):
             _dr._create_database_source(req, _NAMESPACE_ID)
-        assert mock_dao.put.call_args[0][0]["queryEngine"] == "REDSHIFT"
+        assert _source_put(mock_dao)["queryEngine"] == "REDSHIFT"
 
     def test_glue_redshift_engine_without_workgroup_rejected(self):
         """A Redshift-engine Glue source with no workgroup is a 400 — the backend
@@ -318,7 +368,7 @@ class TestCreateDatabaseSource:
             patch(f"{_DR}._get_sqs", return_value=MagicMock()),
         ):
             _dr._create_database_source(req, _NAMESPACE_ID)
-        put_item = mock_dao.put.call_args[0][0]
+        put_item = _source_put(mock_dao)
         assert put_item["queryEngine"] == "ATHENA"
         assert "redshiftWorkgroup" not in put_item
 
@@ -332,7 +382,7 @@ class TestCreateDatabaseSource:
             patch(f"{_DR}._get_sqs", return_value=MagicMock()),
         ):
             _dr._create_database_source(_make_jdbc_db_req(engine="REDSHIFT"), _NAMESPACE_ID)
-        put_item = mock_dao.put.call_args[0][0]
+        put_item = _source_put(mock_dao)
         assert put_item["queryEngine"] == "JDBC"
         assert "redshiftWorkgroup" not in put_item
 
@@ -350,8 +400,8 @@ class TestCreateDatabaseSource:
 
         assert status == 202
         assert "sourceId" in body
-        mock_dao.put.assert_called_once()
-        put_item = mock_dao.put.call_args[0][0]
+        assert len(_source_puts(mock_dao)) == 1
+        put_item = _source_put(mock_dao)
         assert put_item["sourceSubType"] == "JDBC_DATABASE"
 
     def test_create_omits_metadata_enrichment_when_unset(self):
@@ -366,7 +416,7 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(_make_glue_db_req(), _NAMESPACE_ID)
 
-        assert "metadataEnrichmentEnabled" not in mock_dao.put.call_args[0][0]
+        assert "metadataEnrichmentEnabled" not in _source_put(mock_dao)
 
     def test_create_persists_metadata_enrichment_disabled(self):
         mock_dao = MagicMock()
@@ -379,7 +429,7 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(req, _NAMESPACE_ID)
 
-        assert mock_dao.put.call_args[0][0]["metadataEnrichmentEnabled"] is False
+        assert _source_put(mock_dao)["metadataEnrichmentEnabled"] is False
 
     def test_create_persists_metadata_enrichment_enabled_explicitly(self):
         mock_dao = MagicMock()
@@ -392,7 +442,7 @@ class TestCreateDatabaseSource:
         ):
             _dr._create_database_source(req, _NAMESPACE_ID)
 
-        assert mock_dao.put.call_args[0][0]["metadataEnrichmentEnabled"] is True
+        assert _source_put(mock_dao)["metadataEnrichmentEnabled"] is True
 
     def test_create_blank_name_returns_400(self):
         req = _make_glue_db_req()
@@ -441,7 +491,7 @@ class TestCreateDatabaseSource:
         assert status == 500
         # Atomic rollback: the partial source + scan-job records are removed,
         # and the source is NOT mislabeled SCAN_FAILED.
-        mock_dao.delete.assert_called_once()
+        assert len(_source_deletes(mock_dao)) == 1
         mock_scan_dao.delete.assert_called_once()
         assert not any(c.args and c.args[1].get("status") == "SCAN_FAILED" for c in mock_dao.update.call_args_list)
 
@@ -471,14 +521,419 @@ class TestCreateDatabaseSource:
             status, body = _parse(_dr._create_database_source(_make_glue_db_req(), _NAMESPACE_ID))
 
         assert status == 202
-        put_item = mock_dao.put.call_args[0][0]
+        put_item = _source_put(mock_dao)
         assert put_item["sourceType"] == "DATABASE"
         assert put_item["namespaceId"] == _NAMESPACE_ID
 
 
 # ===================================================================
+# _create_database_source — CUSTOM_CONNECTOR (custom connector)
+# ===================================================================
+
+
+def _make_athena_db_req(
+    metadata_arn="arn:aws:lambda:us-east-1:111122223333:function:acme-connector",
+    database_name="widgets",
+):
+    req = MagicMock()
+    req.name = "my-connector"
+    req.glue_configuration = None
+    req.jdbc_configuration = None
+    req.custom_connector_configuration = MagicMock()
+    req.custom_connector_configuration.connector_function_arn = metadata_arn
+    req.custom_connector_configuration.database_name = database_name
+    req.custom_connector_configuration.to_dict.return_value = {
+        "connectorFunctionArn": metadata_arn,
+        "databaseName": database_name,
+    }
+    req.metadata_enrichment_enabled = None
+    return req
+
+
+@pytest.mark.unit
+class TestCreateCustomConnectorSource:
+    """Creating a source backed by a customer-authored Athena federation
+    connector. The load-bearing parts are the ORDER (DynamoDB row before the
+    catalog, because every delete path keys off the row) and the rollbacks, since
+    a catalog nobody has a record of cannot be found again."""
+
+    def _create(self, req, *, register=None, delete=None, sqs=None, dao=None):
+        mock_dao = dao or MagicMock()
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_DR}._get_sqs", return_value=sqs or MagicMock()),
+            patch(f"{_DR}.register_lambda_catalog", register or MagicMock()) as reg,
+            patch(f"{_DR}.delete_lambda_catalog", delete or MagicMock()) as dele,
+        ):
+            status, body = _parse(_dr._create_database_source(req, _NAMESPACE_ID))
+        return status, body, mock_dao, reg, dele
+
+    def test_derives_the_custom_connector_sub_type(self):
+        status, _, mock_dao, _, _ = self._create(_make_athena_db_req())
+        assert status == 202
+        assert _source_put(mock_dao)["sourceSubType"] == "CUSTOM_CONNECTOR"
+
+    def test_the_catalog_name_is_derived_from_the_source_id(self):
+        """Not caller-supplied, and not arbitrary. Two properties rest on this: a
+        1:1 source-to-catalog mapping (so teardown removes only this source's
+        catalog), and the `{sanitizedPrefix}ds_*` shape the IAM policy is scoped
+        to — any other derivation fails closed as AccessDenied."""
+        from coa_sources.database.connectors.athena_catalog import derive_catalog_name
+
+        _, _, mock_dao, reg, _ = self._create(_make_athena_db_req())
+        item = _source_put(mock_dao)
+        expected = derive_catalog_name(item["sourceId"])
+        assert item["athenaDataCatalogName"] == expected
+        assert reg.call_args.kwargs["catalog_name"] == expected
+
+    def test_persists_the_query_layer_attributes(self):
+        _, _, mock_dao, _, _ = self._create(_make_athena_db_req(database_name="sales"))
+        item = _source_put(mock_dao)
+        # queryEngine is ATHENA because there is no direct adapter for an
+        # arbitrary customer connector.
+        assert item["queryEngine"] == "ATHENA"
+        # Serve routes on the PRESENCE of athenaDataCatalogName, so this is what
+        # makes the source addressable at all.
+        assert item["athenaDataCatalogName"]
+        assert item["athenaCatalog"] == item["athenaDataCatalogName"]
+        # Recorded up front rather than waiting for discovery, so serve has the
+        # right namespace even when a scan discovers zero tables.
+        assert item["athenaDatabase"] == "sales"
+        assert item["queryable"] is False
+        assert item["region"] == _dr._AWS_REGION
+
+    def test_registers_the_catalog_with_the_derived_name(self):
+        _, _, mock_dao, reg, _ = self._create(_make_athena_db_req())
+        item = _source_put(mock_dao)
+        assert reg.call_args.kwargs["catalog_name"] == item["athenaDataCatalogName"]
+        assert reg.call_args.kwargs["connector_function_arn"].endswith("acme-connector")
+        # One ARN reaches the catalog registrar, because the shape models one. A
+        # `record_function_arn` kwarg would not be ignored here — it no longer exists.
+        assert "record_function_arn" not in reg.call_args.kwargs
+
+    # A catalog registered before the row would be orphaned: every delete path
+    # finds the catalog through the source record.
+    def test_registers_the_catalog_after_the_dynamodb_put(self):
+        order: list[str] = []
+        mock_dao = MagicMock()
+        # The catalog claim is written between the two and is not what this
+        # orders, so record only the source row. `**_` because the claim write
+        # passes `auto_timestamp=False` (it must stay out of the ByNamespace GSI).
+        mock_dao.put.side_effect = lambda item, **_: (
+            order.append("put") if str(item.get("SK", "")).startswith("SRC#") else None
+        )
+        self._create(
+            _make_athena_db_req(),
+            dao=mock_dao,
+            register=MagicMock(side_effect=lambda **kw: order.append("register")),
+        )
+        assert order == ["put", "register"]
+
+    def test_rolls_back_the_row_when_registration_fails(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        status, _, mock_dao, _, _ = self._create(
+            _make_athena_db_req(),
+            register=MagicMock(side_effect=AthenaCatalogError("nope")),
+        )
+        assert status == 500
+        # A source with no catalog could never be discovered, so it must not
+        # survive the failed create.
+        assert len(_source_deletes(mock_dao)) == 1
+
+    # A read timeout after Athena committed the create is indistinguishable from a
+    # failure, so the catalog may exist — and the row that names it is about to go.
+    def test_deletes_the_catalog_when_registration_reports_failure(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        _, _, mock_dao, _, dele = self._create(
+            _make_athena_db_req(),
+            register=MagicMock(side_effect=AthenaCatalogError("timeout")),
+        )
+        item = _source_put(mock_dao)
+        dele.assert_called_once_with(catalog_name=item["athenaDataCatalogName"])
+
+    # ...but NOT on a conflict: that catalog demonstrably belongs to something
+    # else, and deleting it would destroy a resource we did not create.
+    def test_does_not_delete_a_conflicting_catalog(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogConflictError
+
+        status, _, mock_dao, _, dele = self._create(
+            _make_athena_db_req(),
+            register=MagicMock(side_effect=AthenaCatalogConflictError("someone else's")),
+        )
+        assert status == 500
+        dele.assert_not_called()
+        assert len(_source_deletes(mock_dao)) == 1
+
+    # REGISTERED is an active status, so a row that survives a failed rollback is
+    # undeletable (409), un-rescannable, and blocks namespace deletion — and no
+    # reaper sweeps it, because no Step Functions execution ever started.
+    def test_marks_the_source_recoverable_when_the_rollback_delete_fails(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        mock_dao = MagicMock()
+        mock_dao.delete.side_effect = ClientError({"Error": {"Code": "ThrottlingException"}}, "DeleteItem")
+        status, _, _, _, _ = self._create(
+            _make_athena_db_req(),
+            dao=mock_dao,
+            register=MagicMock(side_effect=AthenaCatalogError("nope")),
+        )
+        assert status == 500
+        # SCAN_FAILED is what makes it both deletable and re-scannable again.
+        assert mock_dao.update.call_args.kwargs["update_fields"]["status"] == "SCAN_FAILED"
+
+    def test_registration_failure_enqueues_no_scan(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        mock_sqs = MagicMock()
+        self._create(
+            _make_athena_db_req(),
+            sqs=mock_sqs,
+            register=MagicMock(side_effect=AthenaCatalogError("nope")),
+        )
+        mock_sqs.send_message.assert_not_called()
+
+    # The row is about to be removed, and it is the only handle on the catalog.
+    def test_deletes_the_catalog_when_the_scan_enqueue_fails(self):
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "SendMessage")
+        status, _, mock_dao, _, dele = self._create(_make_athena_db_req(), sqs=mock_sqs)
+        assert status == 500
+        item = _source_put(mock_dao)
+        dele.assert_called_once_with(catalog_name=item["athenaDataCatalogName"])
+
+    # Failing the rollback must not turn a retryable create failure into an
+    # unretryable one, so the 500 is still returned.
+    def test_a_failed_rollback_delete_still_returns_500(self):
+        from coa_sources.database.connectors.athena_catalog import AthenaCatalogError
+
+        mock_sqs = MagicMock()
+        mock_sqs.send_message.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "SendMessage")
+        status, _, _, _, _ = self._create(
+            _make_athena_db_req(),
+            sqs=mock_sqs,
+            delete=MagicMock(side_effect=AthenaCatalogError("still there")),
+        )
+        assert status == 500
+
+    # A cross-region connector registers fine — registration only records a
+    # name → ARN mapping — and then fails every statement with an AccessDenied
+    # that says nothing about the region, because the IAM grant is region-pinned.
+    def test_rejects_a_connector_arn_in_another_region(self):
+        req = _make_athena_db_req(metadata_arn="arn:aws:lambda:eu-west-1:111122223333:function:acme")
+        status, body, _, reg, _ = self._create(req)
+        assert status == 400
+        assert "eu-west-1" in body["error"]
+        reg.assert_not_called()
+
+    # The config member selects the sub-type, so two of them is ambiguous rather
+    # than additive — silently preferring one would persist a record whose stored
+    # blob does not match its sourceSubType.
+    def test_rejects_more_than_one_configuration(self):
+        req = _make_athena_db_req()
+        req.jdbc_configuration = MagicMock()
+        status, body, _, reg, _ = self._create(req)
+        assert status == 400
+        assert "exactly one" in body["error"]
+        reg.assert_not_called()
+
+    def test_error_names_custom_connector_configuration_when_no_config_is_given(self):
+        req = _make_athena_db_req()
+        req.custom_connector_configuration = None
+        status, body, _, _, _ = self._create(req)
+        assert status == 400
+        assert "customConnectorConfiguration" in body["error"]
+
+    # Glue and JDBC sources must not acquire a catalog registration.
+    def test_a_glue_source_registers_no_catalog(self):
+        _, _, mock_dao, reg, _ = self._create(_make_glue_db_req())
+        reg.assert_not_called()
+        assert "athenaDataCatalogName" not in _source_put(mock_dao)
+
+    def test_a_jdbc_source_registers_no_catalog(self):
+        _, _, mock_dao, reg, _ = self._create(_make_jdbc_db_req())
+        reg.assert_not_called()
+        # Nor the attribute: a JDBC source's federated catalog does not exist until
+        # the post-discovery federation step provisions it, and that step is what
+        # writes the name. A value present at create could only be a caller's, and
+        # DELETE reads this attribute to aim a Lake-Formation-admin teardown.
+        assert "athenaDataCatalogName" not in mock_dao.put.call_args[0][0]
+
+
+# ===================================================================
 # _create_database_source — namespace sourceCount maintenance
 # ===================================================================
+
+
+@pytest.mark.unit
+class TestExternalIdIsNotCallerControlled:
+    """A caller must not be able to choose the ExternalId used on the assume.
+
+    The role ARN is caller-supplied; the ExternalId is derived from the namespace
+    at discovery time (``discovery_handler._external_id``). If the API persisted a
+    caller-supplied value, the caller would get back control of the only thing
+    binding an assume to its namespace, and could read another tenant's source.
+    """
+
+    @staticmethod
+    def _stored_config(mock_dao):
+        args, kwargs = mock_dao.put.call_args.args, mock_dao.put.call_args.kwargs
+        item = args[0] if args else kwargs["item"]
+        return json.loads(item["configuration"])
+
+    def test_create_drops_caller_supplied_external_id(self):
+        mock_dao = MagicMock()
+        req = _make_glue_db_req()
+        req.glue_configuration.to_dict.return_value = {
+            "databaseName": "mydb",
+            "region": "us-east-1",
+            "crossAccountRoleArn": "arn:aws:iam::999999999999:role/scl-dev-datasource-access-victim",
+            "externalId": "the-victims-external-id",
+        }
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_DR}._get_sqs", return_value=MagicMock()),
+        ):
+            status, _ = _parse(_dr._create_database_source(req, _NAMESPACE_ID))
+
+        assert status == 202
+        config = self._stored_config(mock_dao)
+        assert "externalId" not in config
+        # The role ARN is still stored — it is the assume target, not the control.
+        assert config["crossAccountRoleArn"].endswith("datasource-access-victim")
+
+    def test_create_keeps_other_config_fields(self):
+        """The strip must be surgical — nothing else may be dropped."""
+        mock_dao = MagicMock()
+        req = _make_glue_db_req()
+        req.glue_configuration.to_dict.return_value = {
+            "databaseName": "mydb",
+            "region": "us-east-1",
+            "tableFilter": "sales_*",
+            "externalId": "nope",
+        }
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_DR}._get_sqs", return_value=MagicMock()),
+        ):
+            _parse(_dr._create_database_source(req, _NAMESPACE_ID))
+
+        config = self._stored_config(mock_dao)
+        assert config["tableFilter"] == "sales_*"
+        assert config["databaseName"] == "mydb"
+        assert "externalId" not in config
+
+    @staticmethod
+    def _updated_config(mock_dao):
+        args, kwargs = mock_dao.update.call_args.args, mock_dao.update.call_args.kwargs
+        update_fields = args[1] if len(args) >= 2 else kwargs["update_fields"]
+        return json.loads(update_fields["configuration"])
+
+    # `databaseName` echoes the stored value rather than repointing: the target is
+    # immutable after create (`_apply_glue_configuration_update`), so changing it
+    # here would return 400 and test that guard instead of the externalId strip.
+    def test_update_drops_caller_supplied_external_id(self):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceType": "DATABASE",
+            "status": "APPROVED",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "configuration": json.dumps({"databaseName": "mydb", "region": "us-east-1"}),
+        }
+
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            event = {
+                "body": json.dumps(
+                    {
+                        "glueConfiguration": {
+                            "catalogId": "123456789012",
+                            "region": "us-east-1",
+                            "databaseName": "mydb",
+                            "externalId": "injected-on-update",
+                        }
+                    }
+                )
+            }
+            status, _ = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert "externalId" not in self._updated_config(mock_dao)
+
+    def test_update_carries_forward_a_legacy_stored_external_id(self):
+        """LEGACY BRIDGE: a pre-existing value survives an unrelated config edit.
+
+        Its trust policy still pins that value, so dropping it here would break
+        the source's next scan. The caller's value is still ignored.
+        """
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceType": "DATABASE",
+            "status": "APPROVED",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "configuration": json.dumps({"databaseName": "mydb", "region": "us-east-1", "externalId": "legacy-value"}),
+        }
+
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            event = {
+                "body": json.dumps(
+                    {
+                        "glueConfiguration": {
+                            "catalogId": "123456789012",
+                            "region": "us-east-1",
+                            "databaseName": "mydb",
+                            "externalId": "attacker-chosen",
+                        }
+                    }
+                )
+            }
+            status, _ = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert self._updated_config(mock_dao)["externalId"] == "legacy-value"
+
+    def test_update_carries_forward_legacy_external_id_from_dict_config(self):
+        """Some older records store `configuration` as a dict, not a JSON string.
+
+        discovery_handler tolerates both shapes, so the carry-forward must too —
+        otherwise updating one of those sources silently drops its pinned
+        ExternalId and its next scan fails on AccessDenied.
+        """
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceType": "DATABASE",
+            "status": "APPROVED",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "configuration": {"databaseName": "mydb", "externalId": "legacy-dict-value"},
+        }
+
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            event = {
+                "body": json.dumps(
+                    {
+                        "glueConfiguration": {
+                            "catalogId": "123456789012",
+                            "region": "us-east-1",
+                            "databaseName": "mydb",
+                        }
+                    }
+                )
+            }
+            status, _ = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
+
+        assert status == 200
+        assert self._updated_config(mock_dao)["externalId"] == "legacy-dict-value"
 
 
 @pytest.mark.unit
@@ -529,7 +984,7 @@ class TestCreateDatabaseSourceCounter:
             call(_NAMESPACE_ID, SourceType.DATABASE, 1),
             call(_NAMESPACE_ID, SourceType.DATABASE, -1),
         ]
-        mock_dao.delete.assert_called_once()
+        assert len(_source_deletes(mock_dao)) == 1
 
     def test_create_does_not_double_count_when_ddb_put_fails(self):
         """If the source row never persists (DDB put fails) the counter must
@@ -688,6 +1143,369 @@ class TestHandleGetScanJob:
 
 
 @pytest.mark.unit
+class TestUpdateCustomConnectorConfiguration:
+    """The connector Lambda ARN is baked into the registered Athena data catalog at
+    create, and nothing re-registers it afterwards — so accepting a new ARN here
+    would leave every read path reporting it while the catalog still invoked the old
+    Lambda."""
+
+    _ARN = "arn:aws:lambda:us-east-1:111122223333:function:acme-connector"
+
+    def _item(self, **config_overrides):
+        config = {"connectorFunctionArn": self._ARN, "databaseName": "widgets"}
+        config.update(config_overrides)
+        return {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceId": _SOURCE_ID,
+            "sourceType": "DATABASE",
+            "sourceSubType": "CUSTOM_CONNECTOR",
+            "status": "APPROVED",
+            "athenaDatabase": "widgets",
+            "configuration": json.dumps(config),
+            "updatedAt": "2026-01-01T00:00:00Z",
+        }
+
+    def _update(self, body, item=None):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item or self._item()
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            status, resp = _parse(_dr._handle_update_metadata({"body": json.dumps(body)}, _NAMESPACE_ID, _SOURCE_ID))
+        return status, resp, mock_dao
+
+    def test_rejects_a_changed_connector_function_arn(self):
+        status, body, mock_dao = self._update(
+            {
+                "customConnectorConfiguration": {
+                    "connectorFunctionArn": "arn:aws:lambda:us-east-1:111122223333:function:acme-v2",
+                    "databaseName": "widgets",
+                }
+            }
+        )
+        assert status == 400
+        assert "cannot be changed after creation" in body["error"]
+        mock_dao.update.assert_not_called()
+
+    def test_ignores_an_unmodelled_record_function_arn(self):
+        """A stray recordFunctionArn is not an immutable-field change — it is not a field.
+
+        The member was removed from CustomConnectorConfiguration, so a client still sending it is
+        sending something the shape does not define. That must not be mistaken for an
+        attempt to change an immutable ARN: the immutability check iterates the members
+        that exist, and an unknown key is simply not one of them.
+        """
+        status, _, mock_dao = self._update(
+            {
+                "customConnectorConfiguration": {
+                    "connectorFunctionArn": self._ARN,
+                    "recordFunctionArn": "arn:aws:lambda:us-east-1:111122223333:function:acme-record",
+                    "databaseName": "widgets",
+                }
+            }
+        )
+        assert status == 200
+        mock_dao.update.assert_called_once()
+
+    # Serve prefers discoveredSchemas[0] and falls back to athenaDatabase only when
+    # that list is empty. Discovery writes it on every successful scan, so writing
+    # athenaDatabase retargets nothing: the update would return 200 while serve kept
+    # querying the old database, and a re-scan cannot reconcile it because
+    # _handle_rescan 409s any DATABASE source that is not SCAN_FAILED.
+    def test_rejects_a_changed_database_name(self):
+        status, body, mock_dao = self._update(
+            {"customConnectorConfiguration": {"connectorFunctionArn": self._ARN, "databaseName": "gadgets"}}
+        )
+        assert status == 400
+        assert "databaseName cannot be changed after creation" in body["error"]
+        # Names the target, so the message is actionable without reading the source.
+        assert "gadgets" in body["error"]
+        mock_dao.update.assert_not_called()
+
+    # Rejecting a CHANGE must not reject an echo: the shape is shared with create,
+    # where databaseName is required, so a client editing a filter sends the whole
+    # configuration back including the unchanged database.
+    def test_allows_an_unchanged_database_name(self):
+        status, _, mock_dao = self._update(
+            {"customConnectorConfiguration": {"connectorFunctionArn": self._ARN, "databaseName": "widgets"}}
+        )
+        assert status == 200
+        mock_dao.update.assert_called_once()
+
+    # A source whose athenaDatabase attribute was never written still gets one:
+    # mirroring an unchanged value does not move where the source points.
+    def test_mirrors_the_database_name_when_the_attribute_is_absent(self):
+        item = self._item()
+        del item["athenaDatabase"]
+        status, _, mock_dao = self._update(
+            {"customConnectorConfiguration": {"connectorFunctionArn": self._ARN, "databaseName": "widgets"}}, item=item
+        )
+        assert status == 200
+        assert mock_dao.update.call_args[0][1]["athenaDatabase"] == "widgets"
+
+    def test_filters_can_be_updated_freely(self):
+        status, _, mock_dao = self._update(
+            {
+                "customConnectorConfiguration": {
+                    "connectorFunctionArn": self._ARN,
+                    "databaseName": "widgets",
+                    "tableFilter": "dim_*",
+                }
+            }
+        )
+        assert status == 200
+        fields = mock_dao.update.call_args[0][1]
+        assert json.loads(fields["configuration"])["tableFilter"] == "dim_*"
+        # Unchanged database must not be rewritten needlessly.
+        assert "athenaDatabase" not in fields
+
+    # A Glue config on a CUSTOM_CONNECTOR row would leave the blob and the
+    # sub-type disagreeing, and GET then 500s on GlueConfiguration's required
+    # members rather than mislabelling anything.
+    def test_rejects_a_mismatched_configuration_shape(self):
+        status, body, mock_dao = self._update(
+            {"glueConfiguration": {"catalogId": "123456789012", "region": "us-east-1", "databaseName": "x"}}
+        )
+        assert status == 400
+        assert "customConnectorConfiguration" in body["error"]
+        mock_dao.update.assert_not_called()
+
+
+@pytest.mark.unit
+class TestCreateGlueSourceOwnership:
+    """F-8: catalogId/databaseName must be bound to the caller's namespace.
+
+    ``manageSource`` authorizes against the NAMESPACE and the Smithy shape only
+    checks the form of these two fields, so without this the create path is the
+    entry point to reading any Glue database in the platform account.
+    """
+
+    def _create(self, req, *, allowed: bool):
+        mock_dao = MagicMock()
+        mock_scan_dao = MagicMock()
+        error = _go.GlueOwnershipError("Glue database 'mydb' is not registered to namespace")
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+            patch(f"{_DR}._get_sqs", return_value=MagicMock()),
+            patch(
+                f"{_DR}.assert_namespace_may_catalog",
+                side_effect=None if allowed else error,
+            ) as mock_check,
+        ):
+            status, body = _parse(_dr._create_database_source(req, _NAMESPACE_ID))
+        return status, body, mock_dao, mock_check
+
+    def test_an_unowned_database_is_refused_with_403(self):
+        status, body, mock_dao, _ = self._create(_make_glue_db_req(), allowed=False)
+        assert status == 403
+        assert "not registered to namespace" in body["error"]
+        # Nothing may be stored: a source row is what the scan pipeline reads, so a
+        # row written before the refusal would still get discovered.
+        mock_dao.put.assert_not_called()
+
+    def test_the_check_receives_the_caller_supplied_target(self):
+        _, _, _, mock_check = self._create(_make_glue_db_req(), allowed=True)
+        kwargs = mock_check.call_args.kwargs
+        assert kwargs["namespace_id"] == _NAMESPACE_ID
+        assert kwargs["catalog_id"] == "123456789012"
+        assert kwargs["database_name"] == "mydb"
+
+    def test_create_tolerates_a_database_that_does_not_exist_yet(self):
+        """Create has never required the target to exist — it persists the config and
+        the async scan reports a bad target. Refusing here would be a 403 telling the
+        caller to tag something that isn't there. The pipeline stays strict."""
+        _, _, _, mock_check = self._create(_make_glue_db_req(), allowed=True)
+        assert mock_check.call_args.kwargs["allow_missing_database"] is True
+
+    def test_an_owned_database_is_created(self):
+        status, _, mock_dao, _ = self._create(_make_glue_db_req(), allowed=True)
+        assert status == 202
+        assert len(_source_puts(mock_dao)) == 1
+
+    def test_jdbc_sources_are_not_subject_to_the_glue_check(self):
+        """The check is about a caller-named Glue database. A JDBC source names a
+        host and credentials it must already hold, and gets a catalog of its own."""
+        mock_dao = MagicMock()
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_DR}._get_sqs", return_value=MagicMock()),
+            patch(f"{_DR}.assert_namespace_may_catalog") as mock_check,
+        ):
+            status, _ = _parse(_dr._create_database_source(_make_jdbc_db_req(), _NAMESPACE_ID))
+        assert status == 202
+        mock_check.assert_not_called()
+
+    def test_a_jdbc_source_claims_the_catalog_it_will_be_given(self):
+        """The claim is what stops another namespace naming this catalog later."""
+        mock_dao = MagicMock()
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_DR}._get_sqs", return_value=MagicMock()),
+        ):
+            _parse(_dr._create_database_source(_make_jdbc_db_req(), _NAMESPACE_ID))
+
+        claims = [c.args[0] for c in mock_dao.put.call_args_list if c.args[0].get("SK") == "CLAIM"]
+        assert len(claims) == 1
+        assert claims[0]["namespaceId"] == _NAMESPACE_ID
+        assert claims[0]["PK"].startswith("GLUECAT#")
+
+    def test_a_glue_source_claims_nothing(self):
+        """It is given no catalog, so there is nothing for it to own."""
+        mock_dao = MagicMock()
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=MagicMock()),
+            patch(f"{_DR}._get_sqs", return_value=MagicMock()),
+        ):
+            _parse(_dr._create_database_source(_make_glue_db_req(), _NAMESPACE_ID))
+
+        claims = [c.args[0] for c in mock_dao.put.call_args_list if c.args[0].get("SK") == "CLAIM"]
+        assert claims == []
+
+
+class TestUpdateGlueConfiguration:
+    """The stored blob is discovery's input, so a repoint here would bypass the
+    ownership check the create path applied to the original target."""
+
+    def _item(self, **config_overrides):
+        config = {"catalogId": "123456789012", "region": "us-east-1", "databaseName": "mydb"}
+        config.update(config_overrides)
+        return {
+            "PK": f"NS#{_NAMESPACE_ID}",
+            "SK": f"SRC#{_SOURCE_ID}",
+            "sourceId": _SOURCE_ID,
+            "sourceType": "DATABASE",
+            "sourceSubType": "GLUE_DATABASE",
+            "status": "APPROVED",
+            "athenaDatabase": "mydb",
+            "configuration": json.dumps(config),
+            "updatedAt": "2026-01-01T00:00:00Z",
+        }
+
+    def _update(self, config, item=None):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = item or self._item()
+        with patch(f"{_DR}._get_dao", return_value=mock_dao):
+            status, resp = _parse(
+                _dr._handle_update_metadata(
+                    {"body": json.dumps({"glueConfiguration": config})}, _NAMESPACE_ID, _SOURCE_ID
+                )
+            )
+        return status, resp, mock_dao
+
+    def test_rejects_a_repointed_database_name(self):
+        status, body, mock_dao = self._update(
+            {"catalogId": "123456789012", "region": "us-east-1", "databaseName": "someone_elses_db"}
+        )
+        assert status == 400
+        assert "databaseName cannot be changed after creation" in body["error"]
+        mock_dao.update.assert_not_called()
+
+    def test_rejects_a_repointed_catalog_id(self):
+        status, body, mock_dao = self._update(
+            {"catalogId": "123456789012:scldevds_deadbeef", "region": "us-east-1", "databaseName": "mydb"}
+        )
+        assert status == 400
+        assert "catalogId cannot be changed after creation" in body["error"]
+        mock_dao.update.assert_not_called()
+
+    def test_allows_an_unchanged_target(self):
+        """Echoing the stored value must stay allowed, or another member of the blob
+        becomes uneditable."""
+        status, _, mock_dao = self._update(
+            {
+                "catalogId": "123456789012",
+                "region": "us-east-1",
+                "databaseName": "mydb",
+                "tableExcludeFilter": "staging_*",
+            }
+        )
+        assert status == 200
+        mock_dao.update.assert_called_once()
+
+    def test_falls_back_to_athena_database_for_a_row_with_no_stored_blob(self):
+        """A row whose blob predates the field must not read as "changed" for a
+        value it never disagreed with."""
+        item = self._item()
+        item["configuration"] = json.dumps({"catalogId": "123456789012", "region": "us-east-1"})
+        status, body, _ = self._update(
+            {"catalogId": "123456789012", "region": "us-east-1", "databaseName": "other"}, item=item
+        )
+        assert status == 400
+        assert "databaseName cannot be changed" in body["error"]
+
+
+class TestScanJobDegradationSignal:
+    """A scan can SUCCEED while individual tables were unreadable. Unsurfaced, the
+    result is indistinguishable from a complete one, so a reviewer would approve a
+    silently incomplete ontology."""
+
+    _SOURCE = {"PK": f"NS#{_NAMESPACE_ID}", "SK": f"SRC#{_SOURCE_ID}", "sourceType": "DATABASE"}
+
+    def _get(self, scan_item):
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = dict(self._SOURCE)
+        mock_scan_dao = MagicMock()
+        mock_scan_dao.get.return_value = scan_item
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._get_scan_dao", return_value=mock_scan_dao),
+        ):
+            return _parse(_dr._handle_get_scan_job(_NAMESPACE_ID, _SOURCE_ID, "2026-01-01T00:00:00Z"))
+
+    def test_reports_unreadable_tables(self):
+        status, body = self._get(
+            {
+                "status": "COMPLETED",
+                "tablesDiscovered": 3,
+                "tablesFailed": 2,
+                "failedTables": ["widgets.bad", "widgets.worse"],
+            }
+        )
+        assert status == 200
+        assert body["tablesFailed"] == 2
+        assert body["failedTables"] == ["widgets.bad", "widgets.worse"]
+
+    # Decimal, not int, because that is what DynamoDB actually returns through
+    # boto3's resource interface — and api_response serialises with
+    # `default=str`, so an uncoerced Decimal ships as the JSON STRING "2". The
+    # only consumer requires `typeof x === "number"`, so the whole degraded-scan
+    # signal would be silently dropped. Mocking this with a native int (as the
+    # test above does) cannot catch that.
+    def test_numeric_fields_survive_json_as_numbers_not_strings(self):
+        from decimal import Decimal
+
+        status, body = self._get(
+            {
+                "status": "COMPLETED",
+                "tablesDiscovered": Decimal("40"),
+                "columnsDiscovered": Decimal("312"),
+                "tablesFailed": Decimal("2"),
+                "failedTables": ["widgets.bad", "widgets.worse"],
+            }
+        )
+        assert status == 200
+        # `body` is the round-tripped JSON, so these assertions cover serialisation.
+        for field, expected in (
+            ("tablesFailed", 2),
+            ("tablesDiscovered", 40),
+            ("columnsDiscovered", 312),
+        ):
+            assert body[field] == expected, field
+            assert isinstance(body[field], int), f"{field} shipped as {type(body[field]).__name__}"
+            assert not isinstance(body[field], str), f"{field} shipped as a string"
+
+    # Absent rather than zero, so the field can be used directly to filter for
+    # degraded scans — and so a clean scan's response is byte-for-byte unchanged.
+    def test_a_clean_scan_omits_the_fields(self):
+        _, body = self._get({"status": "COMPLETED", "tablesDiscovered": 3})
+        assert "tablesFailed" not in body
+        assert "failedTables" not in body
+
+
+@pytest.mark.unit
 class TestHandleUpdateMetadata:
     def _db_item(self):
         return {
@@ -766,6 +1584,189 @@ class TestHandleUpdateMetadata:
             status, _ = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
 
         assert status == 200
+
+    def test_update_jdbc_config_invokes_binding_validation(self):
+        # The credential-secret → namespace binding must run on the update path,
+        # not only at create — otherwise a source could be repointed at a secret
+        # bound to another namespace after creation.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = self._db_item()
+        spy = MagicMock(return_value=None)
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._validate_credential_secret_binding", spy),
+        ):
+            event = {
+                "body": json.dumps(
+                    {
+                        "jdbcConfiguration": {
+                            "engine": "POSTGRESQL",
+                            "host": "db.example.com",
+                            "port": 5432,
+                            "databaseName": "mydb",
+                            "credentialSecretArn": ("arn:aws:secretsmanager:us-east-1:111122223333:secret:s-AbCdEf"),
+                        }
+                    }
+                )
+            }
+            status, _ = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
+        assert status == 200
+        spy.assert_called_once()
+
+    def test_update_jdbc_config_rejected_when_binding_fails(self):
+        # A binding failure blocks the update and must not write to DynamoDB.
+        mock_dao = MagicMock()
+        mock_dao.get.return_value = self._db_item()
+        from coa_common.response import api_response
+
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(
+                f"{_DR}._validate_credential_secret_binding",
+                return_value=api_response(400, {"error": "not bound"}),
+            ),
+        ):
+            event = {
+                "body": json.dumps(
+                    {
+                        "jdbcConfiguration": {
+                            "engine": "POSTGRESQL",
+                            "host": "db.example.com",
+                            "port": 5432,
+                            "databaseName": "mydb",
+                            "credentialSecretArn": (
+                                "arn:aws:secretsmanager:us-east-1:111122223333:secret:other-XyZ123"
+                            ),
+                        }
+                    }
+                )
+            }
+            status, _ = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
+        assert status == 400
+        mock_dao.update.assert_not_called()
+
+    def test_update_cannot_repoint_jdbc_host(self):
+        """host is immutable: it decides which server receives the credentials.
+
+        The credential secret is bound to the NAMESPACE, not to whoever edits the
+        source, so without this `manageSource` on a namespace is enough to redirect
+        a source another steward registered at a host the editor controls and have
+        discovery deliver that namespace's database credentials to it. The binding
+        check still passes there — the secret is unchanged; the destination moved.
+        """
+        mock_dao = MagicMock()
+        item = self._db_item()
+        item["sourceSubType"] = "JDBC_DATABASE"
+        item["configuration"] = json.dumps(
+            {
+                "engine": "POSTGRESQL",
+                "host": "prod-db.internal",
+                "port": 5432,
+                "databaseName": "mydb",
+                "credentialSecretArn": "arn:aws:secretsmanager:us-east-1:111122223333:secret:s-AbCdEf",
+            }
+        )
+        mock_dao.get.return_value = item
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._validate_credential_secret_binding", return_value=None),
+        ):
+            event = {
+                "body": json.dumps(
+                    {
+                        "jdbcConfiguration": {
+                            "engine": "POSTGRESQL",
+                            "host": "attacker.example.com",
+                            "port": 5432,
+                            "databaseName": "mydb",
+                            "credentialSecretArn": ("arn:aws:secretsmanager:us-east-1:111122223333:secret:s-AbCdEf"),
+                        }
+                    }
+                )
+            }
+            status, body = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
+        assert status == 400
+        assert "host" in body["error"]
+        mock_dao.update.assert_not_called()
+
+    def test_update_cannot_swap_jdbc_credential_secret(self):
+        # Swapping the secret is caught here as well as by the binding check, so a
+        # secret that happens to be tagged for this namespace still cannot be
+        # substituted for the one the source was registered with.
+        mock_dao = MagicMock()
+        item = self._db_item()
+        item["sourceSubType"] = "JDBC_DATABASE"
+        item["configuration"] = json.dumps(
+            {
+                "engine": "POSTGRESQL",
+                "host": "prod-db.internal",
+                "port": 5432,
+                "databaseName": "mydb",
+                "credentialSecretArn": "arn:aws:secretsmanager:us-east-1:111122223333:secret:s-AbCdEf",
+            }
+        )
+        mock_dao.get.return_value = item
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._validate_credential_secret_binding", return_value=None),
+        ):
+            event = {
+                "body": json.dumps(
+                    {
+                        "jdbcConfiguration": {
+                            "engine": "POSTGRESQL",
+                            "host": "prod-db.internal",
+                            "port": 5432,
+                            "databaseName": "mydb",
+                            "credentialSecretArn": (
+                                "arn:aws:secretsmanager:us-east-1:111122223333:secret:elevated-XyZ123"
+                            ),
+                        }
+                    }
+                )
+            }
+            status, body = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
+        assert status == 400
+        assert "credentialSecretArn" in body["error"]
+        mock_dao.update.assert_not_called()
+
+    def test_update_jdbc_may_echo_immutable_fields_to_edit_a_filter(self):
+        # Rejecting only CHANGES keeps a whole-blob PUT usable: the client resends
+        # host/port/secret unchanged in order to edit schemaFilter.
+        mock_dao = MagicMock()
+        item = self._db_item()
+        item["sourceSubType"] = "JDBC_DATABASE"
+        item["configuration"] = json.dumps(
+            {
+                "engine": "POSTGRESQL",
+                "host": "prod-db.internal",
+                "port": 5432,
+                "databaseName": "mydb",
+                "credentialSecretArn": "arn:aws:secretsmanager:us-east-1:111122223333:secret:s-AbCdEf",
+            }
+        )
+        mock_dao.get.return_value = item
+        with (
+            patch(f"{_DR}._get_dao", return_value=mock_dao),
+            patch(f"{_DR}._validate_credential_secret_binding", return_value=None),
+        ):
+            event = {
+                "body": json.dumps(
+                    {
+                        "jdbcConfiguration": {
+                            "engine": "POSTGRESQL",
+                            "host": "prod-db.internal",
+                            "port": 5432,
+                            "databaseName": "mydb",
+                            "credentialSecretArn": ("arn:aws:secretsmanager:us-east-1:111122223333:secret:s-AbCdEf"),
+                            "schemaFilter": "^public$",
+                        }
+                    }
+                )
+            }
+            status, _ = _parse(_dr._handle_update_metadata(event, _NAMESPACE_ID, _SOURCE_ID))
+        assert status == 200
+        mock_dao.update.assert_called_once()
 
     def test_update_both_configs_returns_400(self):
         mock_dao = MagicMock()

@@ -14,6 +14,8 @@ from coa_common.domain_models import Column, Table
 from coa_common.metadata_store.base import AssetResult, SearchResult
 from coa_common.metadata_store.reader import (
     _parse_asset,
+    _table_name_from_asset,
+    read_asset_names_for_datasource,
     read_assets_for_datasource,
 )
 
@@ -150,3 +152,99 @@ class TestParseAsset:
         assert result is not None
         assert result.name == "customers"
         assert result.data_source_id == "ds-1"
+
+
+class TestReadAssetNamesForDatasource:
+    """The cheap half: table names from search pages, zero per-asset calls.
+
+    ``read_assets_for_datasource`` must fetch one form per asset to build ``Table``
+    objects. Callers that only need to know WHICH tables exist do not, and paying
+    the per-asset cost for them put ``POST /metrics`` over API Gateway's 29s limit
+    on an 88-table source.
+    """
+
+    def test_raises_without_data_source_id(self):
+        with pytest.raises(ValueError, match="data_source_id is required"):
+            read_asset_names_for_datasource("dom-1", "proj-1", "")
+
+    @patch("coa_common.metadata_store.reader.SMUSClient")
+    def test_indexes_names_without_fetching_any_form(self, mock_client_cls):
+        client = MagicMock()
+        client.search_assets.return_value = SearchResult(
+            items=[
+                AssetResult(asset_id="a1", name="DS#ds-1:sales.orders", project_id="proj-1"),
+                AssetResult(asset_id="a2", name="DS#ds-1:sales.customers", project_id="proj-1"),
+                AssetResult(asset_id="a3", name="DS#other:widgets", project_id="proj-1"),
+            ],
+            next_token=None,
+        )
+        mock_client_cls.return_value = client
+
+        names = read_asset_names_for_datasource("dom-1", "proj-1", "ds-1")
+
+        assert names == {"orders": "a1", "customers": "a2"}
+        client.get_asset_forms.assert_not_called()
+        assert client.search_assets.call_count == 1
+
+    @patch("coa_common.metadata_store.reader.SMUSClient")
+    def test_paginates_and_still_fetches_no_forms(self, mock_client_cls):
+        client = MagicMock()
+        client.search_assets.side_effect = [
+            SearchResult(
+                items=[AssetResult(asset_id=f"a{i}", name=f"DS#ds-1:public.t{i}", project_id="p") for i in range(50)],
+                next_token="tok",
+            ),
+            SearchResult(
+                items=[AssetResult(asset_id="a50", name="DS#ds-1:public.t50", project_id="p")],
+                next_token=None,
+            ),
+        ]
+        mock_client_cls.return_value = client
+
+        names = read_asset_names_for_datasource("dom-1", "proj-1", "ds-1")
+
+        assert len(names) == 51
+        # 51 assets, 2 search calls, still zero per-asset calls.
+        assert client.search_assets.call_count == 2
+        client.get_asset_forms.assert_not_called()
+
+    @patch("coa_common.metadata_store.reader.SMUSClient")
+    def test_search_failure_propagates(self, mock_client_cls):
+        """Callers must be able to tell "no tables" from "could not look" — an
+        empty mapping on failure would make absence look provable."""
+        client = MagicMock()
+        client.search_assets.side_effect = RuntimeError("datazone down")
+        mock_client_cls.return_value = client
+
+        with pytest.raises(RuntimeError, match="datazone down"):
+            read_asset_names_for_datasource("dom-1", "proj-1", "ds-1")
+
+    def test_accepts_an_already_prefixed_data_source_id(self):
+        with patch("coa_common.metadata_store.reader.SMUSClient") as cls:
+            client = MagicMock()
+            client.search_assets.return_value = SearchResult(
+                items=[AssetResult(asset_id="a1", name="DS#ds-1:public.orders", project_id="p")],
+                next_token=None,
+            )
+            cls.return_value = client
+
+            assert read_asset_names_for_datasource("dom-1", "proj-1", "DS#ds-1") == {"orders": "a1"}
+
+
+class TestTableNameFromAsset:
+    """Asset names are ``DS#{sourceId}:{database}.{table}``; the index key is the
+    bare table, matching the form's ``tableName`` that ``Table.name`` carries."""
+
+    @pytest.mark.parametrize(
+        ("asset_name", "expected"),
+        [
+            ("DS#ds-1:public.orders", "orders"),
+            ("DS#ds-1:pc_insurance.claim_amount", "claim_amount"),
+            # A dot in the table name survives; the split takes the first only.
+            ("DS#ds-1:public.odd.name", "odd.name"),
+            # No database segment: fall back to the whole remainder.
+            ("DS#ds-1:orders", "orders"),
+        ],
+    )
+    def test_parses_bare_table_name(self, asset_name, expected):
+        assert _table_name_from_asset(asset_name, "DS#ds-1") == expected

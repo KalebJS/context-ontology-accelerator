@@ -48,6 +48,35 @@ _CATALOG = {
     ]
 }
 
+# ── Fixtures for the cheap (names-only) catalog path ──────────────────────
+#
+# Existence and column lookups no longer go through read_approved_catalog: the
+# lookup indexes table NAMES from DataZone search pages and fetches ONE asset's
+# form when a caller actually needs its columns or review status. These build the
+# two seams that replaced it. `_CATALOG` above is still used by
+# data_source_exists, which keeps the full read.
+
+# What read_asset_names_for_datasource returns: table name (lower) → asset id.
+_NAMES = {"orders": "asset-orders"}
+
+
+def _bm(status="APPROVED"):
+    from coa_common.domain_models import BusinessMetadata, ReviewStatus
+
+    return BusinessMetadata(review_status=ReviewStatus(status))
+
+
+def _table(*, name="Orders", columns=(("order_id", "integer"), ("amount", "decimal")), status="APPROVED"):
+    """A parsed DataZone asset, as read_table_for_asset would return it."""
+    from coa_common.domain_models import Column, Table
+
+    return Table(
+        name=name,
+        database="public",
+        business_metadata=_bm(status),
+        columns=[Column(name=n, data_type=t, business_metadata=_bm()) for n, t in columns],
+    )
+
 
 class TestSmusCatalogDataSourceLookup:
     """Tests for the SMUS catalog-backed data source lookup."""
@@ -69,18 +98,22 @@ class TestSmusCatalogDataSourceLookup:
 
         assert lookup.data_source_exists("ds-missing") is False
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_table_exists_is_case_insensitive(self, mock_read):
-        mock_read.return_value = _CATALOG
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_table_exists_is_case_insensitive(self, mock_names, mock_asset):
+        mock_names.return_value = _NAMES
+        mock_asset.return_value = _table()
         lookup = _lookup()
 
         assert lookup.table_exists("ds-1", "orders") is True
         assert lookup.table_exists("ds-1", "ORDERS") is True
         assert lookup.table_exists("ds-1", "customers") is False
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_get_table_columns_returns_named_columns_only(self, mock_read):
-        mock_read.return_value = _CATALOG
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_get_table_columns_returns_named_columns_only(self, mock_names, mock_asset):
+        mock_names.return_value = _NAMES
+        mock_asset.return_value = _table(columns=(("order_id", "integer"), ("amount", "decimal"), ("", "ignored")))
         lookup = _lookup()
 
         columns = lookup.get_table_columns("ds-1", "orders")
@@ -88,74 +121,80 @@ class TestSmusCatalogDataSourceLookup:
         assert columns is not None
         assert [c.name for c in columns] == ["order_id", "amount"]
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_get_table_columns_none_for_unknown_source(self, mock_read):
-        mock_read.return_value = {"sources": []}
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_get_table_columns_none_for_unknown_source(self, mock_names):
+        mock_names.return_value = {}
         lookup = _lookup()
 
         assert lookup.get_table_columns("ds-unknown", "orders") is None
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_get_column_type_case_insensitive_match(self, mock_read):
-        mock_read.return_value = _CATALOG
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_get_column_type_case_insensitive_match(self, mock_names, mock_asset):
+        mock_names.return_value = _NAMES
+        mock_asset.return_value = _table()
         lookup = _lookup()
 
         assert lookup.get_column_type("ds-1", "orders", "ORDER_ID") == "integer"
         assert lookup.get_column_type("ds-1", "orders", "amount") == "decimal"
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_get_column_type_returns_none_for_missing_column(self, mock_read):
-        mock_read.return_value = _CATALOG
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_get_column_type_returns_none_for_missing_column(self, mock_names, mock_asset):
+        mock_names.return_value = _NAMES
+        mock_asset.return_value = _table()
         lookup = _lookup()
 
         assert lookup.get_column_type("ds-1", "orders", "no_such_col") is None
 
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
     @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_catalog_read_failure_degrades_to_empty(self, mock_read):
+    def test_catalog_read_failure_degrades_to_empty(self, mock_read, mock_names):
         mock_read.side_effect = RuntimeError("catalog down")
+        mock_names.side_effect = RuntimeError("catalog down")
         lookup = _lookup()
 
         assert lookup.data_source_exists("ds-1") is False
         assert lookup.table_exists("ds-1", "orders") is False
         assert lookup.get_table_columns("ds-1", "orders") is None
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_catalog_available_false_on_read_failure(self, mock_read):
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_catalog_available_false_on_read_failure(self, mock_names):
         """#161: table_exists() fails OPEN (False) on a read failure, so it
         cannot distinguish 'absent' from 'unknown'. catalog_available() is the
         signal that makes absence provable — without it a hard sourceTable
         block would reject valid metrics whenever the catalog is down."""
-        mock_read.side_effect = RuntimeError("catalog down")
+        mock_names.side_effect = RuntimeError("catalog down")
         lookup = _lookup()
 
         assert lookup.catalog_available("ds-1") is False
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_catalog_available_true_on_successful_read(self, mock_read):
-        mock_read.return_value = _CATALOG
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_catalog_available_true_on_successful_read(self, mock_names):
+        mock_names.return_value = _NAMES
         lookup = _lookup()
 
         assert lookup.catalog_available("ds-1") is True
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_catalog_available_true_when_source_absent_but_read_succeeded(self, mock_read):
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_catalog_available_true_when_source_absent_but_read_succeeded(self, mock_names):
         """A successful read that simply lacks the source is still 'available' —
         the catalog spoke, it just had nothing for this source."""
-        mock_read.return_value = {"sources": []}
+        mock_names.return_value = {}
         lookup = _lookup()
 
         assert lookup.catalog_available("ds-missing") is True
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_known_tables_returns_lowercased_names(self, mock_read):
-        mock_read.return_value = _CATALOG
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_known_tables_returns_lowercased_names(self, mock_names):
+        mock_names.return_value = _NAMES
         lookup = _lookup()
 
         assert lookup.known_tables("ds-1") == {"orders"}
 
-    @patch("coa_common.metadata_store.catalog_reader.read_approved_catalog")
-    def test_known_tables_empty_when_read_failed(self, mock_read):
-        mock_read.side_effect = RuntimeError("catalog down")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_known_tables_empty_when_read_failed(self, mock_names):
+        mock_names.side_effect = RuntimeError("catalog down")
         lookup = _lookup()
 
         assert lookup.known_tables("ds-1") == set()
@@ -169,6 +208,97 @@ class TestSmusCatalogDataSourceLookup:
         base = DataSourceLookup()
         assert base.catalog_available("ds-1") is True
         assert base.known_tables("ds-1") == set()
+
+
+class TestSmusCatalogReadCost:
+    """The cost of a lookup must not scale with the source's table count.
+
+    These assert CALL COUNTS, not results, because the defect they guard is
+    invisible in output. ``check_source_table_exists`` used to reach
+    ``read_approved_catalog``, which issues one ``get_asset_forms`` per asset. On
+    an 88-table source that measured 0.186s x 88 = 16s of DataZone round-trips,
+    and ``POST /metrics`` returned a 504 at API Gateway's 29s ceiling while every
+    assertion about the RESULT still passed (job 10909663; reproduced on demand at
+    29.74s and 29.93s against two namespaces, versus 10.65s for a 2-table source).
+
+    A regression here reads as latency, not as a wrong answer, so the only test
+    that catches it is one that counts the calls.
+    """
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_table_exists_fetches_at_most_one_asset_on_a_wide_source(self, mock_names, mock_asset):
+        mock_names.return_value = {f"t{i}": f"asset-{i}" for i in range(88)}
+        mock_asset.return_value = _table(name="t7")
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-wide", "t7") is True
+
+        mock_names.assert_called_once()
+        assert mock_asset.call_count == 1, (
+            f"one asset form per existence check, not one per table — got {mock_asset.call_count}"
+        )
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_absent_table_costs_no_asset_fetch(self, mock_names, mock_asset):
+        """The name index alone proves absence, so nothing needs fetching."""
+        mock_names.return_value = {f"t{i}": f"asset-{i}" for i in range(88)}
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-wide", "not_a_table") is False
+        mock_asset.assert_not_called()
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_exists_then_columns_shares_one_fetch(self, mock_names, mock_asset):
+        """The validator's real sequence on a metric's sourceTable: exists? then
+        columns. Both answers come from one asset, so it must be fetched once."""
+        mock_names.return_value = _NAMES
+        mock_asset.return_value = _table()
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-1", "orders") is True
+        assert lookup.get_table_columns("ds-1", "orders") is not None
+        assert lookup.get_column_type("ds-1", "orders", "amount") == "decimal"
+
+        assert mock_asset.call_count == 1, f"per-table cache not shared — {mock_asset.call_count} fetches"
+        mock_names.assert_called_once()
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_unapproved_table_is_reported_absent(self, mock_names, mock_asset):
+        """Approval semantics are preserved. The name index cannot see review
+        status, so the ONE candidate's form is what rules it out — the previous
+        implementation got this from an index built of approved tables only."""
+        mock_names.return_value = _NAMES
+        mock_asset.return_value = _table(status="PENDING_REVIEW")
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-1", "orders") is False
+        assert lookup.get_table_columns("ds-1", "orders") is None
+
+    @patch("coa_metrics.lookups.read_table_for_asset")
+    @patch("coa_metrics.lookups.read_asset_names_for_datasource")
+    def test_transient_asset_read_failure_stays_fail_open(self, mock_names, mock_asset):
+        """#161: a transient asset-form read error must NOT become provable absence.
+
+        The name index loaded fine, so ``catalog_available()`` would otherwise stay
+        True while ``table_exists`` returned False — making a valid, approved table
+        look provably absent (a hard 400). The failure must instead flip
+        ``catalog_available()`` to False (degrading to the soft warning) and must
+        not be cached, so a later lookup retries once the service recovers.
+        """
+        mock_names.return_value = _NAMES
+        mock_asset.side_effect = RuntimeError("datazone down")
+        lookup = _lookup()
+
+        assert lookup.table_exists("ds-1", "orders") is False
+        # Not cached: the second lookup retries the fetch rather than reusing None.
+        assert lookup.table_exists("ds-1", "orders") is False
+        assert mock_asset.call_count == 2, "a transient failure must be retried, not cached as absence"
+        # The failure poisons availability so absence is not treated as provable.
+        assert lookup.catalog_available("ds-1") is False
 
 
 class TestNeptuneOntologyLookup:

@@ -2,8 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import * as cdk from "aws-cdk-lib";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import { Template, Match } from "aws-cdk-lib/assertions";
 import { WebStack } from "../../lib/stacks/foundation";
+import {
+  readRepoVersion,
+  buildRuntimeConfig,
+} from "../../lib/stacks/foundation/web-stack";
 import { DEFAULT_RESOURCE_PREFIX } from "../../lib/constants";
 
 const BASE_PROPS = {
@@ -165,5 +172,110 @@ describe("WebStack CloudFront WAF WebACL", () => {
       },
     );
     expect(readers).toHaveLength(1);
+  });
+});
+
+describe("readRepoVersion (VERSION → runtime-config)", () => {
+  test("returns the trimmed, bare-semver contents of the repo-root VERSION file", () => {
+    // Independently resolve the monorepo root (dir containing pnpm-workspace.yaml)
+    // so the test does not hardcode a version that VERSION bumps will break.
+    let dir = __dirname;
+    while (!fs.existsSync(path.join(dir, "pnpm-workspace.yaml"))) {
+      const parent = path.dirname(dir);
+      if (parent === dir) throw new Error("monorepo root not found");
+      dir = parent;
+    }
+    const expected = fs.readFileSync(path.join(dir, "VERSION"), "utf-8").trim();
+
+    const version = readRepoVersion();
+    expect(version).toBe(expected);
+    // The value is interpolated into the UI badge as `v{version}`, so it must
+    // be a bare semver (no leading "v", no stray whitespace).
+    expect(version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
+  });
+
+  test("returns undefined when the VERSION file is missing (deploy is never blocked)", () => {
+    const missing = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "ver-")),
+      "VERSION",
+    );
+    expect(readRepoVersion(missing)).toBeUndefined();
+  });
+
+  test("returns undefined for an empty or whitespace-only VERSION file", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ver-"));
+    const empty = path.join(dir, "VERSION");
+    fs.writeFileSync(empty, "   \n\t ");
+    expect(readRepoVersion(empty)).toBeUndefined();
+  });
+});
+
+describe("buildRuntimeConfig (version include/omit)", () => {
+  const base = {
+    region: "us-east-1",
+    stage: "dev",
+    authority: "https://issuer",
+    clientId: "abc",
+  };
+
+  test("includes version when provided", () => {
+    expect(buildRuntimeConfig({ ...base, version: "0.2.3" })).toMatchObject({
+      version: "0.2.3",
+    });
+  });
+
+  test("omits the version key entirely when undefined", () => {
+    expect(buildRuntimeConfig(base)).not.toHaveProperty("version");
+  });
+
+  test("omits the version key when empty", () => {
+    expect(buildRuntimeConfig({ ...base, version: "" })).not.toHaveProperty(
+      "version",
+    );
+  });
+
+  test("omits apiEndpoint and serveRuntimeArn when not provided", () => {
+    const cfg = buildRuntimeConfig(base);
+    expect(cfg).not.toHaveProperty("apiEndpoint");
+    expect(cfg).not.toHaveProperty("serveRuntimeArn");
+  });
+});
+
+describe("WebStack runtime-config.json artifact (end-to-end)", () => {
+  test("ships runtime-config.json carrying the repo VERSION", () => {
+    // Resolve the repo VERSION independently (no hardcoded value).
+    let dir = __dirname;
+    while (!fs.existsSync(path.join(dir, "pnpm-workspace.yaml"))) {
+      dir = path.dirname(dir);
+    }
+    const expected = fs.readFileSync(path.join(dir, "VERSION"), "utf-8").trim();
+
+    // Synth to a temp outdir and read the actual deploy artifact the
+    // BucketDeployment ships — the version lands in this asset, not the
+    // CloudFormation template, so this is the only place to assert the full
+    // WebStack → runtime-config.json path.
+    const outdir = fs.mkdtempSync(path.join(os.tmpdir(), "synth-"));
+    const app = new cdk.App({
+      outdir,
+      context: { resource_prefix: DEFAULT_RESOURCE_PREFIX, env: "dev" },
+    });
+    new WebStack(app, "TestWebArtifact", { isCognitoMode: true });
+    app.synth();
+
+    const configs: string[] = [];
+    const walk = (d: string) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (e.name === "runtime-config.json")
+          configs.push(fs.readFileSync(p, "utf-8"));
+      }
+    };
+    walk(outdir);
+
+    expect(configs.length).toBeGreaterThan(0);
+    expect(configs.some((c) => c.includes(`"version":"${expected}"`))).toBe(
+      true,
+    );
   });
 });

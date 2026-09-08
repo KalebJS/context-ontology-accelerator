@@ -32,6 +32,7 @@ from typing import Any
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common import async_boto_config
+from coa_common.constants import namespace_tag_condition_patterns, namespace_tag_key
 from coa_common.dao import DynamoDBDAO
 from coa_control_plane_server.models.source_sub_type import SourceSubType
 
@@ -42,6 +43,11 @@ from coa_sources.database.connectors.glue_connection_provisioner import (
     grant_iam_allowed_principals,
     provision_federated_catalog,
 )
+from coa_sources.database.glue_ownership import (
+    GlueOwnershipError,
+    assert_namespace_may_catalog,
+)
+from coa_sources.database.secret_binding import require_secret_namespace_binding
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("LOG_LEVEL", "INFO"))
@@ -54,9 +60,34 @@ CONSUMER_QUERY_ROLE_SSM_PARAM = os.environ.get("CONSUMER_QUERY_ROLE_SSM_PARAM", 
 # Role the AWS-managed federated connector uses to read the credential secret.
 # We assume it to pre-check secret readability before provisioning.
 FEDERATED_CATALOG_ROLE_ARN = os.environ.get("FEDERATED_CATALOG_ROLE_ARN", "")
+# Tag key binding a credential secret to the namespaces entitled to it. Derived
+# from the deployment prefix, so it must match the key the registration check
+# (database_routes) and the sources-stack IAM conditions use.
+_NAMESPACE_TAG_KEY = namespace_tag_key()
 
 _dao: DynamoDBDAO | None = None
 _ssm = None
+
+# DATABASE sub-types this handler has an explicit branch for.
+_HANDLED_SUB_TYPES = frozenset(
+    {
+        SourceSubType.GLUE_DATABASE.value,
+        SourceSubType.JDBC_DATABASE.value,
+        SourceSubType.CUSTOM_CONNECTOR.value,
+    }
+)
+# DOCUMENTS sub-types never reach this pipeline, so a row carrying one is a
+# mis-stored record. The right treatment there is the long-standing no-op, not a
+# scan failure — this handler is not the place to police that.
+_DOCUMENT_SUB_TYPES = frozenset({SourceSubType.S3.value, SourceSubType.LOCAL_UPLOAD.value})
+# What is left is a DATABASE sub-type the enum recognises and this handler has no
+# branch for. Empty today, and that is the point: it becomes non-empty only when a
+# new DATABASE sub-type ships without its branch here, which the catch-all in
+# :func:`handler` then reports instead of silently leaving every source of that
+# type not-queryable. An absent or unrecognised value is deliberately NOT in this
+# set, so a concurrently-deleted source (which reads back as an empty dict) and a
+# legacy row both keep the no-op.
+_UNHANDLED_DATABASE_SUB_TYPES = frozenset(m.value for m in SourceSubType) - _HANDLED_SUB_TYPES - _DOCUMENT_SUB_TYPES
 
 
 def _get_dao() -> DynamoDBDAO:
@@ -117,12 +148,21 @@ def _consumer_role_arn() -> str:
         return ""
 
 
-def _grant_secret_read_to_consumer(secret_arn: str) -> None:
+def _grant_secret_read_to_consumer(secret_arn: str, namespace_id: str) -> None:
     """Attach a resource policy on the credential secret granting the consumer role GetSecretValue.
 
     Idempotent: merges the consumer principal into the existing policy if one exists.
     Best-effort: failures are logged but don't block provisioning (the source remains
     queryable via Athena federation; only the direct JDBC fast-path is affected).
+
+    Namespace binding: the grant is conditioned on the secret's
+    ``<prefix>:namespace`` tag LISTING ``namespace_id``, so the serve runtime can
+    read the secret only while it is tagged for this namespace. This is the
+    serve-side half of the namespace binding — it keeps a stale or rebound grant
+    from being used to read a secret this namespace has since been removed from,
+    without giving the serve role any DescribeSecret permission of its own. The
+    tag value may bind several namespaces, so this is an entry match rather than
+    an equality one (see ``namespace_tag_condition_patterns``).
     """
     consumer_arn = _consumer_role_arn()
     if not consumer_arn or not secret_arn:
@@ -166,6 +206,17 @@ def _grant_secret_read_to_consumer(secret_arn: str) -> None:
                 "Principal": {"AWS": consumer_arn},
                 "Action": "secretsmanager:GetSecretValue",
                 "Resource": "*",
+                # Only readable while the secret's namespace tag lists this
+                # namespace. StringLike (not StringEquals) because the tag value
+                # may bind several namespaces; the patterns are space-anchored so
+                # this is an entry match, not a substring one.
+                "Condition": {
+                    "StringLike": {
+                        f"secretsmanager:ResourceTag/{_NAMESPACE_TAG_KEY}": namespace_tag_condition_patterns(
+                            namespace_id
+                        )
+                    }
+                },
             }
         )
         policy = {
@@ -205,6 +256,45 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
                 extra={"datasource_id": datasource_id},
             )
             return {"provisioned": False, "reason": "no-athena-database"}
+
+        # This function runs as a Lake Formation admin and the principal it grants
+        # is the SHARED serve runtime role, so a grant here makes the database
+        # readable by every namespace's queries — the widest single effect in the
+        # pipeline. Re-verify the namespace owns the target rather than trusting
+        # that source-create did: this step is reached from the stored row, and the
+        # cost of the check is one GetTags against a decision that cannot be undone
+        # by deleting the source. See ``coa_sources.database.glue_ownership``.
+        raw_config = item.get("configuration", "{}")
+        glue_config = json.loads(raw_config) if isinstance(raw_config, str) else (raw_config or {})
+        try:
+            assert_namespace_may_catalog(
+                _get_dao(),
+                namespace_id=namespace_id,
+                catalog_id=glue_config.get("catalogId", ""),
+                database_name=database_name,
+                region=glue_config.get("region") or AWS_REGION,
+                cross_account_role_arn=glue_config.get("crossAccountRoleArn"),
+            )
+        except GlueOwnershipError as exc:
+            # Not a scan failure: discovery already refused the same target, so a
+            # source reaching here unverified is a row that predates the check or
+            # whose tag was removed after onboarding. Leave it not-queryable and
+            # say why, rather than failing a step whose only job is a grant.
+            #
+            # The message travels in `reason`, not just the log: this return value
+            # is the Step Functions execution output an operator reads first, and
+            # a bare "namespace-not-owner" tells them what happened without
+            # telling them the tag command that fixes it.
+            logger.warning(
+                "glue_native_lf_grant_refused_unowned",
+                extra={"datasource_id": datasource_id, "database": database_name, "reason": str(exc)},
+            )
+            return {
+                "provisioned": False,
+                "reason": f"namespace-not-owner: {exc}",
+                "queryable": False,
+            }
+
         granted = grant_consumer_select_native(
             database_name=database_name,
             principal_arn=_consumer_role_arn(),
@@ -229,7 +319,41 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
         )
         return {"provisioned": False, "reason": "glue-native", "queryable": granted}
 
+    # Custom-connector sources need no provisioning here: the Lambda-backed Athena
+    # data catalog was registered at source-create, because this sub-type's
+    # discovery queries it and discovery runs BEFORE this step. All that remains
+    # is to mark the source queryable, which discovery having succeeded is the
+    # evidence for — the SHOW/DESCRIBE statements it ran are proof the catalog
+    # resolves and the connector answers. There is no Glue object and no Lake
+    # Formation grant to make, so nothing gates this beyond the write itself.
+    if sub_type == SourceSubType.CUSTOM_CONNECTOR:
+        # Raises on failure, matching the JDBC path: leaving queryable False after
+        # a successful discovery would present as a source that scanned fine and
+        # silently answers nothing. Nothing needs rolling back — the catalog
+        # belongs to the create path — and a re-scan retries.
+        _get_dao().update(
+            key=source_key,
+            update_fields={"queryable": True},
+            condition="attribute_exists(PK)",
+        )
+        logger.info("custom_connector_marked_queryable", extra={"datasource_id": datasource_id})
+        return {"provisioned": False, "reason": "custom-connector", "queryable": True}
+
     if sub_type != SourceSubType.JDBC_DATABASE:
+        # An ABSENT sub-type is the benign case and must stay a no-op: a source
+        # deleted concurrently with its scan reads back as an empty dict, and a
+        # legacy row may predate the attribute. Turning either into a pipeline
+        # failure would convert a race into an alarm.
+        #
+        # A sub-type the enum RECOGNISES but this handler does not is different —
+        # it means a new DATABASE sub-type shipped without its branch here, and
+        # every source of that type would silently stay queryable=False, scanning
+        # cleanly and then answering nothing. That has to be loud.
+        if sub_type in _UNHANDLED_DATABASE_SUB_TYPES:
+            raise RuntimeError(
+                f"No federation branch for sourceSubType {sub_type!r} ({datasource_id}); "
+                f"the source would stay not-queryable with no other signal"
+            )
         logger.info("Skipping federation for non-JDBC source: %s (type=%s)", datasource_id, sub_type)
         return {"provisioned": False, "reason": "not-jdbc"}
 
@@ -243,6 +367,19 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     if not all([host, port, engine, credential_secret_arn, database_name]):
         logger.info("Skipping federation — incomplete JDBC config for %s", datasource_id)
         return {"provisioned": False, "reason": "incomplete-config"}
+
+    # Re-verify the namespace binding on the STORED ARN before anything reads the
+    # secret or writes a policy onto it. Discovery already did this earlier in the
+    # pipeline, so reaching here with an unbound secret means the row or the
+    # secret's tag list changed mid-scan — which is exactly the window this closes,
+    # because the two steps that follow both act on the named secret: the
+    # readability precheck reads it as FEDERATED_CATALOG_ROLE_ARN, and
+    # `_grant_secret_read_to_consumer` rewrites its resource policy.
+    #
+    # Raises rather than skipping, matching this handler's fail-loudly contract:
+    # a secret whose tag does not list this namespace is a refusal, not an
+    # incomplete-config no-op to be silently reported as not-queryable.
+    require_secret_namespace_binding(credential_secret_arn, namespace_id, datasource_id)
 
     # Fail fast: don't provision a connection the managed connector can't
     # authenticate (e.g. a cross-account secret not yet shared with the catalog
@@ -297,7 +434,7 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     # Grant the consumer query principal (AgentCore runtime role) read access to
     # the credential secret so the direct JDBC executor can authenticate at query time.
     # Uses a resource-based policy on the secret (least-privilege, no broad IAM grant).
-    _grant_secret_read_to_consumer(credential_secret_arn)
+    _grant_secret_read_to_consumer(credential_secret_arn, namespace_id)
 
     # Persist the references; roll back the cloud resources if the write fails
     # so we never leave orphaned Glue/LF resources unrecorded, then re-raise to

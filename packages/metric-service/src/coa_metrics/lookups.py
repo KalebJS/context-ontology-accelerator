@@ -18,6 +18,11 @@ import re
 from dataclasses import dataclass
 
 import structlog
+from coa_common.domain_models import ReviewStatus, Table
+from coa_common.metadata_store.reader import (
+    read_asset_names_for_datasource,
+    read_table_for_asset,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -144,9 +149,98 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         self._tables_by_source: dict[str, dict[str, list[ColumnMetadata]]] = {}
         self._source_present: dict[str, bool] = {}
         self._load_failed: dict[str, bool] = {}
+        # Cheap path: table name → asset id, from search pages only.
+        self._names_by_source: dict[str, dict[str, str]] = {}
+        self._names_load_failed: dict[str, bool] = {}
+        # One parsed asset per (source, table), fetched on demand.
+        self._table_cache: dict[tuple[str, str], Table | None] = {}
+
+    def _ensure_names_loaded(self, data_source_id: str) -> None:
+        """Index the source's table NAMES (once). No per-asset form fetch.
+
+        Answers every existence question this lookup is asked. Costs one DataZone
+        search call per 50 assets, independent of table count — where
+        ``_ensure_loaded`` costs one ``get_asset_forms`` per asset on top.
+        """
+        if data_source_id in self._names_by_source:
+            return
+
+        try:
+            names = read_asset_names_for_datasource(self._domain_id, self._project_id, data_source_id)
+        except Exception as exc:
+            logger.warning(
+                "smus_catalog_names_read_failed",
+                data_source_id=data_source_id,
+                namespace=self._namespace_id,
+                error=str(exc),
+            )
+            self._names_by_source[data_source_id] = {}
+            self._names_load_failed[data_source_id] = True
+            return
+
+        logger.info(
+            "smus_catalog_names_read",
+            data_source_id=data_source_id,
+            namespace=self._namespace_id,
+            table_count=len(names),
+        )
+        self._names_by_source[data_source_id] = names
+        self._names_load_failed[data_source_id] = False
+
+    def _approved_table(self, data_source_id: str, table_name: str) -> Table | None:
+        """The named table's approved metadata, or ``None``.
+
+        ``None`` covers the source having no such asset, the asset's form being
+        missing/unparseable, or the table not being steward-approved. A *transient*
+        read failure is handled separately — it is not cached as absence and flips
+        catalog_available() to False (see below) so callers stay fail-open (#161).
+        The approval check is what keeps this equivalent to the previous
+        approved-catalog index — the name index alone cannot see review status, so
+        the ONE candidate's form is fetched to check it. One call, not one per table.
+        """
+        key = (data_source_id, table_name.lower())
+        if key in self._table_cache:
+            return self._table_cache[key]
+
+        self._ensure_names_loaded(data_source_id)
+        asset_id = self._names_by_source.get(data_source_id, {}).get(table_name.lower())
+        if asset_id is None:
+            self._table_cache[key] = None
+            return None
+
+        ds_key = data_source_id if data_source_id.startswith("DS#") else f"DS#{data_source_id}"
+        try:
+            table = read_table_for_asset(self._domain_id, asset_id, f"{ds_key}:{table_name}", data_source_id)
+        except Exception as exc:
+            logger.warning(
+                "smus_asset_read_failed",
+                data_source_id=data_source_id,
+                table=table_name,
+                error=str(exc),
+            )
+            # A transient read failure is NOT provable absence (#161): don't cache
+            # it, and flip the source to unavailable so catalog_available() returns
+            # False. Callers then degrade to the soft table_reference warning
+            # instead of a hard 400, and a later lookup retries the fetch. This
+            # keeps the name-index and per-asset reads failing together, as the old
+            # single whole-catalog read did.
+            self._names_load_failed[data_source_id] = True
+            return None
+
+        if table is not None and table.business_metadata.review_status != ReviewStatus.APPROVED:
+            table = None
+        self._table_cache[key] = table
+        return table
 
     def _ensure_loaded(self, data_source_id: str) -> None:
-        """Fetch and index the approved catalog for a data source (once)."""
+        """Fetch and index the approved catalog for a data source (once).
+
+        The FULL read: one ``get_asset_forms`` per asset. Retained for
+        :meth:`data_source_exists`, whose contract is "this source is APPROVED and
+        has at least one approved table" — a whole-catalog fact that no name index
+        can answer. Only the OSI-import paths call it, so the O(tables) cost stays
+        off metric creation. Do not reintroduce it into the existence checks below.
+        """
         if data_source_id in self._tables_by_source:
             return
 
@@ -212,7 +306,7 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         return self._source_present.get(data_source_id, False)
 
     def table_exists(self, data_source_id: str, table_name: str) -> bool:
-        """Return whether the named table exists in the data source's catalog.
+        """Return whether the named approved table exists in the source's catalog.
 
         Args:
             data_source_id: The data source id owning the table.
@@ -221,8 +315,7 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         Returns:
             True if the approved catalog contains the table, else False.
         """
-        self._ensure_loaded(data_source_id)
-        return table_name.lower() in self._tables_by_source.get(data_source_id, {})
+        return self._approved_table(data_source_id, table_name) is not None
 
     def catalog_available(self, data_source_id: str) -> bool:
         """Whether the approved catalog was read successfully for this source.
@@ -234,21 +327,30 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
             False only when the catalog read raised — in that case an absent
             table proves nothing (see ``DataSourceLookup.catalog_available``).
         """
-        self._ensure_loaded(data_source_id)
-        return not self._load_failed.get(data_source_id, False)
+        self._ensure_names_loaded(data_source_id)
+        return not self._names_load_failed.get(data_source_id, False)
 
     def known_tables(self, data_source_id: str) -> set[str]:
-        """Return the lower-cased approved table names for a data source.
+        """Return the lower-cased table names the source's catalog knows.
 
         Args:
             data_source_id: The data source id to enumerate.
 
         Returns:
-            The set of table names in the approved catalog (empty when the
-            source is unknown or its read failed).
+            The set of table names in the catalog (empty when the source is
+            unknown or its read failed).
+
+        Note:
+            Counts every table asset, approved or not — the previous
+            implementation counted approved ones only. The sole caller
+            (``check_source_table_exists``) uses this as a non-empty guard for "the
+            catalog knows at least one table", i.e. to decide whether a table's
+            absence is *provable*. Counting unapproved tables makes that guard more
+            conservative, which is the safe direction: it can only turn a hard 400
+            into the pre-existing soft warning, never the reverse.
         """
-        self._ensure_loaded(data_source_id)
-        return set(self._tables_by_source.get(data_source_id, {}))
+        self._ensure_names_loaded(data_source_id)
+        return set(self._names_by_source.get(data_source_id, {}))
 
     def get_table_columns(self, data_source_id: str, table_name: str) -> list[ColumnMetadata] | None:
         """Return the approved column metadata for a table.
@@ -260,12 +362,19 @@ class SmusCatalogDataSourceLookup(DataSourceLookup):
         Returns:
             The list of column metadata, or None if the source or table is
             unknown.
+
+        Shares :meth:`_approved_table`'s per-table cache with :meth:`table_exists`,
+        so the validator's usual sequence — exists? then columns, on the same
+        ``sourceTable`` — costs ONE ``get_asset_forms`` call in total.
         """
-        self._ensure_loaded(data_source_id)
-        source_tables = self._tables_by_source.get(data_source_id)
-        if not source_tables:
+        table = self._approved_table(data_source_id, table_name)
+        if table is None:
             return None
-        return source_tables.get(table_name.lower())
+        return [
+            ColumnMetadata(name=col.name, data_type=(col.data_type or "unknown"))
+            for col in table.columns
+            if col.name and col.business_metadata.review_status == ReviewStatus.APPROVED
+        ]
 
 
 # ── Production: Neptune Ontology Lookup ─────────────────────────────────

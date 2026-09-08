@@ -1,6 +1,6 @@
 {
   "name": "coa-infra",
-  "version": "0.1.0",
+  "version": "0.2.3",
   "description": "SemanticContext CDK Infrastructure (TypeScript)",
   "private": true,
   "scripts": {

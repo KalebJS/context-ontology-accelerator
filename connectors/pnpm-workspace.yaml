@@ -1,0 +1,12 @@
+# A workspace of its own, separate from the repository root's.
+#
+# Every connector owns its own CDK app, so that a customer can add whatever resources their
+# source needs — a VPC, an RDS proxy, a secret, a KMS key — without asking permission from
+# any code here. That means N CDK apps, and each one would otherwise pull its own copy of
+# aws-cdk-lib. This workspace shares that dependency between them.
+#
+# It is deliberately not part of the repository's workspace: these are customer-facing
+# samples, they are copied out, and they must build on their own.
+packages:
+  - "cdk-toolkit"
+  - "*/cdk"

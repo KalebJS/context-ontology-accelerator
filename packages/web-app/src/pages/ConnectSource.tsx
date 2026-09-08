@@ -10,6 +10,7 @@ import Box from "@cloudscape-design/components/box";
 import Button from "@cloudscape-design/components/button";
 import Checkbox from "@cloudscape-design/components/checkbox";
 import Container from "@cloudscape-design/components/container";
+import CopyToClipboard from "@cloudscape-design/components/copy-to-clipboard";
 import ExpandableSection from "@cloudscape-design/components/expandable-section";
 import FileUpload from "@cloudscape-design/components/file-upload";
 import FormField from "@cloudscape-design/components/form-field";
@@ -22,11 +23,54 @@ import SpaceBetween from "@cloudscape-design/components/space-between";
 import Tabs from "@cloudscape-design/components/tabs";
 import Tiles from "@cloudscape-design/components/tiles";
 import Toggle from "@cloudscape-design/components/toggle";
-import { useCreateSource, useGetSourceUploadUrls } from "@api-hooks";
+import {
+  useCreateSource,
+  useGetNamespace,
+  useGetSourceUploadUrls,
+} from "@api-hooks";
 import {
   ControlPlaneServiceServiceException,
   SourceType,
 } from "@coa/control-plane-client";
+
+/** Read-only display of the ExternalId a cross-account role's trust policy must pin.
+ *
+ * Deliberately not an input. The platform derives this value from the namespace
+ * and refuses to assume a role without presenting it, so letting the user choose
+ * it would defeat the binding it exists to provide — it is what stops a role
+ * onboarded for one namespace from being read by another.
+ */
+function CrossAccountExternalIdField({
+  externalId,
+  isLoading,
+}: {
+  readonly externalId: string | undefined;
+  readonly isLoading: boolean;
+}): React.JSX.Element {
+  return (
+    <FormField
+      label="External ID (add to the role's trust policy)"
+      description="Context Ontology Accelerator presents this value when assuming the role above. Add it as an sts:ExternalId condition on that role's trust policy — without the condition the role is assumable on behalf of any namespace in this deployment."
+    >
+      {externalId ? (
+        <CopyToClipboard
+          copyButtonAriaLabel="Copy External ID"
+          copyButtonText="Copy"
+          copySuccessText="External ID copied"
+          copyErrorText="Failed to copy External ID"
+          textToCopy={externalId}
+          variant="inline"
+        />
+      ) : (
+        <Box color="text-status-inactive">
+          {isLoading
+            ? "Loading…"
+            : "Unavailable — reload the page to retrieve it."}
+        </Box>
+      )}
+    </FormField>
+  );
+}
 
 /** Extract a human-readable message from any thrown value.
  *  Smithy sets `message = "UnknownError"` for unmodeled error responses;
@@ -67,8 +111,31 @@ import { S3_ARN_RE, validateS3Prefix } from "@utils/helpers";
 
 // ── Source type options ───────────────────────────────────────────────────────
 
-// Three-way selection shown in step 1
-type SourceKind = "GLUE_DATABASE" | "JDBC_DATABASE" | "DOCUMENTS";
+// Four-way selection shown in step 1
+type SourceKind =
+  | "GLUE_DATABASE"
+  | "JDBC_DATABASE"
+  | "CUSTOM_CONNECTOR"
+  | "DOCUMENTS";
+
+/** Narrow a Tiles selection to a SourceKind. Cloudscape hands back a plain
+ *  string, and a guard keeps that boundary honest without a cast. */
+function isSourceKind(value: string): value is SourceKind {
+  return (
+    value === "GLUE_DATABASE" ||
+    value === "JDBC_DATABASE" ||
+    value === "CUSTOM_CONNECTOR" ||
+    value === "DOCUMENTS"
+  );
+}
+
+// Labels for the step-1 tiles, reused by the review step's summary.
+const SOURCE_KIND_LABELS: Record<SourceKind, string> = {
+  GLUE_DATABASE: "Glue database",
+  JDBC_DATABASE: "JDBC database",
+  CUSTOM_CONNECTOR: "Custom connector",
+  DOCUMENTS: "Documents",
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -156,7 +223,6 @@ interface Model {
   glueTableExcludeFilter: string;
   glueAthenaDataCatalogName: string;
   glueCrossAccountRoleArn: string;
-  glueExternalId: string;
   // How this Glue/Iceberg source's queries execute at serve time.
   // "ATHENA" (default) or "REDSHIFT" (Redshift Serverless awsdatacatalog
   // auto-mount). NOTE: this is the *execution engine* for a Glue source — it is
@@ -178,7 +244,15 @@ interface Model {
   dbWarehouse: string;
   dbRole: string;
   jdbcCrossAccountRoleArn: string;
-  jdbcExternalId: string;
+  // Custom Athena Query Federation connector config. The connector is a Lambda
+  // the customer authors and deploys in their own account; there is no Glue
+  // database and no cross-account role to assume, so this config carries only
+  // the function ARNs, the one database to expose, and the table filters.
+  customConnectorName: string;
+  customConnectorFunctionArn: string;
+  customConnectorDatabaseName: string;
+  customConnectorTableFilter: string;
+  customConnectorTableExcludeFilter: string;
   // Shared database enrichment toggle — when false, the backend skips the
   // AI metadata enrichment step entirely and only persists discovered
   // technical metadata for steward review.
@@ -206,7 +280,6 @@ const initialModel: Model = {
   glueTableExcludeFilter: "",
   glueAthenaDataCatalogName: "",
   glueCrossAccountRoleArn: "",
-  glueExternalId: "",
   glueExecutionEngine: "ATHENA",
   glueRedshiftWorkgroup: "",
   jdbcName: "",
@@ -222,7 +295,11 @@ const initialModel: Model = {
   dbWarehouse: "",
   dbRole: "",
   jdbcCrossAccountRoleArn: "",
-  jdbcExternalId: "",
+  customConnectorName: "",
+  customConnectorFunctionArn: "",
+  customConnectorDatabaseName: "",
+  customConnectorTableFilter: "",
+  customConnectorTableExcludeFilter: "",
   metadataEnrichmentEnabled: true,
   docUploadName: "",
   docUploadFiles: [],
@@ -253,6 +330,24 @@ function validateCrossAccountRoleArn(arn: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Validate a connector Lambda function ARN.
+ * Mirrors the LambdaFunctionArn shape the backend accepts: a full ARN,
+ * optionally qualified with a version, an alias, or $LATEST. Lambda's partial
+ * ARN and name-only forms are rejected — the connector runs in the customer's
+ * account, so an unqualified name would resolve against this deployment's
+ * account instead.
+ */
+function validateLambdaFunctionArn(arn: string): string | undefined {
+  if (!arn.trim()) return undefined; // callers decide whether the field is required
+  const lambdaArnPattern =
+    /^arn:aws[a-z-]*:lambda:[a-z0-9-]+:\d{12}:function:[a-zA-Z0-9_-]+(:(\$LATEST|[a-zA-Z0-9_-]+))?$/;
+  if (!lambdaArnPattern.test(arn.trim())) {
+    return "Must be a full Lambda function ARN: arn:aws:lambda:REGION:ACCOUNT:function:NAME";
+  }
+  return undefined;
+}
+
 interface ValidationErrors {
   step1?: string;
   dbName?: string;
@@ -267,11 +362,29 @@ interface ValidationErrors {
   dbDatabaseName?: string;
   dbSecretArn?: string;
   jdbcCrossAccountRoleArn?: string;
+  customConnectorName?: string;
+  customConnectorFunctionArn?: string;
+  customConnectorDatabaseName?: string;
   docUploadName?: string;
   docFiles?: string;
   docS3Name?: string;
   docS3BucketArn?: string;
   docS3Prefixes?: Record<number, string>;
+}
+
+/** The name field that belongs to the selected source kind. A switch rather
+ *  than a ternary chain so a new kind cannot silently inherit another's name. */
+function sourceNameFor(model: Model, docTab: "upload" | "s3"): string {
+  switch (model.sourceKind) {
+    case "GLUE_DATABASE":
+      return model.dbName;
+    case "JDBC_DATABASE":
+      return model.jdbcName;
+    case "CUSTOM_CONNECTOR":
+      return model.customConnectorName;
+    case "DOCUMENTS":
+      return docTab === "upload" ? model.docUploadName : model.docS3Name;
+  }
 }
 
 function validateStep2(
@@ -306,6 +419,19 @@ function validateStep2(
       errs.dbSecretArn = "Secrets Manager ARN is required.";
     const roleErr = validateCrossAccountRoleArn(model.jdbcCrossAccountRoleArn);
     if (roleErr) errs.jdbcCrossAccountRoleArn = roleErr;
+  } else if (model.sourceKind === "CUSTOM_CONNECTOR") {
+    if (!model.customConnectorName.trim())
+      errs.customConnectorName = "Name is required.";
+    if (!model.customConnectorFunctionArn.trim())
+      errs.customConnectorFunctionArn = "Connector function ARN is required.";
+    else {
+      const arnErr = validateLambdaFunctionArn(
+        model.customConnectorFunctionArn,
+      );
+      if (arnErr) errs.customConnectorFunctionArn = arnErr;
+    }
+    if (!model.customConnectorDatabaseName.trim())
+      errs.customConnectorDatabaseName = "Database name is required.";
   } else {
     // DOCUMENTS
     if (docTab === "upload") {
@@ -344,6 +470,12 @@ function validateStep2(
 
 export const ConnectSource: React.FC = () => {
   const { namespaceId } = useParams<{ namespaceId: string }>();
+  // The ExternalId shown for cross-account roles is derived server-side from the
+  // namespace, so it comes from the namespace detail rather than being typed in.
+  const { data: namespaceData, isLoading: namespaceLoading } = useGetNamespace(
+    namespaceId ?? "",
+  );
+  const datasourceExternalId = namespaceData?.namespace?.datasourceExternalId;
   const navigate = useNavigate();
 
   const [model, setModel] = useState<Model>(initialModel);
@@ -359,7 +491,8 @@ export const ConnectSource: React.FC = () => {
 
   const isDatabase =
     model.sourceKind === "GLUE_DATABASE" ||
-    model.sourceKind === "JDBC_DATABASE";
+    model.sourceKind === "JDBC_DATABASE" ||
+    model.sourceKind === "CUSTOM_CONNECTOR";
 
   // ── Mutations ──────────────────────────────────────────────────────
   const {
@@ -438,7 +571,6 @@ export const ConnectSource: React.FC = () => {
                   : model.glueAthenaDataCatalogName.trim() || undefined,
               crossAccountRoleArn:
                 model.glueCrossAccountRoleArn.trim() || undefined,
-              externalId: model.glueExternalId.trim() || undefined,
               // Only send executionEngine/redshiftWorkgroup when the
               // user opts into Redshift — omitting them keeps ATHENA the default.
               executionEngine:
@@ -480,7 +612,30 @@ export const ConnectSource: React.FC = () => {
               role: model.dbRole.trim() || undefined,
               crossAccountRoleArn:
                 model.jdbcCrossAccountRoleArn.trim() || undefined,
-              externalId: model.jdbcExternalId.trim() || undefined,
+            },
+          },
+        },
+      });
+      return;
+    }
+
+    if (model.sourceKind === "CUSTOM_CONNECTOR") {
+      createSource({
+        namespaceId: namespaceId!,
+        body: {
+          sourceType: SourceType.DATABASE,
+          databaseSource: {
+            name: model.customConnectorName.trim(),
+            metadataEnrichmentEnabled: model.metadataEnrichmentEnabled,
+            // customConnectorConfiguration only: the backend rejects a payload carrying
+            // more than one of glue/jdbc/athena configuration, since the
+            // configuration present is what selects the sub-type.
+            customConnectorConfiguration: {
+              connectorFunctionArn: model.customConnectorFunctionArn.trim(),
+              databaseName: model.customConnectorDatabaseName.trim(),
+              tableFilter: model.customConnectorTableFilter.trim() || undefined,
+              tableExcludeFilter:
+                model.customConnectorTableExcludeFilter.trim() || undefined,
             },
           },
         },
@@ -521,9 +676,9 @@ export const ConnectSource: React.FC = () => {
           contentType: resolveContentType(f),
         })),
       });
-      const { s3Prefix, uploadUrls } = result;
-      if (!s3Prefix || !uploadUrls)
-        throw new Error("Invalid response: missing s3Prefix or uploadUrls.");
+      const { uploadId, uploadUrls } = result;
+      if (!uploadId || !uploadUrls)
+        throw new Error("Invalid response: missing uploadId or uploadUrls.");
 
       const fileMap = new Map(model.docUploadFiles.map((f) => [f.name, f]));
       let completed = 0;
@@ -554,7 +709,7 @@ export const ConnectSource: React.FC = () => {
           sourceType: SourceType.DOCUMENTS,
           documentSource: {
             name: model.docUploadName.trim(),
-            s3Prefixes: [s3Prefix],
+            uploadId,
             extractionConfig: {
               enableVersioning: model.enableVersioning,
               deletePrevVersions: model.deletePrevVersions,
@@ -589,24 +744,31 @@ export const ConnectSource: React.FC = () => {
         <Container header={<Header variant="h2">Source type</Header>}>
           <Tiles
             value={model.sourceKind}
-            onChange={({ detail }) =>
-              setField("sourceKind", detail.value as SourceKind)
-            }
+            onChange={({ detail }) => {
+              if (isSourceKind(detail.value))
+                setField("sourceKind", detail.value);
+            }}
             items={[
               {
                 value: "GLUE_DATABASE",
-                label: "Glue database",
+                label: SOURCE_KIND_LABELS.GLUE_DATABASE,
                 description:
                   "Connect to an existing AWS Glue Data Catalog database. Covers S3/Iceberg tables, DynamoDB, and Athena-federated JDBC sources.",
               },
               {
                 value: "JDBC_DATABASE",
-                label: "JDBC database",
+                label: SOURCE_KIND_LABELS.JDBC_DATABASE,
                 description: `Connect directly to a relational database. Schema is discovered from information_schema. Supported engines: ${ENGINE_LABELS}.`,
               },
               {
+                value: "CUSTOM_CONNECTOR",
+                label: SOURCE_KIND_LABELS.CUSTOM_CONNECTOR,
+                description:
+                  "Bring your own data source: register an Athena Query Federation SDK connector you built and deployed as a Lambda in your own AWS account. Schema and rows are read through Athena against that connector.",
+              },
+              {
                 value: "DOCUMENTS",
-                label: "Documents",
+                label: SOURCE_KIND_LABELS.DOCUMENTS,
                 description:
                   "Ingest unstructured documents from an S3 bucket or by uploading files directly.",
               },
@@ -796,7 +958,7 @@ export const ConnectSource: React.FC = () => {
                 )}
                 <FormField
                   label="Cross-account role ARN"
-                  description="Optional. For a Glue catalog in another account, the IAM role Context Ontology Accelerator assumes to read catalog metadata. Must be named {prefix}-datasource-access-*."
+                  description="Optional. For a Glue catalog in another account, the IAM role Context Ontology Accelerator assumes to read catalog metadata. Must be named {prefix}-datasource-access-*, and its trust policy must require the External ID below."
                   errorText={step2Errs.glueCrossAccountRoleArn}
                 >
                   <Input
@@ -807,18 +969,10 @@ export const ConnectSource: React.FC = () => {
                     placeholder="arn:aws:iam::222222222222:role/coa-dev-datasource-access-acme"
                   />
                 </FormField>
-                <FormField
-                  label="External ID"
-                  description="Optional. STS ExternalId required by the cross-account role's trust policy."
-                >
-                  <Input
-                    value={model.glueExternalId}
-                    onChange={({ detail }) =>
-                      setField("glueExternalId", detail.value)
-                    }
-                    placeholder="optional-external-id"
-                  />
-                </FormField>
+                <CrossAccountExternalIdField
+                  externalId={datasourceExternalId}
+                  isLoading={namespaceLoading}
+                />
               </SpaceBetween>
             </ExpandableSection>
           </SpaceBetween>
@@ -1043,7 +1197,7 @@ export const ConnectSource: React.FC = () => {
                 )}
                 <FormField
                   label="Cross-account role ARN"
-                  description="Optional. For a credential secret in another account, the IAM role Context Ontology Accelerator assumes to read it. Must be named {prefix}-datasource-access-*."
+                  description="Optional. For a credential secret in another account, the IAM role Context Ontology Accelerator assumes to read it. Must be named {prefix}-datasource-access-*, and its trust policy must require the External ID below."
                   errorText={step2Errs.jdbcCrossAccountRoleArn}
                 >
                   <Input
@@ -1054,16 +1208,119 @@ export const ConnectSource: React.FC = () => {
                     placeholder="arn:aws:iam::222222222222:role/coa-dev-datasource-access-acme"
                   />
                 </FormField>
+                <CrossAccountExternalIdField
+                  externalId={datasourceExternalId}
+                  isLoading={namespaceLoading}
+                />
+              </SpaceBetween>
+            </ExpandableSection>
+          </SpaceBetween>
+        ),
+      };
+    } else if (model.sourceKind === "CUSTOM_CONNECTOR") {
+      step2 = {
+        title: "Configure connection",
+        description:
+          "Point at the Athena Query Federation connector you deployed.",
+        errorText: step2Errs.step1,
+        content: (
+          <SpaceBetween size="l">
+            <Container header={<Header variant="h2">Source details</Header>}>
+              <FormField
+                label={
+                  <>
+                    Source name{" "}
+                    <Box variant="span" color="text-status-error">
+                      *
+                    </Box>
+                  </>
+                }
+                description="A unique name for this source within the namespace."
+                errorText={step2Errs.customConnectorName}
+              >
+                <Input
+                  value={model.customConnectorName}
+                  onChange={({ detail }) =>
+                    setField("customConnectorName", detail.value)
+                  }
+                  placeholder="My Custom Connector"
+                />
+              </FormField>
+            </Container>
+            <Container header={<Header variant="h2">Connector</Header>}>
+              <SpaceBetween size="l">
                 <FormField
-                  label="External ID"
-                  description="Optional. STS ExternalId required by the cross-account role's trust policy."
+                  label={
+                    <>
+                      Connector function ARN{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description="The connector Lambda. It serves both metadata and record requests. It must live in the same AWS Region as Context Ontology Accelerator; a connector in another Region is rejected, because Athena can only invoke a data source connector co-located with the query."
+                  errorText={step2Errs.customConnectorFunctionArn}
                 >
                   <Input
-                    value={model.jdbcExternalId}
+                    value={model.customConnectorFunctionArn}
                     onChange={({ detail }) =>
-                      setField("jdbcExternalId", detail.value)
+                      setField("customConnectorFunctionArn", detail.value)
                     }
-                    placeholder="optional-external-id"
+                    placeholder="arn:aws:lambda:us-east-1:123456789012:function:my-connector"
+                  />
+                </FormField>
+                <FormField
+                  label={
+                    <>
+                      Database name{" "}
+                      <Box variant="span" color="text-status-error">
+                        *
+                      </Box>
+                    </>
+                  }
+                  description="The single database inside the connector's catalog that this source exposes. A connector serving several databases is onboarded once per database."
+                  errorText={step2Errs.customConnectorDatabaseName}
+                >
+                  <Input
+                    value={model.customConnectorDatabaseName}
+                    onChange={({ detail }) =>
+                      setField("customConnectorDatabaseName", detail.value)
+                    }
+                    placeholder="my_connector_db"
+                  />
+                </FormField>
+              </SpaceBetween>
+            </Container>
+            <ExpandableSection
+              headerText="Advanced configuration"
+              variant="container"
+            >
+              <SpaceBetween size="l">
+                <FormField
+                  label="Table filter"
+                  description="Optional glob(s) (* ? [seq]) to include specific tables. Separate multiple with | or ,."
+                >
+                  <Input
+                    value={model.customConnectorTableFilter}
+                    onChange={({ detail }) =>
+                      setField("customConnectorTableFilter", detail.value)
+                    }
+                    placeholder="orders|customers"
+                  />
+                </FormField>
+                <FormField
+                  label="Table exclude filter"
+                  description="Optional glob(s) (* ? [seq]) to exclude specific tables. Applied after the include filter. Separate multiple with | or ,."
+                >
+                  <Input
+                    value={model.customConnectorTableExcludeFilter}
+                    onChange={({ detail }) =>
+                      setField(
+                        "customConnectorTableExcludeFilter",
+                        detail.value,
+                      )
+                    }
+                    placeholder="tmp_*|staging_*"
                   />
                 </FormField>
               </SpaceBetween>
@@ -1379,23 +1636,11 @@ export const ConnectSource: React.FC = () => {
               items={[
                 {
                   label: "Category",
-                  value:
-                    model.sourceKind === "GLUE_DATABASE"
-                      ? "Glue database"
-                      : model.sourceKind === "JDBC_DATABASE"
-                        ? "JDBC database"
-                        : "Documents",
+                  value: SOURCE_KIND_LABELS[model.sourceKind],
                 },
                 {
                   label: "Source name",
-                  value:
-                    model.sourceKind === "GLUE_DATABASE"
-                      ? model.dbName
-                      : model.sourceKind === "JDBC_DATABASE"
-                        ? model.jdbcName
-                        : docTab === "upload"
-                          ? model.docUploadName
-                          : model.docS3Name,
+                  value: sourceNameFor(model, docTab),
                 },
               ]}
             />
@@ -1441,6 +1686,27 @@ export const ConnectSource: React.FC = () => {
                   {
                     label: "Authentication",
                     value: "AWS Secrets Manager",
+                  },
+                ]}
+              />
+            </Container>
+          )}
+          {model.sourceKind === "CUSTOM_CONNECTOR" && (
+            <Container header={<Header variant="h2">Connection</Header>}>
+              <KeyValuePairs
+                columns={2}
+                items={[
+                  {
+                    label: "Connector function ARN",
+                    value: model.customConnectorFunctionArn,
+                  },
+                  {
+                    label: "Database",
+                    value: model.customConnectorDatabaseName,
+                  },
+                  {
+                    label: "Table filter",
+                    value: model.customConnectorTableFilter || "(none)",
                   },
                 ]}
               />

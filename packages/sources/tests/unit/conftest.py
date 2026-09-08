@@ -21,6 +21,9 @@ shell they ran in.
 """
 
 import os
+from unittest.mock import patch
+
+import pytest
 
 os.environ.setdefault("ALLOWED_ORIGIN", "https://test.example.com")
 
@@ -33,3 +36,35 @@ os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
 os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
 os.environ.setdefault("AWS_SECURITY_TOKEN", "testing")
 os.environ.setdefault("AWS_SESSION_TOKEN", "testing")
+
+# Imported after the env block above: the module reads AWS_REGION at import time.
+from coa_sources.database import glue_ownership  # noqa: E402
+
+_STUB_ACCOUNT = "000000000000"
+
+
+@pytest.fixture(autouse=True)
+def stub_glue_ownership(request):
+    """Treat every Glue database as shared with all namespaces, unless opted out.
+
+    Creating or scanning a Glue source now requires the target database to be
+    registered to the caller's namespace — a live ``glue:GetTags`` call and an STS
+    identity lookup (see ``coa_sources.database.glue_ownership``). Neither is what
+    the tests around them are about, and unstubbed both reach for the network and
+    then fail closed, turning every Glue fixture into a 403.
+
+    The ownership check itself is covered directly in
+    ``tests/unit/database/test_glue_ownership.py`` and the route/pipeline tests that
+    carry the ``real_glue_ownership`` marker, which this fixture steps aside for.
+    Reach for that marker in any new test where the ownership decision is the
+    subject rather than a precondition.
+    """
+    if request.node.get_closest_marker("real_glue_ownership"):
+        yield
+        return
+    shared = glue_ownership._TagLookup(frozenset({glue_ownership.SHARED_WITH_ALL}), missing=False)
+    with (
+        patch.object(glue_ownership, "_tagged_namespaces", return_value=shared),
+        patch.object(glue_ownership, "_deployment_account", return_value=_STUB_ACCOUNT),
+    ):
+        yield

@@ -58,6 +58,12 @@ from coa_control_plane_server.models.ingest_ontology_from_s3_request_content imp
 from coa_control_plane_server.models.ingest_ontology_from_s3_response_content import (
     IngestOntologyFromS3ResponseContent,
 )
+from coa_control_plane_server.models.list_ontologies_response_content import (
+    ListOntologiesResponseContent,
+)
+from coa_control_plane_server.models.ontology_record import (
+    OntologyRecord as _OntologyRecord,
+)
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
@@ -164,6 +170,20 @@ def _to_response(ont: dict) -> OntologyResponse:
     return OntologyResponse(**merged)
 
 
+def _to_record(ont: dict) -> _OntologyRecord:
+    """Adapt a registry row to the Smithy-declared ``OntologyRecord``.
+
+    ``list_ontologies`` serialises the generated model (``by_alias``) so the wire
+    matches the contract in ``models/src/main/smithy/ontology-graph.smithy``, and
+    the generated TS client can actually deserialise it. Reuses ``_to_response``
+    for the merge/defaulting, then drops down to the contract's field subset —
+    the generated model ignores extras, so registry-only bookkeeping fields
+    (``imports``, ``source``, ``embedding_index``, …) fall away here rather than
+    leaking into a declared response shape that has no place for them.
+    """
+    return _OntologyRecord.model_validate(_to_response(ont).model_dump())
+
+
 def _merge_registry_and_graph(registry_row: dict | None, graph_row: dict | None) -> dict | None:
     """Merge a Dynamo registry row with a graph-store row.
 
@@ -181,7 +201,7 @@ def _merge_registry_and_graph(registry_row: dict | None, graph_row: dict | None)
     return merged
 
 
-@router.get("/", response_model=list[OntologyResponse])
+@router.get("/", response_model=ListOntologiesResponseContent, response_model_by_alias=True)
 def list_ontologies(
     ontology_type: str | None = None,
     uri: str | None = None,
@@ -206,7 +226,7 @@ def list_ontologies(
         rows = [r for r in rows if r.get("source_registry") == source_registry]
     if license_tier:
         rows = [r for r in rows if r.get("license_tier") == license_tier]
-    return [_to_response(r) for r in rows[skip : skip + limit]]
+    return ListOntologiesResponseContent(ontologies=[_to_record(r) for r in rows[skip : skip + limit]])
 
 
 @router.get("/{ontology_id:path}/download")
@@ -1344,8 +1364,6 @@ def get_ontology_upload_url(body: GetOntologyUploadUrlRequestContent, namespace:
     """
     import uuid as _uuid
 
-    import boto3 as _boto3
-
     # The Smithy model leaves content_type optional; default to text/turtle.
     content_type = body.content_type or "text/turtle"
     if content_type not in _SUPPORTED_ONTOLOGY_TYPES:
@@ -1364,16 +1382,19 @@ def get_ontology_upload_url(body: GetOntologyUploadUrlRequestContent, namespace:
         raise HTTPException(400, "Invalid filename after sanitization.")
     s3_key = f"ontology-uploads/{namespace}/{upload_id}/{safe_filename}"
 
-    _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
     try:
-        s3 = _boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-1"))
-        url = s3.generate_presigned_url(
+        # Reuse the s3v4-pinned client from dynamo_store — a no-Config client
+        # falls back to the deprecated SigV2 presigner (still the default in
+        # pre-2014 regions like us-east-1), and SigV2-only regions won't sign at
+        # all. Only ``ContentType`` is signed: a signed ``ContentLength`` would
+        # force the browser to PUT exactly that many bytes under SigV4 (403 for
+        # anything else) — it never capped upload size for a presigned PUT.
+        url = dynamo_store._get_s3().generate_presigned_url(
             "put_object",
             Params={
                 "Bucket": _ONTOLOGY_BUCKET,
                 "Key": s3_key,
                 "ContentType": content_type,
-                "ContentLength": _MAX_UPLOAD_BYTES,
             },
             ExpiresIn=_UPLOAD_EXPIRY_SECONDS,
         )

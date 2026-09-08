@@ -1,6 +1,7 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import * as fs from "fs";
 import * as cdk from "aws-cdk-lib";
 import * as cr from "aws-cdk-lib/custom-resources";
 import * as iam from "aws-cdk-lib/aws-iam";
@@ -11,7 +12,61 @@ import { PublicUIConstruct } from "../../constructs/public-ui-construct";
 import { RuntimeConfig } from "@coa/shared";
 import { SCLStack } from "../../constructs/scl-stack";
 import { resolveContext } from "../../context";
+import { fromRoot } from "../../paths";
 import { CustomDomainConfig } from "../../types";
+
+/**
+ * Read the monorepo version from the repo-root VERSION file (the single source
+ * of truth kept in sync across all manifests by `scripts/sync_version.py`).
+ * Surfaced to the frontend via runtime-config.json so the UI shows the deployed
+ * version without a rebuild. Returns undefined if the file is missing so a
+ * deploy is never blocked on it.
+ */
+export function readRepoVersion(
+  versionFile: string = fromRoot("VERSION"),
+): string | undefined {
+  try {
+    return fs.readFileSync(versionFile, "utf-8").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Assemble the {@link RuntimeConfig} written to `runtime-config.json`. Optional
+ * fields are omitted (not emitted as `undefined`) so a missing apiEndpoint,
+ * serveRuntimeArn, or version leaves no key behind — the frontend treats an
+ * absent key and an absent value identically. Pure and exported so the
+ * include/omit behavior is unit-testable without a synth.
+ */
+export function buildRuntimeConfig(args: {
+  region: string;
+  stage: string;
+  authority: string;
+  clientId: string;
+  apiEndpoint?: string;
+  serveRuntimeArn?: string;
+  version?: string;
+}): RuntimeConfig {
+  const {
+    region,
+    stage,
+    authority,
+    clientId,
+    apiEndpoint,
+    serveRuntimeArn,
+    version,
+  } = args;
+  return {
+    region,
+    stage,
+    authority,
+    clientId,
+    ...(apiEndpoint && { apiEndpoint }),
+    ...(serveRuntimeArn && { serveRuntimeArn }),
+    ...(version && { version }),
+  };
+}
 
 export interface WebStackProps extends cdk.StackProps {
   /**
@@ -100,18 +155,21 @@ export class WebStack extends SCLStack {
     const uiCertificateArn = props.customDomain?.uiCertificateArn;
     const apiDomainName = props.customDomain?.apiDomainName;
 
-    const runtimeConfig: RuntimeConfig = {
+    // Prefer the custom API domain when configured; otherwise the direct
+    // API endpoint. Undefined when neither is set — buildRuntimeConfig omits it.
+    const apiEndpoint = apiDomainName
+      ? `https://${apiDomainName}`
+      : props.apiEndpoint;
+
+    const runtimeConfig = buildRuntimeConfig({
       region: this.region,
       stage: this.envName,
       authority,
       clientId,
-      // Prefer the custom API domain when configured; otherwise the direct
-      // API endpoint.
-      ...(apiDomainName
-        ? { apiEndpoint: `https://${apiDomainName}` }
-        : props.apiEndpoint && { apiEndpoint: props.apiEndpoint }),
-      ...(props.serveRuntimeArn && { serveRuntimeArn: props.serveRuntimeArn }),
-    };
+      apiEndpoint,
+      serveRuntimeArn: props.serveRuntimeArn,
+      version: readRepoVersion(),
+    });
 
     if (props.enablePrivateEndpoints) {
       throw new Error(

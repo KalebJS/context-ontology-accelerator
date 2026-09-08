@@ -15,6 +15,11 @@ export {
   DEFAULT_EVENT_SOURCE_PREFIX,
   DEFAULT_DZ_TYPE_PREFIX,
   BRAND,
+  CONNECTOR_TAG_KEY,
+  CONNECTOR_TAG_VALUE,
+  CONNECTOR_SPILL_KMS_TAG_KEY,
+  CONNECTOR_SPILL_KMS_TAG_VALUE,
+  CONNECTOR_SPILL_KEY_GLOB,
 } from "@coa/shared";
 
 /** CDK context key names. */
@@ -192,5 +197,15 @@ export const DEFAULT_EXTRACTION_CONFIG = {
   use_batch_inference: "false",
   enable_versioning: "true",
   enable_proposition_extraction: "true",
+  // Corpus-derived entity-class vocabulary; see graph_build.py.
+  infer_entity_classifications: "true",
+  // Explicit vocabulary (JSON-encoded list); "[]" means no explicit list, use
+  // infer or the toolkit default depending on the flag above.
+  preferred_entity_classifications: "[]",
+  // Textract TABLES routing off by default.
+  enable_table_extraction: "false",
+  // "0" means "use the graphrag-toolkit default (256 / 25)".
+  chunk_size: "0",
+  chunk_overlap: "0",
   delete_prev_versions: "false",
 } as const;

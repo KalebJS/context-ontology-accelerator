@@ -97,6 +97,26 @@ export function prefixed(node: Node, name: string): string {
 }
 
 /**
+ * Resource-tag key that binds a resource the platform reads, but does not own,
+ * to the namespaces entitled to it — today a JDBC source's credential secret,
+ * tagged `{prefix}:namespace = "<namespaceId> [<namespaceId> ...]"`.
+ *
+ * Carries `prefix` (not the static brand) for the same reason `eventSourcePrefix`
+ * does: the resource being tagged is account-global and therefore shared, so two
+ * deployments co-located in one account must bind independently. A secret
+ * onboarded to `scl` is not readable by a `coa` deployment, whose IAM conditions
+ * name their own key.
+ *
+ * Single source of truth for the synth side. The runtime derives the same key
+ * from `RESOURCE_TAG_PREFIX` (see `namespace_tag_key()` in
+ * libs/common/constants.py) — the two must agree exactly or registration writes
+ * a tag the IAM conditions cannot match.
+ */
+export function namespaceTagKey(node: Node): string {
+  return `${resolveContext(node).prefix}:namespace`;
+}
+
+/**
  * Resolve the `lambda_reserved_concurrency` context value shared by the VKG
  * reload and doc-preprocessing Lambdas.
  *

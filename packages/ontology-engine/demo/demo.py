@@ -105,6 +105,19 @@ def _http_fetch(method: str, url: str, **kwargs) -> dict | list:
     sys.exit(1)
 
 
+def _list_ontologies(**params) -> list[dict]:
+    """GET /ontologies/ and return the rows, unwrapping the response envelope.
+
+    ListOntologies answers with camelCase ``{"ontologies": [...]}`` per its
+    Smithy contract. A bare array is still accepted so the demo keeps working
+    against an older deployment.
+    """
+    payload = _http_fetch("GET", f"{CATALOG_URL}/ontologies/", params=params, timeout=10)
+    if isinstance(payload, dict):
+        return payload.get("ontologies") or []
+    return payload or []
+
+
 def timed(label: str):
     """Context manager that records wall-clock time for a step."""
 
@@ -235,24 +248,8 @@ def browse_ontology_catalog() -> list[str] | None:
 
     # Fetch both foundational and customer-provided in one pass, merge.
     with timed("fetch_ontologies"):
-        foundational = (
-            _http_fetch(
-                "GET",
-                f"{CATALOG_URL}/ontologies/",
-                params={"ontology_type": "foundational"},
-                timeout=10,
-            )
-            or []
-        )
-        customer = (
-            _http_fetch(
-                "GET",
-                f"{CATALOG_URL}/ontologies/",
-                params={"ontology_type": "customer_provided"},
-                timeout=10,
-            )
-            or []
-        )
+        foundational = _list_ontologies(ontology_type="foundational")
+        customer = _list_ontologies(ontology_type="customer_provided")
 
     # Tag with tier (engine returns ontology_type per record but we want a
     # short display label for the table).
@@ -284,8 +281,8 @@ def browse_ontology_catalog() -> list[str] | None:
             f"[{tier_color}]{tier}[/]",
             o["title"],
             o["uri"],
-            str(o.get("class_count") or "—"),
-            ", ".join(o.get("domain_tags", [])) or "—",
+            str(o.get("classCount") or "—"),
+            ", ".join(o.get("domainTags") or []) or "—",
         )
 
     console.print(t)
@@ -332,7 +329,7 @@ def browse_ontology_catalog() -> list[str] | None:
                 return []
             if selection == "all":
                 return None
-    return [onts[i]["id"] for i in indices if 0 <= i < len(onts)]
+    return [onts[i]["ontologyId"] for i in indices if 0 <= i < len(onts)]
 
 
 # ── Step 3: Configure & run induction ──────────────────────────
@@ -701,15 +698,7 @@ def benchmark_against_golden(report: dict, datasource_ids: list[str]):
     tier_prefixes: dict[str, str] = {}  # uri_prefix → 'customer' | 'foundational'
     try:
         for ont_type in ("customer_provided", "foundational"):
-            onts = (
-                _http_fetch(
-                    "GET",
-                    f"{CATALOG_URL}/ontologies/",
-                    params={"ontology_type": ont_type},
-                    timeout=10,
-                )
-                or []
-            )
+            onts = _list_ontologies(ontology_type=ont_type)
             tier = "customer" if ont_type == "customer_provided" else "foundational"
             for o in onts:
                 uri = (o.get("uri") or "").rstrip("/#")
@@ -1024,12 +1013,7 @@ def export_ontology():
     """Let the user select an induced ontology and display its Turtle content."""
     console.rule("[bold cyan]Export Ontology")
 
-    ontologies = _http_fetch(
-        "GET",
-        f"{CATALOG_URL}/ontologies/",
-        params={"ontology_type": "induced"},
-        timeout=10,
-    )
+    ontologies = _list_ontologies(ontology_type="induced")
 
     if not ontologies:
         console.print("  [yellow]No induced ontologies found.[/]")
@@ -1042,7 +1026,7 @@ def export_ontology():
     t.add_column("URI")
 
     for i, o in enumerate(ontologies, 1):
-        t.add_row(str(i), str(o["id"]), o["title"], o["uri"])
+        t.add_row(str(i), str(o["ontologyId"]), o["title"], o["uri"])
 
     console.print(t)
     console.print()
@@ -1064,7 +1048,7 @@ def export_ontology():
         return
 
     onto = ontologies[idx]
-    encoded_id = quote(onto["id"], safe="")
+    encoded_id = quote(onto["ontologyId"], safe="")
     try:
         resp = httpx.get(f"{CATALOG_URL}/ontologies/{encoded_id}/download", timeout=30)
     except httpx.HTTPError as e:

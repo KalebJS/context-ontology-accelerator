@@ -60,6 +60,60 @@ const ACTIVE_STATUSES = new Set([
   "REJECTING",
 ]);
 
+// Human labels for the DATABASE sub-types. A lookup rather than a ternary so a
+// sub-type without an entry shows its own name instead of being mislabelled as
+// one of the others.
+const DATABASE_SUBTYPE_LABELS: Record<string, string> = {
+  GLUE_DATABASE: "Glue database",
+  JDBC_DATABASE: "JDBC database",
+  CUSTOM_CONNECTOR: "Custom connector",
+};
+
+// ── Degraded-scan annotation ──────────────────────────────────────────────────
+//
+// Discovery for the CUSTOM_CONNECTOR sub-type reads one table at a time (a
+// DESCRIBE per table), so a single unreadable table is dropped while the scan
+// as a whole still SUCCEEDS. The scan job then reports `tablesFailed` — the
+// count of listed-but-unreadable tables, absent rather than zero when the scan
+// was clean, so its presence alone marks the scan degraded — and
+// `failedTables`, the affected tables as `database.table`.
+//
+// `failedTables` is a capped diagnostic sample and may be shorter than
+// `tablesFailed`, so the count is always taken from `tablesFailed` and never
+// derived from the list's length.
+//
+// Both members ARE modelled on `GetSourceScanJobOutput`, but they are read
+// defensively off the response rather than by typed field access, mirroring
+// `normalizeResponse` in `@api-hooks/normalize-response` — the package's idiom
+// for values the API assembles as a raw dict rather than through a model.
+//
+// The `typeof === "number"` check is load-bearing, not decoration. DynamoDB
+// numbers arrive as `Decimal` through boto3's resource interface and serialize to
+// JSON as STRINGS unless the handler coerces them, so a regression on the API
+// side must read here as "not degraded" rather than as a truthy count.
+
+interface DegradedScan {
+  tablesFailed: number;
+  failedTables: string[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readDegradedScan(scanJob: unknown): DegradedScan | undefined {
+  if (!isRecord(scanJob)) return undefined;
+  const count = scanJob.tablesFailed;
+  if (typeof count !== "number" || count <= 0) return undefined;
+  const listed = scanJob.failedTables;
+  return {
+    tablesFailed: count,
+    failedTables: Array.isArray(listed)
+      ? listed.filter((entry): entry is string => typeof entry === "string")
+      : [],
+  };
+}
+
 const ValueWithLabel: React.FC<{
   label: string;
   children: React.ReactNode;
@@ -144,13 +198,13 @@ export const SourceDetail: React.FC = () => {
     }
   }, [source?.status, queryClient, namespaceId, sourceId]);
 
-  // Fetch scan job error for database sources when scan failed
+  // Scan-job record for the most recent scan of a database source. Fetched for
+  // every scan, not just failed ones: a scan can succeed and still have dropped
+  // individual tables, and that count lives only on the scan job.
   const { data: scanJobData } = useGetSourceScanJob(
     namespaceId ?? "",
     sourceId ?? "",
-    source?.status === SourceStatus.SCAN_FAILED
-      ? (source?.databaseDetails?.lastScanJobId ?? "")
-      : "",
+    isDatabase ? (source?.databaseDetails?.lastScanJobId ?? "") : "",
   );
 
   // useCollection must be called unconditionally (Rules of Hooks) — before any early returns.
@@ -238,6 +292,9 @@ export const SourceDetail: React.FC = () => {
   // Type-specific detail objects
   const dbDetails = source.databaseDetails;
   const docDetails = source.documentDetails;
+
+  // Present only when the last scan succeeded but lost individual tables.
+  const degradedScan = readDegradedScan(scanJobData);
 
   const preprocessingIssues = Array.isArray(docDetails?.preprocessingIssues)
     ? docDetails.preprocessingIssues
@@ -455,6 +512,34 @@ export const SourceDetail: React.FC = () => {
           </Alert>
         )}
 
+      {isDatabase && degradedScan && (
+        <Alert
+          type="warning"
+          header="Scan completed, but metadata is incomplete"
+        >
+          <SpaceBetween size="xs">
+            <Box variant="p">
+              The last scan succeeded but could not read{" "}
+              {degradedScan.tablesFailed === 1
+                ? "1 of the tables"
+                : `${degradedScan.tablesFailed} of the tables`}{" "}
+              it listed. Those tables have no columns, no comments and no
+              declared keys below, and any AI-generated descriptions were
+              produced over that gap — do not review this source as complete.
+              Re-scan once the tables are readable.
+            </Box>
+            {degradedScan.failedTables.length > 0 && (
+              <Box variant="p">
+                {degradedScan.failedTables.length < degradedScan.tablesFailed
+                  ? `Affected tables (${degradedScan.failedTables.length} of ${degradedScan.tablesFailed} shown): `
+                  : "Affected tables: "}
+                <Box variant="code">{degradedScan.failedTables.join(", ")}</Box>
+              </Box>
+            )}
+          </SpaceBetween>
+        </Alert>
+      )}
+
       {isDatabase && isMetadataStale && (
         <Alert type="warning" header="Metadata may be stale">
           This source was last scanned more than 30 days ago. The underlying
@@ -473,9 +558,9 @@ export const SourceDetail: React.FC = () => {
                 {
                   label: "Source type",
                   value:
-                    source.sourceSubType === "GLUE_DATABASE"
-                      ? "Glue database"
-                      : "JDBC database",
+                    DATABASE_SUBTYPE_LABELS[source.sourceSubType ?? ""] ??
+                    source.sourceSubType ??
+                    "—",
                 },
                 {
                   label: "Status",
@@ -808,6 +893,45 @@ export const SourceDetail: React.FC = () => {
                         ]}
                       />
                     )}
+                    {dbDetails?.customConnectorConfiguration && (
+                      <KeyValuePairs
+                        columns={2}
+                        items={[
+                          {
+                            // One ARN, because CustomConnectorConfiguration models one: the
+                            // connector Lambda serves both the metadata and record
+                            // paths. Athena's split metadata/record pair is not
+                            // offered anywhere — see that Smithy shape for why.
+                            label: "Connector function ARN",
+                            value: String(
+                              dbDetails.customConnectorConfiguration
+                                .connectorFunctionArn ?? "—",
+                            ),
+                          },
+                          {
+                            label: "Database",
+                            value: String(
+                              dbDetails.customConnectorConfiguration
+                                .databaseName ?? "—",
+                            ),
+                          },
+                          {
+                            label: "Table filter",
+                            value: String(
+                              dbDetails.customConnectorConfiguration
+                                .tableFilter ?? "(none)",
+                            ),
+                          },
+                          {
+                            label: "Table exclude filter",
+                            value: String(
+                              dbDetails.customConnectorConfiguration
+                                .tableExcludeFilter ?? "(none)",
+                            ),
+                          },
+                        ]}
+                      />
+                    )}
                   </Container>
                 ),
               },
@@ -1031,6 +1155,8 @@ function buildScanHistory(args: {
   tablesDiscovered: number;
   tablesApproved: number;
   errorMessage?: string;
+  /** Tables lost to a per-table read failure while the scan itself succeeded. */
+  tablesFailed?: number;
 }): ScanHistoryEntry[] {
   // Normalize Smithy ``Date`` timestamps to ISO strings so the rest of the
   // function can build stable ids and sort lexicographically.
@@ -1070,13 +1196,20 @@ function buildScanHistory(args: {
       args.status === SourceStatus.APPROVAL_FAILED ||
       args.status === SourceStatus.REJECTION_FAILED
     ) {
+      const scanned = `Scanned ${args.tablesDiscovered} table${args.tablesDiscovered === 1 ? "" : "s"}.`;
+      const lost = args.tablesFailed ?? 0;
       events.push({
         id: `scan-${lastScanAt}`,
         at: lastScanAt,
         kind: "scan",
-        type: "success",
+        // A scan that dropped tables completed, but not cleanly — flag it so
+        // the activity log doesn't read as a clean success.
+        type: lost > 0 ? "warning" : "success",
         label: "Scan completed",
-        detail: `Scanned ${args.tablesDiscovered} table${args.tablesDiscovered === 1 ? "" : "s"}.`,
+        detail:
+          lost > 0
+            ? `${scanned} ${lost} table${lost === 1 ? "" : "s"} could not be read and ${lost === 1 ? "was" : "were"} skipped.`
+            : scanned,
       });
     } else if (
       args.status === SourceStatus.SCANNING ||
@@ -1136,14 +1269,15 @@ interface ScanHistoryTableProps {
 }
 
 const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
-  // Fetch scan job to get errorMessage when scan failed
+  // Fetch the scan job for its errorMessage when the scan failed, and for its
+  // per-table failure count when it succeeded — a scan that completed can still
+  // have dropped tables, and only the scan job records that.
   const { data: scanJob } = useGetSourceScanJob(
     props.namespaceId,
     props.sourceId,
-    props.status === SourceStatus.SCAN_FAILED
-      ? (props.lastScanJobId ?? "")
-      : "",
+    props.lastScanJobId ?? "",
   );
+  const tablesFailed = readDegradedScan(scanJob)?.tablesFailed;
 
   const events = React.useMemo(
     () =>
@@ -1155,6 +1289,7 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
         tablesDiscovered: props.tablesDiscovered,
         tablesApproved: props.tablesApproved,
         errorMessage: scanJob?.errorMessage,
+        tablesFailed,
       }),
     [
       props.createdAt,
@@ -1164,6 +1299,7 @@ const ScanHistoryTable: React.FC<ScanHistoryTableProps> = (props) => {
       props.tablesDiscovered,
       props.tablesApproved,
       scanJob?.errorMessage,
+      tablesFailed,
     ],
   );
 

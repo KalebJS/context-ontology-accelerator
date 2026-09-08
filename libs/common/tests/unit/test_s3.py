@@ -10,6 +10,7 @@ import pytest
 from botocore.exceptions import ClientError
 from coa_common.s3 import (
     _extension,
+    get_bucket_tags,
     get_object_metadata_and_tags,
     get_s3_client,
     list_objects,
@@ -256,3 +257,45 @@ class TestGetObjectMetadataAndTags:
         get_object_metadata_and_tags(client, "my-bucket", "path/to/file.txt")
         client.head_object.assert_called_once_with(Bucket="my-bucket", Key="path/to/file.txt")
         client.get_object_tagging.assert_called_once_with(Bucket="my-bucket", Key="path/to/file.txt")
+
+
+@pytest.mark.unit
+class TestGetBucketTags:
+    """Bucket tags feed an authorization decision, so faults must propagate.
+
+    The sibling ``get_object_metadata_and_tags`` swallows errors on purpose — its
+    tags are enrichment. These are not, and a swallowed ``AccessDenied`` would be
+    indistinguishable from an untagged bucket.
+    """
+
+    def test_returns_the_tag_set_as_a_dict(self):
+        s3 = MagicMock()
+        s3.get_bucket_tagging.return_value = {
+            "TagSet": [
+                {"Key": "coa:namespace", "Value": "ns-a ns-b"},
+                {"Key": "owner", "Value": "team"},
+            ]
+        }
+        assert get_bucket_tags(s3, "b") == {"coa:namespace": "ns-a ns-b", "owner": "team"}
+        s3.get_bucket_tagging.assert_called_once_with(Bucket="b")
+
+    def test_no_tag_set_is_an_empty_dict_not_an_error(self):
+        """An untagged bucket is a legitimate answer; it authorizes nothing."""
+        s3 = MagicMock()
+        s3.get_bucket_tagging.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchTagSet", "Message": "The TagSet does not exist"}},
+            "GetBucketTagging",
+        )
+        assert get_bucket_tags(s3, "b") == {}
+
+    def test_empty_tag_set_is_an_empty_dict(self):
+        s3 = MagicMock()
+        s3.get_bucket_tagging.return_value = {"TagSet": []}
+        assert get_bucket_tags(s3, "b") == {}
+
+    @pytest.mark.parametrize("code", ["AccessDenied", "NoSuchBucket", "ThrottlingException"])
+    def test_other_errors_propagate_so_the_caller_fails_closed(self, code):
+        s3 = MagicMock()
+        s3.get_bucket_tagging.side_effect = ClientError({"Error": {"Code": code, "Message": code}}, "GetBucketTagging")
+        with pytest.raises(ClientError):
+            get_bucket_tags(s3, "b")

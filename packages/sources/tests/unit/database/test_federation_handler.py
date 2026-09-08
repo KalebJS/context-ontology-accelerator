@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 # Imported for its side effect: mock.patch() resolves dotted targets by
@@ -12,6 +13,7 @@ from unittest.mock import MagicMock, patch
 # package before any patch(f"{MODULE}...") is evaluated.
 import coa_sources.database.pipeline.federation_handler  # noqa: F401
 import pytest
+from coa_sources.database import glue_ownership as _go
 
 MODULE = "coa_sources.database.pipeline.federation_handler"
 PROVISIONER = "coa_sources.database.connectors.glue_connection_provisioner"
@@ -33,6 +35,18 @@ def _reset():
     mod._dao = None
     yield
     mod._dao = None
+
+
+@pytest.fixture(autouse=True)
+def _secret_bound():
+    """Default the namespace-binding re-check to "bound".
+
+    Every JDBC case below is about provisioning, not binding, and the real check
+    would reach STS/Secrets Manager. The cases that are about binding patch this
+    themselves — see TestScanTimeNamespaceBinding.
+    """
+    with patch(f"{MODULE}.require_secret_namespace_binding") as require:
+        yield require
 
 
 _EVENT = {
@@ -86,6 +100,70 @@ class TestFederationHandler:
         dao.update.assert_called_once()
         assert dao.update.call_args.kwargs["update_fields"] == {"queryable": True}
         assert out == {"provisioned": False, "reason": "glue-native", "queryable": True}
+
+    def test_glue_native_grant_is_refused_for_an_unowned_database(self):
+        """F-8: this function runs as a Lake Formation admin and the principal it
+        grants is the SHARED serve runtime role, so a grant here makes the database
+        readable by every namespace's queries. It verifies ownership rather than
+        trusting that source-create did — this step is reached from the stored row.
+        """
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao(
+            {
+                "sourceSubType": "GLUE_DATABASE",
+                "athenaDatabase": "someone_elses_db",
+                "configuration": json.dumps({"catalogId": "123456789012", "databaseName": "someone_elses_db"}),
+            }
+        )
+        with (
+            ctx,
+            patch(
+                f"{MODULE}.assert_namespace_may_catalog",
+                side_effect=_go.GlueOwnershipError("not registered to namespace"),
+            ),
+            patch(f"{MODULE}._consumer_role_arn", return_value="arn:aws:iam::123:role/serve"),
+            patch(f"{MODULE}.grant_consumer_select_native") as grant,
+        ):
+            out = handler(_EVENT)
+
+        grant.assert_not_called()
+        # Left not-queryable rather than failing the step: discovery already refused
+        # the same target, so a source reaching here unverified is a legacy row or
+        # one whose tag was removed after onboarding.
+        assert out["provisioned"] is False
+        assert out["queryable"] is False
+        # The reason carries the actionable message, not just a code: this dict is
+        # the Step Functions output an operator reads first.
+        assert out["reason"].startswith("namespace-not-owner: ")
+        assert "not registered to namespace" in out["reason"]
+        dao.update.assert_not_called()
+
+    def test_glue_native_grant_checks_the_stored_target(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao(
+            {
+                "sourceSubType": "GLUE_DATABASE",
+                "athenaDatabase": "retail_demo",
+                "configuration": json.dumps(
+                    {"catalogId": "123456789012", "databaseName": "retail_demo", "region": "eu-west-1"}
+                ),
+            }
+        )
+        with (
+            ctx,
+            patch(f"{MODULE}.assert_namespace_may_catalog") as check,
+            patch(f"{MODULE}._consumer_role_arn", return_value="arn:aws:iam::123:role/serve"),
+            patch(f"{MODULE}.grant_consumer_select_native", return_value=True),
+        ):
+            handler(_EVENT)
+
+        kwargs = check.call_args.kwargs
+        assert kwargs["namespace_id"] == _EVENT["namespaceId"]
+        assert kwargs["catalog_id"] == "123456789012"
+        assert kwargs["database_name"] == "retail_demo"
+        assert kwargs["region"] == "eu-west-1"
 
     def test_skips_non_jdbc_non_glue_source(self):
         """Other source types (e.g. DOCUMENT_SOURCE) are still skipped entirely."""
@@ -273,3 +351,240 @@ class TestFederationHandler:
         grant.assert_called_once_with(catalog_name="cat", schemas=["public"], principal_arn="")
         assert dao.update.call_args.kwargs["update_fields"]["queryable"] is False
         assert out["queryable"] is False
+
+
+class TestCustomConnectorBranch:
+    """A custom-connector source needs no provisioning here — its Lambda-backed
+    Athena data catalog was registered at source-create, because this sub-type's
+    discovery queries it and discovery runs first. All that remains is marking the
+    source queryable."""
+
+    _ITEM = {"sourceSubType": "CUSTOM_CONNECTOR", "athenaDataCatalogName": "coadevds_abc123"}
+
+    def test_marks_the_source_queryable(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao(dict(self._ITEM))
+        with ctx:
+            out = handler(_EVENT)
+        assert out == {"provisioned": False, "reason": "custom-connector", "queryable": True}
+        assert dao.update.call_args.kwargs["update_fields"] == {"queryable": True}
+        # Guards against a concurrently-deleted row being resurrected.
+        assert dao.update.call_args.kwargs["condition"] == "attribute_exists(PK)"
+
+    def test_provisions_no_glue_or_lake_formation_resources(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao(dict(self._ITEM))
+        with (
+            ctx,
+            patch(f"{MODULE}.provision_federated_catalog") as prov,
+            patch(f"{MODULE}.grant_consumer_select") as grant,
+            patch(f"{MODULE}.grant_consumer_select_native") as grant_native,
+            patch(f"{MODULE}.grant_iam_allowed_principals") as iam_grant,
+        ):
+            handler(_EVENT)
+        # There is no Glue object behind a Lambda catalog, so there is nothing to
+        # provision and nothing for Lake Formation to govern.
+        prov.assert_not_called()
+        grant.assert_not_called()
+        grant_native.assert_not_called()
+        iam_grant.assert_not_called()
+
+    def test_a_failed_write_raises_rather_than_leaving_it_unqueryable(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, dao = _patch_dao(dict(self._ITEM))
+        dao.update.side_effect = RuntimeError("ddb down")
+        # Silently leaving queryable False would present as a source that scanned
+        # cleanly and then answers nothing. Nothing needs rolling back, and a
+        # re-scan retries.
+        with ctx, pytest.raises(RuntimeError):
+            handler(_EVENT)
+
+
+class TestUnhandledSubType:
+    """An absent sub-type must stay a no-op; a recognised DATABASE sub-type with
+    no branch here must not."""
+
+    def test_an_absent_sub_type_is_a_no_op(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        # A source deleted concurrently with its scan reads back as an empty dict.
+        ctx, dao = _patch_dao({})
+        with ctx:
+            out = handler(_EVENT)
+        assert out == {"provisioned": False, "reason": "not-jdbc"}
+        dao.update.assert_not_called()
+
+    def test_an_unrecognised_sub_type_is_a_no_op(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao({"sourceSubType": "SOMETHING_LEGACY"})
+        with ctx:
+            assert handler(_EVENT)["reason"] == "not-jdbc"
+
+    def test_a_documents_sub_type_is_a_no_op(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        # These never reach this pipeline; a row carrying one is mis-stored, and
+        # policing that is not this handler's job.
+        ctx, _ = _patch_dao({"sourceSubType": "S3"})
+        with ctx:
+            assert handler(_EVENT)["reason"] == "not-jdbc"
+
+    def test_a_recognised_database_sub_type_with_no_branch_raises(self):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        # Simulates a new DATABASE sub-type shipping without its branch. Without
+        # the raise, every source of that type would scan cleanly and then stay
+        # queryable=False with no other signal.
+        ctx, _ = _patch_dao({"sourceSubType": "FUTURE_DATABASE"})
+        with (
+            ctx,
+            patch(f"{MODULE}._UNHANDLED_DATABASE_SUB_TYPES", frozenset({"FUTURE_DATABASE"})),
+            pytest.raises(RuntimeError, match="No federation branch"),
+        ):
+            handler(_EVENT)
+
+    def test_the_set_is_empty_while_every_database_sub_type_has_a_branch(self):
+        from coa_sources.database.pipeline.federation_handler import _UNHANDLED_DATABASE_SUB_TYPES
+
+        # This is the tripwire: adding a DATABASE sub-type to the Smithy enum
+        # without a branch above makes this fail, here, rather than in production.
+        assert not _UNHANDLED_DATABASE_SUB_TYPES
+
+
+@pytest.mark.unit
+class TestGrantSecretReadToConsumer:
+    """The serve runtime's read grant must be namespace-bound."""
+
+    def _run(self, namespace_id="ns-1"):
+        import json
+
+        from botocore.exceptions import ClientError
+        from coa_sources.database.pipeline.federation_handler import _grant_secret_read_to_consumer
+
+        sm = MagicMock()
+        sm.get_resource_policy.side_effect = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException", "Message": "none"}}, "GetResourcePolicy"
+        )
+        with (
+            patch(f"{MODULE}._consumer_role_arn", return_value="arn:aws:iam::123:role/consumer"),
+            patch(f"{MODULE}.boto3.client", return_value=sm),
+        ):
+            _grant_secret_read_to_consumer("arn:aws:secretsmanager:us-east-1:123:secret:s-AbCdEf", namespace_id)
+        assert sm.put_resource_policy.called
+        policy = json.loads(sm.put_resource_policy.call_args.kwargs["ResourcePolicy"])
+        return next(s for s in policy["Statement"] if s.get("Sid") == "SCLRuntimeSecretRead")
+
+    def test_grant_is_conditioned_on_the_namespace_tag(self):
+        from coa_common.constants import namespace_tag_condition_patterns, namespace_tag_key
+
+        ns = "550e8400-e29b-41d4-a716-446655440000"
+        stmt = self._run(namespace_id=ns)
+        # StringLike, not StringEquals: the tag value may list several namespaces,
+        # so the grant matches this namespace as an ENTRY. StringEquals would never
+        # match a shared secret and would silently kill the direct-JDBC read path.
+        assert stmt["Condition"] == {
+            "StringLike": {f"secretsmanager:ResourceTag/{namespace_tag_key()}": namespace_tag_condition_patterns(ns)}
+        }
+        assert stmt["Action"] == "secretsmanager:GetSecretValue"
+
+    def test_condition_matches_a_shared_multi_namespace_tag(self):
+        """Evaluate the emitted patterns the way IAM would, against real values."""
+        import re
+
+        from coa_common.constants import namespace_tag_key
+
+        ns = "550e8400-e29b-41d4-a716-446655440000"
+        other = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+        patterns = self._run(namespace_id=ns)["Condition"]["StringLike"][
+            f"secretsmanager:ResourceTag/{namespace_tag_key()}"
+        ]
+
+        def binds(value: str) -> bool:
+            return any(re.fullmatch(".*".join(re.escape(part) for part in p.split("*")), value) for p in patterns)
+
+        assert binds(ns)
+        assert binds(f"{ns} {other}")
+        assert binds(f"{other} {ns}")
+        assert not binds(other)
+        assert not binds(f"prefixed{ns}")
+
+    def test_no_grant_without_consumer_arn(self):
+        # No consumer principal → nothing to grant; must not touch the policy.
+        from coa_sources.database.pipeline.federation_handler import _grant_secret_read_to_consumer
+
+        sm = MagicMock()
+        with (
+            patch(f"{MODULE}._consumer_role_arn", return_value=""),
+            patch(f"{MODULE}.boto3.client", return_value=sm),
+        ):
+            _grant_secret_read_to_consumer("arn:aws:secretsmanager:us-east-1:123:secret:s-AbCdEf", "ns-1")
+        sm.put_resource_policy.assert_not_called()
+
+
+@pytest.mark.unit
+class TestScanTimeNamespaceBinding:
+    """The provisioner re-checks the STORED secret ARN before it touches it.
+
+    Registration validates the ARN a caller supplies; this handler reads the ARN
+    back out of the sources row. Rows written before the binding rule existed, and
+    secrets re-tagged after registration, are only caught here.
+    """
+
+    def test_binding_is_checked_against_the_stored_arn_and_row_namespace(self, _secret_bound):
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao(_JDBC_ITEM)
+        with (
+            ctx,
+            patch(f"{MODULE}.provision_federated_catalog") as prov,
+            patch(f"{MODULE}.grant_consumer_select", return_value=True),
+        ):
+            prov.return_value = {"glueConnectionName": "c", "athenaDataCatalogName": "cat"}
+            handler(_EVENT)
+
+        _secret_bound.assert_called_once_with(
+            _JDBC_ITEM["configuration"]["credentialSecretArn"],
+            "ns-1",
+            "DS#abc",
+        )
+
+    def test_unbound_secret_raises_before_anything_reads_it(self, _secret_bound):
+        """A refusal must abort the step, not fall through to a not-queryable no-op.
+
+        The two things that follow both act on the named secret: the readability
+        precheck reads it, and the consumer grant rewrites its resource policy.
+        Neither may run.
+        """
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        _secret_bound.side_effect = RuntimeError("Credential secret is not bound to namespace ns-1")
+        ctx, _ = _patch_dao(_JDBC_ITEM)
+        with (
+            ctx,
+            patch(f"{MODULE}._secret_readable_by_connector") as readable,
+            patch(f"{MODULE}.provision_federated_catalog") as prov,
+            patch(f"{MODULE}._grant_secret_read_to_consumer") as grant,
+            pytest.raises(RuntimeError, match="not bound to namespace"),
+        ):
+            handler(_EVENT)
+
+        readable.assert_not_called()
+        prov.assert_not_called()
+        grant.assert_not_called()
+
+    def test_binding_is_not_checked_for_glue_native_sources(self, _secret_bound):
+        # GLUE_DATABASE sources have no credential secret; the check must not run.
+        from coa_sources.database.pipeline.federation_handler import handler
+
+        ctx, _ = _patch_dao({"sourceSubType": "GLUE_DATABASE", "athenaDatabase": "retail_demo"})
+        with (
+            ctx,
+            patch(f"{MODULE}._consumer_role_arn", return_value="arn:aws:iam::123:role/serve"),
+            patch(f"{MODULE}.grant_consumer_select_native", return_value=True),
+        ):
+            handler(_EVENT)
+        _secret_bound.assert_not_called()

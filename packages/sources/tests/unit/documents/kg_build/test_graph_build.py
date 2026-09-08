@@ -38,6 +38,7 @@ def _stub_missing_modules() -> None:
         "llama_index.core.base",
         "llama_index.core.base.embeddings",
         "llama_index.core.base.embeddings.base",
+        "llama_index.core.node_parser",
         "graphrag_toolkit",
         "graphrag_toolkit.lexical_graph",
         "graphrag_toolkit.lexical_graph.storage",
@@ -78,8 +79,9 @@ def _stub_missing_modules() -> None:
         bd.Checkpoint = MagicMock()
 
     ex = sys.modules["graphrag_toolkit.lexical_graph.indexing.extract"]
-    if not hasattr(ex, "BatchConfig"):
-        ex.BatchConfig = MagicMock()
+    for attr in ["BatchConfig", "InferClassificationsConfig"]:
+        if not hasattr(ex, attr):
+            setattr(ex, attr, MagicMock())
 
     ld = sys.modules["graphrag_toolkit.lexical_graph.indexing.load"]
     if not hasattr(ld, "S3BasedDocs"):
@@ -92,6 +94,12 @@ def _stub_missing_modules() -> None:
 
     # llama_index.core.Document
     sys.modules["llama_index.core"].Document = MagicMock()
+
+    # llama_index.core.node_parser.SentenceSplitter — imported by
+    # graph_build._build_indexing_config when CHUNK_SIZE > 0.
+    np = sys.modules["llama_index.core.node_parser"]
+    if not hasattr(np, "SentenceSplitter"):
+        np.SentenceSplitter = MagicMock()
 
 
 _stub_missing_modules()
@@ -816,16 +824,55 @@ class TestGraphRAGConfig:
 
 
 class TestBuildIndexingConfig:
-    def test_no_overrides_returns_none(self, mod):
-        """Default flags (proposition=true, batch=false) → no config needed."""
-        config = mod._build_indexing_config("bucket", "ns", "ds")
-        # With USE_BATCH_INFERENCE=false and ENABLE_PROPOSITION_EXTRACTION=true,
-        # no IndexingConfig kwargs are set
-        assert config is None
+    """``_build_indexing_config`` must ALWAYS return a fully-specified
+    IndexingConfig — never None, never a bare ``ExtractionConfig()``. Both would
+    let the toolkit fall back to its hardcoded ``DEFAULT_ENTITY_CLASSIFICATIONS``
+    (news/finance list). These tests are the regression guard.
+    """
 
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
     @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
     @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
-    def test_proposition_disabled(self, mock_ic, mock_ec, monkeypatch, mod):
+    def test_default_flags_build_infer_config(self, mock_ic, mock_ec, mock_icc, mod):
+        """Under default flags an ExtractionConfig is still built, with
+        preferred_entity_classifications=[] and infer_entity_classifications
+        wired to an InferClassificationsConfig — i.e. no news vocabulary."""
+        config = mod._build_indexing_config("bucket", "ns", "ds")
+
+        assert config is not None
+        mock_ec.assert_called_once()
+        kwargs = mock_ec.call_args.kwargs
+        # These three together are the fix: empty seed + infer + replace.
+        assert kwargs["preferred_entity_classifications"] == []
+        assert kwargs["enable_proposition_extraction"] is True
+        assert kwargs["infer_entity_classifications"] is mock_icc.return_value
+        mock_icc.assert_called_once_with(replace_default_classifications=True)
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_infer_disabled_via_env(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
+        """INFER_ENTITY_CLASSIFICATIONS=false → infer_entity_classifications=False.
+        Empty preferred list still stands, so the toolkit gets [] rather than
+        its own default list.
+        """
+        monkeypatch.setenv("INFER_ENTITY_CLASSIFICATIONS", "false")
+        sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
+        pkg = sys.modules.get("coa_sources.documents.kg_build")
+        if pkg and hasattr(pkg, "graph_build"):
+            delattr(pkg, "graph_build")
+        from coa_sources.documents.kg_build import graph_build as entrypoint
+
+        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        kwargs = mock_ec.call_args.kwargs
+        assert kwargs["preferred_entity_classifications"] == []
+        assert kwargs["infer_entity_classifications"] is False
+        mock_icc.assert_not_called()
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_proposition_disabled(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
         monkeypatch.setenv("ENABLE_PROPOSITION_EXTRACTION", "false")
         sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
         pkg = sys.modules.get("coa_sources.documents.kg_build")
@@ -834,11 +881,14 @@ class TestBuildIndexingConfig:
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
         entrypoint._build_indexing_config("bucket", "ns", "ds")
-        mock_ec.assert_called_once_with(enable_proposition_extraction=False)
+        kwargs = mock_ec.call_args.kwargs
+        assert kwargs["enable_proposition_extraction"] is False
 
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
     @patch("graphrag_toolkit.lexical_graph.indexing.extract.BatchConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
     @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
-    def test_batch_inference_with_role(self, mock_ic, mock_bc, monkeypatch, mod):
+    def test_batch_inference_with_role(self, mock_ic, mock_ec, mock_bc, mock_icc, monkeypatch, mod):
         monkeypatch.setenv("USE_BATCH_INFERENCE", "true")
         monkeypatch.setenv("BATCH_INFERENCE_ROLE_ARN", "arn:aws:iam::123:role/batch")
         sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
@@ -851,8 +901,12 @@ class TestBuildIndexingConfig:
         mock_bc.assert_called_once()
         assert mock_bc.call_args[1]["role_arn"] == "arn:aws:iam::123:role/batch"
 
-    def test_batch_inference_without_role_falls_back(self, monkeypatch, mod):
-        """USE_BATCH_INFERENCE=true but no role → warning, no BatchConfig."""
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_batch_inference_without_role_falls_back(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
+        """USE_BATCH_INFERENCE=true but no role → warning, no BatchConfig. An
+        ExtractionConfig is still built (batch is orthogonal to vocabulary)."""
         monkeypatch.setenv("USE_BATCH_INFERENCE", "true")
         monkeypatch.setenv("BATCH_INFERENCE_ROLE_ARN", "")
         sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
@@ -862,7 +916,152 @@ class TestBuildIndexingConfig:
         from coa_sources.documents.kg_build import graph_build as entrypoint
 
         config = entrypoint._build_indexing_config("bucket", "ns", "ds")
-        assert config is None  # fell back to real-time
+        # New contract: still returns an IndexingConfig (with the vocabulary
+        # fix); only BatchConfig is absent.
+        assert config is not None
+        mock_ec.assert_called_once()
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_explicit_preferred_list_wins_over_infer(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
+        """A non-empty PREFERRED_ENTITY_CLASSIFICATIONS is
+        authoritative. Inference must NOT run — "these labels, exactly"."""
+        monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", '["Policy", "Claim", "Loss Ratio"]')
+        sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
+        pkg = sys.modules.get("coa_sources.documents.kg_build")
+        if pkg and hasattr(pkg, "graph_build"):
+            delattr(pkg, "graph_build")
+        from coa_sources.documents.kg_build import graph_build as entrypoint
+
+        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        kwargs = mock_ec.call_args.kwargs
+        assert kwargs["preferred_entity_classifications"] == ["Policy", "Claim", "Loss Ratio"]
+        assert kwargs["infer_entity_classifications"] is False
+        mock_icc.assert_not_called()
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_preferred_empty_json_falls_through_to_infer(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
+        """Empty list stringified as "[]" (the default from the trigger) must
+        NOT block infer — otherwise every default request would run unguided.
+        """
+        monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", "[]")
+        sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
+        pkg = sys.modules.get("coa_sources.documents.kg_build")
+        if pkg and hasattr(pkg, "graph_build"):
+            delattr(pkg, "graph_build")
+        from coa_sources.documents.kg_build import graph_build as entrypoint
+
+        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        kwargs = mock_ec.call_args.kwargs
+        assert kwargs["preferred_entity_classifications"] == []
+        assert kwargs["infer_entity_classifications"] is mock_icc.return_value
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_invalid_preferred_json_falls_through_to_infer(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
+        """Malformed JSON must NOT crash the container; log and fall through.
+        Regression guard for the "one bad list breaks every future ingest" mode.
+        """
+        monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", "not json")
+        sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
+        pkg = sys.modules.get("coa_sources.documents.kg_build")
+        if pkg and hasattr(pkg, "graph_build"):
+            delattr(pkg, "graph_build")
+        from coa_sources.documents.kg_build import graph_build as entrypoint
+
+        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        kwargs = mock_ec.call_args.kwargs
+        assert kwargs["preferred_entity_classifications"] == []
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_wellformed_json_wrong_type_falls_through_to_infer(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod):
+        """Valid JSON that is NOT a list-of-strings (e.g. an object) must be
+        rejected via the ValueError branch and fall through to infer — not
+        passed to graphrag as a bad vocabulary."""
+        monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", '{"Policy": 1}')
+        sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
+        pkg = sys.modules.get("coa_sources.documents.kg_build")
+        if pkg and hasattr(pkg, "graph_build"):
+            delattr(pkg, "graph_build")
+        from coa_sources.documents.kg_build import graph_build as entrypoint
+
+        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        assert mock_ec.call_args.kwargs["preferred_entity_classifications"] == []
+
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_both_infer_and_preferred_off_warns(self, mock_ic, mock_ec, mock_icc, monkeypatch, mod, caplog):
+        """If a user disables both, extraction runs unguided — log it loudly."""
+        monkeypatch.setenv("INFER_ENTITY_CLASSIFICATIONS", "false")
+        monkeypatch.setenv("PREFERRED_ENTITY_CLASSIFICATIONS", "[]")
+        sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
+        pkg = sys.modules.get("coa_sources.documents.kg_build")
+        if pkg and hasattr(pkg, "graph_build"):
+            delattr(pkg, "graph_build")
+        from coa_sources.documents.kg_build import graph_build as entrypoint
+
+        with caplog.at_level("WARNING"):
+            entrypoint._build_indexing_config("bucket", "ns", "ds")
+        kwargs = mock_ec.call_args.kwargs
+        assert kwargs["preferred_entity_classifications"] == []
+        assert kwargs["infer_entity_classifications"] is False
+
+    @patch("llama_index.core.node_parser.SentenceSplitter")
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_chunk_size_override_wires_splitter(self, mock_ic, mock_ec, mock_icc, mock_ss, monkeypatch, mod):
+        """CHUNK_SIZE>0 pins a SentenceSplitter into IndexingConfig(chunking=[...])."""
+        monkeypatch.setenv("CHUNK_SIZE", "1024")
+        monkeypatch.setenv("CHUNK_OVERLAP", "50")
+        sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
+        pkg = sys.modules.get("coa_sources.documents.kg_build")
+        if pkg and hasattr(pkg, "graph_build"):
+            delattr(pkg, "graph_build")
+        from coa_sources.documents.kg_build import graph_build as entrypoint
+
+        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        mock_ss.assert_called_once_with(chunk_size=1024, chunk_overlap=50)
+        assert "chunking" in mock_ic.call_args.kwargs
+
+    @patch("llama_index.core.node_parser.SentenceSplitter")
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_chunk_overlap_ge_size_is_clamped(self, mock_ic, mock_ec, mock_icc, mock_ss, monkeypatch, mod):
+        """CHUNK_OVERLAP >= CHUNK_SIZE would make SentenceSplitter emit
+        degenerate/empty chunks. The per-field @range constraints cannot express
+        this cross-field invariant, so the code must clamp overlap to size-1.
+        Regression guard for the review finding."""
+        monkeypatch.setenv("CHUNK_SIZE", "100")
+        monkeypatch.setenv("CHUNK_OVERLAP", "200")
+        sys.modules.pop("coa_sources.documents.kg_build.graph_build", None)
+        pkg = sys.modules.get("coa_sources.documents.kg_build")
+        if pkg and hasattr(pkg, "graph_build"):
+            delattr(pkg, "graph_build")
+        from coa_sources.documents.kg_build import graph_build as entrypoint
+
+        entrypoint._build_indexing_config("bucket", "ns", "ds")
+        mock_ss.assert_called_once_with(chunk_size=100, chunk_overlap=99)
+
+    @patch("llama_index.core.node_parser.SentenceSplitter")
+    @patch("graphrag_toolkit.lexical_graph.indexing.extract.InferClassificationsConfig")
+    @patch("graphrag_toolkit.lexical_graph.ExtractionConfig")
+    @patch("graphrag_toolkit.lexical_graph.IndexingConfig")
+    def test_chunk_size_zero_keeps_toolkit_default(self, mock_ic, mock_ec, mock_icc, mock_ss, mod):
+        """CHUNK_SIZE=0 (default) must not pass a chunking= kwarg — otherwise
+        the toolkit's SentenceSplitter fallback (256/25) never runs. Regression
+        guard: this is what preserves the SEC-10-Q baseline."""
+        mod._build_indexing_config("bucket", "ns", "ds")
+        mock_ss.assert_not_called()
+        assert "chunking" not in mock_ic.call_args.kwargs
 
 
 # ===================================================================

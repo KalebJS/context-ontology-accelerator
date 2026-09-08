@@ -1204,7 +1204,7 @@ class TestBuildLexicalRetrieverStrategy:
         NOT the retriever's own 15s. The 15s default is too low for slow single-shot
         traversal strategies (topic_beam's graph beam-traversal times out to empty),
         so build_lexical_retriever raises the standard-mode timeout when the caller
-        (the agentic path) does not pass its own budget."""
+        (the deep-reasoning path) does not pass its own budget."""
         from coa_serve.clients.factory import build_lexical_retriever
 
         monkeypatch.delenv("LEXICAL_RETRIEVER_TIMEOUT_S", raising=False)
@@ -1250,13 +1250,13 @@ class TestBuildLexicalRetrieverStrategy:
         assert result._timeout_s == 45.0
 
     def test_explicit_timeout_s_overrides_env(self, monkeypatch):
-        """An explicit timeout_s (the agentic per-tool budget) wins over the env
+        """An explicit timeout_s (the deep-reasoning per-tool budget) wins over the env
         fallback — the env only applies on the standard-mode path (timeout_s=None)."""
         from coa_serve.clients.factory import build_lexical_retriever
 
         monkeypatch.setenv("LEXICAL_RETRIEVER_TIMEOUT_S", "90")
         mock_config = MagicMock()
-        mock_config.tier3_strategy = "agentic"
+        mock_config.tier3_strategy = "deep-reasoning"
         mock_config.neptune_endpoint = "test-cluster.us-east-1.neptune.amazonaws.com"
         mock_config.opensearch_endpoint = "https://test.aoss.amazonaws.com"
 
@@ -1266,13 +1266,13 @@ class TestBuildLexicalRetrieverStrategy:
         assert result._timeout_s == 30.0
 
     def test_timeout_s_override_is_applied(self):
-        """The agentic path passes its per-tool budget so a graphrag strategy is not
+        """The deep-reasoning path passes its per-tool budget so a graphrag strategy is not
         cut short by the adapter's 15s default (live: ``strategy:entity_based
         degraded ... TimeoutError after 15.0s`` inside a 45s per-tool budget)."""
         from coa_serve.clients.factory import build_lexical_retriever
 
         mock_config = MagicMock()
-        mock_config.tier3_strategy = "agentic"
+        mock_config.tier3_strategy = "deep-reasoning"
         mock_config.neptune_endpoint = "test-cluster.us-east-1.neptune.amazonaws.com"
         mock_config.opensearch_endpoint = "https://test.aoss.amazonaws.com"
 

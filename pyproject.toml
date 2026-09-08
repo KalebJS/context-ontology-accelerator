@@ -2,7 +2,7 @@
 name = "coa"
 # Single source of truth is the repo-root VERSION file. Do not edit by hand —
 # bump VERSION and run `make version` (verified by `make lint`).
-version = "0.1.0"
+version = "0.2.3"
 description = "Context Ontology Accelerator for AWS"
 requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
@@ -47,6 +47,10 @@ markers = [
     "integ: Integration tests",
     "security: Security integration tests (authentication, authorization, input validation, SQL firewall)",
     "slow: Billable load-test rungs (500+) — manual only",
+    # Also registered in packages/sources/pyproject.toml, which is the rootdir nx
+    # uses. Declared here too so running the trees together (a common local
+    # invocation) does not warn about an unknown mark.
+    "real_glue_ownership: Opt out of the sources conftest's Glue ownership stub and exercise the real check",
 ]
 
 [tool.mypy]

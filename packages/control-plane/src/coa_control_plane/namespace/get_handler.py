@@ -9,6 +9,7 @@ import os
 from typing import Any
 
 import structlog
+from coa_common.constants import datasource_external_id
 from coa_common.dao import DynamoDBDAO
 from coa_common.response import api_response
 
@@ -53,6 +54,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             "createdAt": item.get("createdAt"),
             "updatedAt": item.get("updatedAt"),
             "athenaWorkgroupName": item.get("athenaWorkgroupName"),
+            # Derived, not stored: the ExternalId a customer must pin in the trust
+            # policy of any cross-account role they onboard into this namespace.
+            "datasourceExternalId": datasource_external_id(namespace_id),
             "vkgHealth": resolve_vkg_health(namespace_id),
         }
     }

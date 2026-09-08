@@ -16,14 +16,18 @@ from typing import Any
 from urllib.parse import unquote
 
 import structlog
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 from coa_common.constants import (
     SUPPORTED_UPLOAD_CONTENT_TYPES,
+    bucket_grants_namespace,
+    bucket_namespace_tag_key,
     to_graphrag_tenant_id,
+    validate_id,
     validate_s3_prefix,
 )
 from coa_common.dao.base import QueryParams
 from coa_common.response import api_response, get_caller_identity
+from coa_common.s3 import get_bucket_tags, get_s3_client, parse_bucket_from_arn
 from coa_control_plane_server.models.extraction_config import ExtractionConfig
 from coa_control_plane_server.models.source_status import SourceStatus
 from coa_control_plane_server.models.source_sub_type import SourceSubType
@@ -55,6 +59,82 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _validate_bucket_namespace_authorization(source_bucket_arn: str | None, namespace_id: str) -> dict[str, Any] | None:
+    """Bind an S3 document source's bucket to the registering namespace.
+
+    The bucket must carry ``{tag_prefix}.namespace`` listing this namespace. Only a
+    principal with ``s3:TagResource`` on the bucket can set that, so the tag is the
+    bucket owner's consent — which is the evidence the request itself cannot
+    provide, since holding ``manageSource`` on a namespace says nothing about who
+    may read the bucket it names.
+
+    Fail-closed on every uncertainty: a malformed ARN, an unreadable tag set, or a
+    tag that does not list this namespace all refuse the request, so a bucket we
+    cannot prove is authorized is never persisted. A transient client-side fault is
+    distinguished from a refusal — it returns a retryable 503, because "retry" and
+    "fix your tag" are different instructions.
+
+    This is the fail-fast front door; the preprocessing handler re-checks because it
+    is a separate entry point. Mirrors ``_validate_credential_secret_binding`` for
+    JDBC credential secrets.
+
+    Returns an error response, or ``None`` when the binding holds.
+    """
+    # The Smithy S3BucketArn pattern normally rejects a malformed ARN upstream, but
+    # this must not depend on that — parse_bucket_from_arn raises rather than
+    # returning empty, so an unguarded call would surface as a 500. An absent ARN is
+    # refused here rather than narrowed away at the call site, so that a caller who
+    # reaches this function can never skip the check by passing nothing.
+    try:
+        bucket = parse_bucket_from_arn(source_bucket_arn or "")
+    except ValueError as exc:
+        logger.warning("bucket_namespace_authorization_malformed_arn", namespace_id=namespace_id)
+        return api_response(400, {"error": f"sourceBucketArn is malformed: {exc}"})
+
+    tag_key = bucket_namespace_tag_key()
+    try:
+        tags = get_bucket_tags(get_s3_client(), bucket)
+    except ClientError:
+        # AWS answered and refused: AccessDenied, NoSuchBucket, and friends. That is
+        # a request the caller can act on, so it is a 400 naming what to fix.
+        logger.warning("bucket_namespace_authorization_unverifiable", namespace_id=namespace_id, exc_info=True)
+        return api_response(
+            400,
+            {
+                "error": (
+                    f"sourceBucketArn could not be verified. The bucket must exist and be readable "
+                    f"(s3:GetBucketTagging) and carry the tag '{tag_key}' listing this namespace."
+                )
+            },
+        )
+    except BotoCoreError:
+        # Client-side: DNS, TLS, connection timeout. Nothing about the caller's
+        # request is wrong, so a permissions message would misdirect them. Still
+        # fails closed — we just say "retry" instead of "fix your tag".
+        logger.warning("bucket_namespace_authorization_transient_fault", namespace_id=namespace_id, exc_info=True)
+        return api_response(
+            503,
+            {"error": "Could not verify sourceBucketArn (transient fault reaching S3); retry."},
+        )
+
+    if not bucket_grants_namespace(tags, namespace_id):
+        logger.warning(
+            "bucket_namespace_authorization_rejected",
+            namespace_id=namespace_id,
+            has_tag=tag_key in tags,
+        )
+        return api_response(
+            400,
+            {
+                "error": (
+                    f"sourceBucketArn is not authorized for this namespace: tag the bucket with "
+                    f"'{tag_key}={namespace_id}'. Separate several namespace ids with spaces."
+                )
+            },
+        )
+    return None
+
+
 def _create_document_source(doc_req: Any, namespace_id: str, event: dict[str, Any]) -> dict[str, Any]:
     """Create a DOCUMENTS source. doc_req is a CreateDocumentSourceInput model instance."""
     name: str = doc_req.name.strip()
@@ -62,7 +142,6 @@ def _create_document_source(doc_req: Any, namespace_id: str, event: dict[str, An
         return api_response(400, {"error": "name is required"})
 
     source_bucket_arn: str | None = doc_req.source_bucket_arn or None
-    s3_prefixes: list[str] = [p.strip() for p in (doc_req.s3_prefixes or [])]
     role_arn: str | None = doc_req.role_arn or None
 
     # Infer sub-type: sourceBucketArn → S3, else → LOCAL_UPLOAD
@@ -73,16 +152,40 @@ def _create_document_source(doc_req: Any, namespace_id: str, event: dict[str, An
         sub_type = SourceSubType.LOCAL_UPLOAD
         doc_source_type = "upload"
 
-    if doc_source_type == "s3" and not source_bucket_arn:
-        return api_response(400, {"error": "sourceBucketArn is required for S3 sources"})
-    if doc_source_type == "upload" and not s3_prefixes:
-        return api_response(400, {"error": "s3Prefixes is required for upload sources"})
-
-    for prefix in s3_prefixes:
+    if doc_source_type == "s3":
+        # S3 sub-type: prefixes point into the caller-owned sourceBucketArn, so
+        # they are legitimately caller-supplied. Drop empty/whitespace-only
+        # entries (a stray "" would otherwise list the whole bucket), then
+        # validate character set / traversal only.
+        s3_prefixes: list[str] = [s for s in (p.strip() for p in (doc_req.s3_prefixes or [])) if s]
+        for prefix in s3_prefixes:
+            try:
+                validate_s3_prefix(prefix, "s3Prefixes")
+            except ValueError as exc:
+                return api_response(400, {"error": str(exc)})
+        # A caller-named bucket must be authorized by its own owner. Runs after the
+        # local prefix checks so a malformed request costs no S3 call. Upload
+        # sources read the platform's own bucket, so no customer tag applies.
+        error = _validate_bucket_namespace_authorization(source_bucket_arn, namespace_id)
+        if error:
+            return error
+    else:
+        # Upload sub-type: files live in the shared platform bucket under a
+        # server-issued, namespace-scoped prefix. Reconstruct that prefix from
+        # the uploadId minted by GetSourceUploadUrls and ignore any
+        # caller-supplied s3Prefixes — otherwise a steward with manageSource on
+        # one namespace could point ingestion at another namespace's objects
+        # in the shared bucket. uploadId is a UUID-v4-constrained model field;
+        # validate_id re-checks it here so the derived prefix can never contain
+        # a path separator or traversal segment.
+        upload_id: str = (doc_req.upload_id or "").strip()
+        if not upload_id:
+            return api_response(400, {"error": "uploadId is required for upload sources"})
         try:
-            validate_s3_prefix(prefix, "s3Prefixes")
+            validate_id(upload_id, "uploadId")
         except ValueError as exc:
             return api_response(400, {"error": str(exc)})
+        s3_prefixes = [f"{namespace_id}/raw/{upload_id}/"]
 
     try:
         extraction_config = merge_extraction_config(doc_req.extraction_config)

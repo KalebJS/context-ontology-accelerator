@@ -18,6 +18,7 @@ const mdFileToPageId: Record<string, PageId> = {
   'sources.md': 'sources',
   'index.md': 'sources',
   'cross-account-sources.md': 'cross-account-sources',
+  'custom-connector-sources.md': 'custom-connector-sources',
   'ontologies.md': 'ontologies',
   'metrics.md': 'metrics',
   'serve.md': 'serve',

@@ -140,6 +140,18 @@ structure NamespaceDetail {
     /// and a re-creation is required to enable them.
     athenaWorkgroupName: String
 
+    /// STS ExternalId the platform presents when assuming a cross-account role
+    /// onboarded into this namespace (read-only, system-derived). Format:
+    /// `{resource-prefix}{namespaceId}`, the same scheme as
+    /// `athenaWorkgroupName`.
+    ///
+    /// Any role supplied as `crossAccountRoleArn` MUST condition its trust policy
+    /// on this exact value (`sts:ExternalId`). The platform derives it server-side
+    /// and refuses to assume a role without presenting one, so this is what stops
+    /// a caller in one namespace from pointing a source at a role onboarded for
+    /// another. Surface it wherever a cross-account role is configured.
+    datasourceExternalId: String
+
     /// Health of this namespace's VKG translation service (read-time).
     vkgHealth: VkgHealthStatus
 }

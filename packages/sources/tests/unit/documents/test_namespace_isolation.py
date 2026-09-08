@@ -255,7 +255,7 @@ class TestDocSourceCreationNamespaceBinding:
 
             req = CreateDocumentSourceInput(
                 name="test-source",
-                s3Prefixes=[f"{_NS_A}/raw/upload-1/"],
+                uploadId="11111111-1111-4111-8111-111111111111",
             )
             result = _docr._create_document_source(req, _NS_A, {})
 
@@ -284,7 +284,7 @@ class TestDocSourceCreationNamespaceBinding:
 
             req = CreateDocumentSourceInput(
                 name="another-source",
-                s3Prefixes=[f"{_NS_A}/raw/upload-2/"],
+                uploadId="22222222-2222-4222-8222-222222222222",
             )
             _docr._create_document_source(req, _NS_A, {})
 
