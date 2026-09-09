@@ -46,7 +46,7 @@ from botocore.exceptions import ClientError
 from coa_common import resolve_region
 from coa_common.dao import DynamoDBDAO
 from coa_common.datazone_forms import FORM_TYPE_NAME, build_forms_input, deserialize_form
-from coa_common.metadata_store import SMUSClient
+from coa_common.metadata_store import MetadataStoreClient, build_metadata_store
 from coa_common.review_logic import apply_decision_to_table
 from coa_control_plane_server.models.review_decision import ReviewDecision
 from coa_control_plane_server.models.review_status import ReviewStatus
@@ -190,7 +190,7 @@ def parse_message(body: str | dict[str, Any]) -> BulkReviewMessage:
 # ---------------------------------------------------------------------------
 
 
-def _load_one_asset(client: SMUSClient, asset: Any, source_id: str) -> dict[str, Any] | None:
+def _load_one_asset(client: MetadataStoreClient, asset: Any, source_id: str) -> dict[str, Any] | None:
     """Fetch + deserialize a single asset's table form. Returns None on skip.
 
     I/O-bound (one get_asset_forms round-trip); dispatched to a thread pool so a
@@ -221,7 +221,7 @@ def _load_one_asset(client: SMUSClient, asset: Any, source_id: str) -> dict[str,
 
 
 def _load_asset_page(
-    client: SMUSClient,
+    client: MetadataStoreClient,
     project_id: str,
     source_id: str,
     *,
@@ -290,7 +290,7 @@ def _enqueue_continuation(msg: BulkReviewMessage, next_token: str, tables_approv
     )
 
 
-def _write_revision(client: SMUSClient, asset: dict[str, Any]) -> str | None:
+def _write_revision(client: MetadataStoreClient, asset: dict[str, Any]) -> str | None:
     """Write a single asset revision. Returns table_id on failure, else None."""
     table = asset["table"]
     try:
@@ -415,7 +415,7 @@ def _rejected_key_column_reason(assets: list[dict[str, Any]], source_id: str) ->
 def process_bulk_review(
     *,
     msg: BulkReviewMessage,
-    client: SMUSClient,
+    client: MetadataStoreClient,
     project_id: str,
     sources_table: str,
     region: str,
@@ -567,8 +567,8 @@ _PROJECT_ACCESS_ROLE_ARN: str = os.environ.get("PROJECT_ACCESS_ROLE_ARN", "")
 _AWS_REGION: str = resolve_region()
 
 
-def _build_smus_client() -> SMUSClient:
-    return SMUSClient(
+def _build_smus_client() -> MetadataStoreClient:
+    return build_metadata_store(
         domain_id=_SMUS_DOMAIN_ID,
         region_name=_AWS_REGION,
         assume_role_arn=_PROJECT_ACCESS_ROLE_ARN or None,

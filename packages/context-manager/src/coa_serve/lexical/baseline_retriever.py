@@ -322,10 +322,12 @@ class BaselineLexicalRetriever:
 
         from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory, VectorStoreFactory
 
-        from .graphrag_patches import patch_paginated_search_source
+        from .graphrag_patches import patch_local_opensearch_transport, patch_paginated_search_source
 
-        # Must run before any index is queried: AOSS NEXTGEN omits knn_vector from the
-        # default _source, which silently collapses the TopicBeamSearch beam.
+        # Local-stack transport fix must run before any index is opened (see
+        # graphrag_patches.patch_local_opensearch_transport). Then the AOSS
+        # _source projection fix (below) before any index is queried.
+        patch_local_opensearch_transport()
         patch_paginated_search_source()
 
         graph_store = GraphStoreFactory.for_graph_store(self._graph_store_uri)

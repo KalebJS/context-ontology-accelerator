@@ -245,6 +245,25 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
     item = _get_dao().get(source_key) or {}
     sub_type = item.get("sourceSubType")
 
+    # LOCAL DOCKER STACK (FEDERATION_MODE=local): there is no Athena/Glue/Lake
+    # Formation to provision a federated catalog against, and serve's direct-JDBC
+    # path needs none — it reads the stored configuration and connects to the
+    # source database itself. Marking the source queryable here mirrors the
+    # custom-connector branch below: a successful discovery is the evidence (the
+    # SHOW/DESCRIBE statements it ran prove the target resolves), and a source
+    # left not-queryable would answer nothing. Production ignores this switch.
+    if os.environ.get("FEDERATION_MODE", "") == "local":
+        _get_dao().update(
+            key=source_key,
+            update_fields={"queryable": True},
+            condition="attribute_exists(PK)",
+        )
+        logger.info(
+            "federation_local_mode_marked_queryable",
+            extra={"datasource_id": datasource_id, "sub_type": sub_type},
+        )
+        return {"provisioned": False, "reason": "local-no-federation", "queryable": True}
+
     # GLUE_DATABASE sources need no catalog provisioning but still need an LF
     # SELECT grant so the serve runtime role can query LF-governed Glue tables in
     # accounts with strict Lake Formation mode (IAM_ALLOWED_PRINCIPALS removed).

@@ -45,6 +45,54 @@ logger = structlog.get_logger(__name__)
 _EMBEDDING_SOURCE_INCLUDES = ["id", "value", "embedding", "metadata"]
 
 _patched = False
+_tls_patched = False
+
+
+def patch_local_opensearch_transport() -> None:
+    """Point the toolkit's OpenSearch clients at a plain-HTTP local node.
+
+    The toolkit hardcodes ``use_ssl=True`` (and the AOSS SigV4 signer) in
+    ``create_os_client``/``create_os_async_client`` — correct for AOSS, but the
+    local Docker stack runs vanilla OpenSearch over plain HTTP, so every Tier-3
+    vector read dies with ``SSL: WRONG_VERSION_NUMBER``. Selected only by
+    ``OPENSEARCH_AUTH=none`` (the same switch ``coa_common.opensearch`` honors);
+    production defaults keep the signed/TLS clients untouched.
+
+    Idempotent and failure-tolerant: skips with a log if the toolkit internals
+    have moved.
+    """
+    global _tls_patched
+    if _tls_patched:
+        return
+    import os
+
+    if os.getenv("OPENSEARCH_AUTH", "sigv4").lower() != "none":
+        return
+    try:
+        import graphrag_toolkit.lexical_graph.storage.vector.opensearch_vector_indexes as ovi
+        from opensearchpy import AsyncOpenSearch, OpenSearch
+    except ImportError:
+        logger.debug("graphrag_opensearch_transport_patch_skipped", reason="module not importable")
+        return
+
+    endpoint = os.getenv("OPENSEARCH_ENDPOINT", "")
+    if not endpoint:
+        logger.warning("graphrag_opensearch_transport_patch_skipped", reason="OPENSEARCH_ENDPOINT unset")
+        return
+
+    def _local_client(sync: bool):
+        if sync:
+            return OpenSearch(
+                hosts=[endpoint],
+                use_ssl=endpoint.startswith("https://"),
+                verify_certs=False,
+            )
+        return AsyncOpenSearch(hosts=[endpoint], use_ssl=endpoint.startswith("https://"), verify_certs=False)
+
+    ovi.create_os_client = lambda *_, **__: _local_client(sync=True)
+    ovi.create_os_async_client = lambda *_, **__: _local_client(sync=False)
+    _tls_patched = True
+    logger.info("graphrag_opensearch_transport_patch_applied", endpoint=endpoint)
 
 
 def patch_paginated_search_source() -> None:

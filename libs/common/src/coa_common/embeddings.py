@@ -177,6 +177,11 @@ def _env_read_timeout() -> int:
 class BedrockEmbedder:
     """Provider-agnostic Bedrock text embedder.
 
+    ``EMBED_PROVIDER=ollama`` (local Docker stack) delegates every embed call
+    to a :class:`OllamaEmbedder` built from the ``OLLAMA_*`` env vars; the
+    Bedrock client is never constructed in that mode. Default (unset or
+    ``bedrock``) keeps the Bedrock path unchanged.
+
     Args:
         model_id: Bedrock model / inference-profile id. Defaults to the
             ``BEDROCK_EMBED_MODEL_ID`` env var, then :data:`DEFAULT_EMBED_MODEL_ID`.
@@ -215,6 +220,22 @@ class BedrockEmbedder:
         self._cost_tracker = cost_tracker
         self._client: Any = None
         self._client_lock = threading.Lock()
+        # Provider switch: ``EMBED_PROVIDER=ollama`` (local Docker stack) routes
+        # every embed call to the host's Ollama daemon instead of Bedrock — same
+        # interface, so callers (ontology-engine induction, metric-service) need
+        # no changes. Default (unset or ``bedrock``) keeps the Bedrock path.
+        self._delegate: OllamaEmbedder | None = None
+        if os.environ.get("EMBED_PROVIDER", "bedrock").lower() == "ollama":
+            self._delegate = OllamaEmbedder(
+                model_id=os.environ.get("OLLAMA_EMBED_MODEL", _OLLAMA_DEFAULT_EMBED_MODEL),
+                dimensions=dimensions,
+                base_url=os.environ.get("OLLAMA_BASE_URL", _OLLAMA_DEFAULT_BASE_URL),
+                timeout_s=int(os.environ.get("OLLAMA_TIMEOUT_S", "120")),
+            )
+            # Keep the public model_id aligned with what the delegate actually
+            # serves: embedding records carry this id, and consumers compare it
+            # against the model that embedded the query side.
+            self.model_id = self._delegate.model_id
 
     @property
     def client(self) -> Any:
@@ -345,6 +366,9 @@ class BedrockEmbedder:
                 attempt += 1
 
     def _embed(self, text: str, input_type: InputType) -> list[float]:
+        if self._delegate is not None:
+            # mxbai-embed-large is symmetric; input_type is a no-op there.
+            return self._delegate.embed_document(text)
         body = self._invoke(self._request_body(text, input_type))
         self._record_cost([text], body)
         return self._parse_response(body)
@@ -406,6 +430,8 @@ class BedrockEmbedder:
         (~96× fewer requests). Titan / non-v4 Cohere keep the per-text
         thread-pool fan-out — no verified v4 ``texts[]`` batch there. HLD §3.2.
         """
+        if self._delegate is not None:
+            return [self._delegate.embed_document(t) for t in texts]
         if not _is_cohere_v4(self.model_id):
             with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
                 return list(pool.map(self.embed_document, texts))
@@ -417,7 +443,7 @@ def make_llama_index_embedding(
     dimensions: int = DEFAULT_EMBED_DIMENSIONS,
     region: str | None = None,
 ) -> Any:
-    """A LlamaIndex ``BaseEmbedding`` backed by :class:`BedrockEmbedder`.
+    """A LlamaIndex ``BaseEmbedding`` backed by the configured embedder.
 
     graphrag-toolkit configures embeddings via ``GraphRAGConfig.embed_model``.
     If given a model-id STRING it builds its own ``llama_index`` ``BedrockEmbedding``,
@@ -428,18 +454,33 @@ def make_llama_index_embedding(
     unchanged), so we control the exact request and guarantee ``dimensions`` and
     the search_document/search_query asymmetry are honoured.
 
+    Provider switch: ``EMBED_PROVIDER=ollama`` (local Docker stack) builds a
+    :class:`OllamaEmbedderLlamaIndex` over :class:`OllamaEmbedder` — same
+    picklable-adapter pattern, same dimension contract. Default (unset or
+    ``bedrock``) keeps the :class:`BedrockEmbedder` path unchanged.
+
     Imported lazily: only the graphrag paths (doc-kg-build, serve lexical
     retriever) depend on ``llama_index``; other services must not.
 
     MUST be picklable: graphrag's build pipeline fans out over a
     ProcessPoolExecutor, so ``embed_model`` is pickled to worker processes. The
     adapter is therefore a MODULE-LEVEL class (not a closure) that reconstructs
-    its :class:`BedrockEmbedder` from plain fields — a locally-defined class or a
-    captured closure fails to pickle and graphrag silently drops the vector
-    store, breaking ingestion.
+    its embedder from plain fields — a locally-defined class or a captured
+    closure fails to pickle and graphrag silently drops the vector store,
+    breaking ingestion.
     """
-    cls = _bedrock_embedder_llama_index_cls()
+    provider = os.environ.get("EMBED_PROVIDER", "bedrock").lower()
     resolved_id = model_id or os.environ.get("BEDROCK_EMBED_MODEL_ID", DEFAULT_EMBED_MODEL_ID)
+    if provider == "ollama":
+        cls = _ollama_embedder_llama_index_cls()
+        return cls(
+            model_name=os.environ.get("OLLAMA_EMBED_MODEL", "mxbai-embed-large:latest"),
+            embed_batch_size=10,
+            embed_model_id=os.environ.get("OLLAMA_EMBED_MODEL", "mxbai-embed-large:latest"),
+            embed_dimensions=dimensions,
+            embed_base_url=os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434"),
+        )
+    cls = _bedrock_embedder_llama_index_cls()
     return cls(
         model_name=resolved_id,
         embed_batch_size=10,
@@ -502,3 +543,131 @@ def _bedrock_embedder_llama_index_cls() -> Any:
     globals()["BedrockEmbedderLlamaIndex"] = BedrockEmbedderLlamaIndex
     _LLAMA_ADAPTER_CLS = BedrockEmbedderLlamaIndex
     return _LLAMA_ADAPTER_CLS
+
+
+# ---------------------------------------------------------------------------
+# Ollama embedder — local Docker stack (EMBED_PROVIDER=ollama)
+# ---------------------------------------------------------------------------
+
+_OLLAMA_DEFAULT_BASE_URL = "http://host.docker.internal:11434"
+_OLLAMA_DEFAULT_EMBED_MODEL = "mxbai-embed-large:latest"
+
+
+class OllamaEmbedder:
+    """Text embedder served by the host's Ollama daemon.
+
+    Interface-compatible with :class:`BedrockEmbedder`
+    (embed_document / embed_query / embed_documents) so callers can swap the
+    two with a provider switch. mxbai-embed-large is SYMMETRIC (no
+    search_document/search_query distinction), so both input types send the
+    same request; the asymmetric Cohere contract is only meaningful on Bedrock.
+
+    Not thread-pooled like BedrockEmbedder: Ollama serializes generation
+    server-side per model, so fanning out N concurrent HTTP calls just queues
+    them at the daemon. ``embed_documents`` is a plain sequential loop.
+    """
+
+    def __init__(
+        self,
+        model_id: str | None = None,
+        dimensions: int = DEFAULT_EMBED_DIMENSIONS,
+        base_url: str | None = None,
+        timeout_s: int = 120,
+    ) -> None:
+        """Resolve model/endpoint config (see class docstring)."""
+        self.model_id = model_id or os.environ.get("OLLAMA_EMBED_MODEL", _OLLAMA_DEFAULT_EMBED_MODEL)
+        self.dimensions = dimensions
+        self._base_url = (base_url or os.environ.get("OLLAMA_BASE_URL", _OLLAMA_DEFAULT_BASE_URL)).rstrip("/")
+        self._timeout_s = timeout_s
+        self._client: Any = None
+
+    @property
+    def client(self) -> Any:
+        """Lazily construct and cache an httpx client."""
+        if self._client is None:
+            import httpx
+
+            self._client = httpx.Client(
+                base_url=self._base_url,
+                timeout=httpx.Timeout(connect=5.0, read=self._timeout_s, write=self._timeout_s, pool=self._timeout_s),
+            )
+        return self._client
+
+    def _post_embeddings(self, texts: list[str]) -> list[list[float]]:
+        import json as _json
+
+        payload = _json.dumps({"model": self.model_id, "input": texts})
+        resp = self.client.post("/v1/embeddings", content=payload, headers={"Content-Type": "application/json"})
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Ollama embeddings failed ({resp.status_code}): {resp.text[:300]}")
+        data = resp.json()
+        out = [item.get("embedding") or [] for item in (data.get("data") or [])]
+        if len(out) != len(texts):
+            raise ValueError(f"Ollama returned {len(out)} vectors for {len(texts)} inputs (model={self.model_id})")
+        bad = [i for i, v in enumerate(out) if not v]
+        if bad:
+            raise ValueError(f"Ollama returned empty vectors at indices {bad}")
+        return out
+
+    def embed_document(self, text: str) -> list[float]:
+        """Embed one document text (symmetric model — same as embed_query)."""
+        return self._post_embeddings([text])[0]
+
+    def embed_query(self, text: str) -> list[float]:
+        """Embed one search-query text (symmetric model — same as embed_document)."""
+        return self._post_embeddings([text])[0]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Embed many documents, order preserved."""
+        if not texts:
+            return []
+        return self._post_embeddings(list(texts))
+
+
+# Module-scope adapter cache for the Ollama LlamaIndex adapter (pickle parity
+# with BedrockEmbedderLlamaIndex).
+_OLLAMA_LLAMA_ADAPTER_CLS: Any = None
+
+
+def _ollama_embedder_llama_index_cls() -> Any:
+    global _OLLAMA_LLAMA_ADAPTER_CLS
+    if _OLLAMA_LLAMA_ADAPTER_CLS is not None:
+        return _OLLAMA_LLAMA_ADAPTER_CLS
+
+    from llama_index.core.base.embeddings.base import BaseEmbedding
+    from pydantic import PrivateAttr
+
+    class OllamaEmbedderLlamaIndex(BaseEmbedding):
+        """Picklable LlamaIndex adapter over :class:`OllamaEmbedder`."""
+
+        embed_model_id: str
+        embed_dimensions: int = DEFAULT_EMBED_DIMENSIONS
+        embed_base_url: str = _OLLAMA_DEFAULT_BASE_URL
+        _embedder: OllamaEmbedder | None = PrivateAttr(default=None)
+
+        def _get_embedder(self) -> OllamaEmbedder:
+            if self._embedder is None:
+                self._embedder = OllamaEmbedder(
+                    model_id=self.embed_model_id,
+                    dimensions=self.embed_dimensions,
+                    base_url=self.embed_base_url,
+                )
+            return self._embedder
+
+        def _get_query_embedding(self, query: str) -> list[float]:
+            return self._get_embedder().embed_query(query)
+
+        async def _aget_query_embedding(self, query: str) -> list[float]:
+            return self._get_embedder().embed_query(query)
+
+        def _get_text_embedding(self, text: str) -> list[float]:
+            return self._get_embedder().embed_document(text)
+
+        async def _aget_text_embedding(self, text: str) -> list[float]:
+            return self._get_embedder().embed_document(text)
+
+    OllamaEmbedderLlamaIndex.__module__ = __name__
+    OllamaEmbedderLlamaIndex.__qualname__ = "OllamaEmbedderLlamaIndex"
+    globals()["OllamaEmbedderLlamaIndex"] = OllamaEmbedderLlamaIndex
+    _OLLAMA_LLAMA_ADAPTER_CLS = OllamaEmbedderLlamaIndex
+    return _OLLAMA_LLAMA_ADAPTER_CLS

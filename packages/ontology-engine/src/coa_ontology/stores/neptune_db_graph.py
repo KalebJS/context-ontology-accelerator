@@ -47,6 +47,11 @@ log = logging.getLogger(__name__)
 NDB_ENDPOINT = os.getenv("NDB_ENDPOINT", "")  # https://<cluster>.neptune.amazonaws.com:8182
 NDB_REGION = os.getenv("NDB_REGION", os.getenv("AWS_REGION", "us-east-1"))
 NDB_IAM_AUTH = os.getenv("NDB_IAM_AUTH", "true").lower() == "true"
+# Path of the SPARQL Graph Store Protocol endpoint below NDB_ENDPOINT. Neptune
+# DB serves GSP at ``/sparql/gsp/`` (trailing slash); other engines (e.g. local
+# Fuseki) mount it at ``/sparql/gsp`` — overridable so the same code targets
+# either without a fork.
+NDB_GSP_PATH = os.getenv("NDB_GSP_PATH", "/sparql/gsp/")
 NDB_TIMEOUT = float(os.getenv("NDB_TIMEOUT", "30"))
 DEFAULT_NAMESPACE = os.getenv("DYNAMODB_DEFAULT_NAMESPACE", "default")
 
@@ -212,11 +217,11 @@ def _gsp_post_turtle(graph_uri: str, turtle: str) -> dict:
     import time as _t
 
     if graph_uri == "default":
-        url = f"{NDB_ENDPOINT.rstrip('/')}/sparql/gsp/?default"
+        url = f"{NDB_ENDPOINT.rstrip('/')}{NDB_GSP_PATH}?default"
     else:
         from urllib.parse import quote
 
-        url = f"{NDB_ENDPOINT.rstrip('/')}/sparql/gsp/?graph={quote(graph_uri, safe='')}"
+        url = f"{NDB_ENDPOINT.rstrip('/')}{NDB_GSP_PATH}?graph={quote(graph_uri, safe='')}"
     body_bytes = turtle.encode("utf-8")
     headers = {"Content-Type": "text/turtle"}
     # SigV4 needs the body for signing.
@@ -250,11 +255,11 @@ def _gsp_get_turtle(graph_uri: str) -> str | None:
     import time as _t
 
     if graph_uri == "default":
-        url = f"{NDB_ENDPOINT.rstrip('/')}/sparql/gsp/?default"
+        url = f"{NDB_ENDPOINT.rstrip('/')}{NDB_GSP_PATH}?default"
     else:
         from urllib.parse import quote
 
-        url = f"{NDB_ENDPOINT.rstrip('/')}/sparql/gsp/?graph={quote(graph_uri, safe='')}"
+        url = f"{NDB_ENDPOINT.rstrip('/')}{NDB_GSP_PATH}?graph={quote(graph_uri, safe='')}"
     headers = {"Accept": "text/turtle"}
     headers.update(_sign("GET", url, ""))
     _t0 = _t.perf_counter()

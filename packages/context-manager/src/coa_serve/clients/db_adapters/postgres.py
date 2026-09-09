@@ -115,7 +115,12 @@ class PostgresAdapter(EngineAdapter):
                 # (RDS/Aurora); without it a require_ssl source refuses the
                 # plaintext connection and the query hangs/errors. _SSL_CONTEXT is
                 # permissive (no peer-identity pinning) — see base.build_ssl_context.
-                "ssl": SSL_CONTEXT,
+                # A source may opt out ("options": {"ssl": false} in its stored
+                # configuration — the same opt-out the discovery connector honors)
+                # for servers without TLS, e.g. the local demo database; asyncpg's
+                # ssl=False deterministically never attempts SSL (None would be the
+                # weaker "prefer" negotiation).
+                "ssl": SSL_CONTEXT if creds.ssl_enabled else False,
                 # Bound the TCP+handshake (asyncpg `timeout`) so an unreachable host
                 # can't hang the connect; pool_timeout only bounds waiting for a
                 # free pooled slot, not the underlying connect.

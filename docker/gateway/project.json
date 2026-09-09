@@ -1,0 +1,18 @@
+{
+  "name": "local-gateway",
+  "root": "docker/gateway",
+  "projectType": "application",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "commands": [
+          "docker build -f docker/gateway/Dockerfile -t coa-local-gateway:latest ."
+        ],
+        "cwd": "."
+      }
+    }
+  },
+  "//": "Docker build only; unit tests run via repo pytest.",
+  "tags": ["local-docker"]
+}

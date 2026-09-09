@@ -67,7 +67,16 @@ class NeptuneGraphClient:
         self._port = port
         if not self._endpoint:
             raise ValueError("Neptune endpoint must be provided via constructor arg or NEPTUNE_ENDPOINT env var")
-        self._base_url = f"https://{self._endpoint}:{self._port}"
+        # GRAPH_AUTH=none selects plain HTTP (local Docker stack: Jena Fuseki or
+        # an unsigned Neptune-compatible endpoint). Default "sigv4" keeps the
+        # production IAM-signed path unchanged.
+        self._no_auth = os.environ.get("GRAPH_AUTH", "sigv4").lower() == "none"
+        if self._no_auth:
+            # Fuseki/unsigned endpoints are plain http; Neptune is https.
+            scheme = os.environ.get("GRAPH_ENDPOINT_SCHEME", "http")
+            self._base_url = f"{scheme}://{self._endpoint}:{self._port}"
+        else:
+            self._base_url = f"https://{self._endpoint}:{self._port}"
         self._session = Session()
         self._http: httpx.AsyncClient | None = None
         self._http_lock = asyncio.Lock()
@@ -131,8 +140,15 @@ class NeptuneGraphClient:
         return data.get("boolean", False)
 
     async def health_check(self) -> dict[str, Any]:
-        """Probe the Neptune ``/status`` endpoint; returns a status dict, never raises."""
+        """Probe the graph endpoint; returns a status dict, never raises.
+
+        SigV4 mode hits Neptune's ``/status``. No-auth mode hits the SPARQL
+        endpoint with a trivial ASK (Fuseki has no Neptune-style /status).
+        """
         try:
+            if self._no_auth:
+                ok = await self.ask("ASK {}")
+                return {"status": "ok" if ok else "degraded"}
             url = f"{self._base_url}/status"
             headers = await self._sign_request("GET", url)
             client = await self._get_http()
@@ -144,7 +160,7 @@ class NeptuneGraphClient:
     async def _sparql_post(self, sparql: str) -> dict[str, Any]:
         url = f"{self._base_url}/sparql"
         body = urlencode({"query": sparql})
-        headers = await self._sign_request("POST", url, body)
+        headers = {} if self._no_auth else await self._sign_request("POST", url, body)
         headers["Content-Type"] = "application/x-www-form-urlencoded"
 
         # Sync customer path: fail fast with a single retry, and only on
@@ -164,7 +180,7 @@ class NeptuneGraphClient:
 
         resp = await _post()
         if not resp.is_success:
-            logger.error("neptune_sparql_error", status=resp.status_code, body=resp.text[:500])
+            logger.error("neptune_sparql_error", status=resp.status_code, body=resp.text[:500], no_auth=self._no_auth)
         resp.raise_for_status()
         return resp.json()
 

@@ -380,10 +380,23 @@ class PostgresDialect(InformationSchemaDialect):
     system_schema_pattern = r"^(pg_catalog|pg_toast.*|information_schema)$"
 
     def connect(self, *, host, port, database, user, password, options=None):
-        """Open a TLS-enabled PostgreSQL connection via pg8000."""
+        """Open a TLS-enabled PostgreSQL connection via pg8000.
+
+        TLS is on by default (production posture). ``options["ssl"] = false``
+        opts out for local dev databases without TLS (the Docker stack's demo
+        Postgres); anything other than a literal false keeps TLS.
+        """
         import pg8000  # noqa: PLC0415
 
-        return pg8000.connect(host=host, port=port, user=user, password=password, database=database, ssl_context=True)
+        ssl_enabled = (options or {}).get("ssl", True)
+        return pg8000.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            ssl_context=True if ssl_enabled else None,
+        )
 
     def fetch_descriptions(self, conn: Any, schema: str, tables: list[str]) -> Descriptions:
         """Pull table / column comments from pg_catalog.pg_description.

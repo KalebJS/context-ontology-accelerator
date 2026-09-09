@@ -154,6 +154,18 @@ class BedrockClient:
         self._guardrail_version = guardrail_version or _DEFAULT_GUARDRAIL_VERSION
         self._max_input_chars = max_input_chars
         self._component = component
+        # Provider switch: ``LLM_PROVIDER=ollama`` (local Docker stack) routes
+        # invoke() to the host's Ollama daemon's OpenAI-compatible chat endpoint;
+        # the Bedrock runtime client is never constructed in that mode. Default
+        # (unset or ``bedrock``) keeps the Converse path unchanged.
+        self._ollama_base_url: str | None = None
+        if os.environ.get("LLM_PROVIDER", "bedrock").lower() == "ollama":
+            self._ollama_base_url = os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434").rstrip("/")
+            self._model_id = os.environ.get("OLLAMA_CHAT_MODEL", "gemma4:latest")
+            # Sentinel (not None): keeps every attribute defined so tests and
+            # logging that touch _client don't AttributeError in local mode.
+            self._client = None
+            return
         self._client = boto3.client(
             "bedrock-runtime",
             region_name=self._region,
@@ -161,6 +173,61 @@ class BedrockClient:
                 retries={"mode": "adaptive", "max_attempts": 3},
                 read_timeout=read_timeout,
             ),
+        )
+
+    def _invoke_ollama(
+        self, system_prompt: str, user_prompt: str, max_tokens: int, start: float
+    ) -> BedrockInvocationResult:
+        """Route a chat invocation to the local Ollama daemon (LLM_PROVIDER=ollama).
+
+        Mirrors the Converse contract: returns parsed JSON content and usage.
+        Guardrails are a Bedrock feature and are not emulated locally.
+        """
+        import httpx
+
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+        try:
+            with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=300, write=30, pool=300)) as client:
+                resp = client.post(
+                    f"{self._ollama_base_url}/v1/chat/completions",
+                    content=json.dumps(
+                        {"model": self._model_id, "messages": messages, "max_tokens": max_tokens, "stream": False}
+                    ),
+                    headers={"Content-Type": "application/json"},
+                )
+        except (httpx.HTTPError, OSError) as e:
+            logger.error("Ollama chat call failed: %s", e)
+            raise
+        if resp.status_code >= 400:
+            logger.error("Ollama chat failed (%d): %s", resp.status_code, resp.text[:300])
+            raise RuntimeError(f"Ollama chat failed ({resp.status_code})")
+        latency_ms = (time.monotonic() - start) * 1000
+        choices = resp.json().get("choices") or []
+        text = (choices[0].get("message", {}) or {}).get("content", "") if choices else ""
+        text = text.strip()
+        # Same fence-stripping as the Bedrock path.
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+        if not text:
+            logger.error("Ollama returned empty content")
+            raise ValueError("Ollama returned empty response")
+        usage = resp.json().get("usage", {})
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse Ollama response: %s", e)
+            raise ValueError(f"Invalid Ollama response format: {e}") from e
+        return BedrockInvocationResult(
+            result=result,
+            input_tokens=int(usage.get("prompt_tokens", 0)),
+            output_tokens=int(usage.get("completion_tokens", 0)),
+            latency_ms=latency_ms,
         )
 
     @staticmethod
@@ -189,6 +256,8 @@ class BedrockClient:
                 f"Combined prompt is {input_chars} chars, exceeds limit of {self._max_input_chars}"
             )
         start = time.monotonic()
+        if self._ollama_base_url is not None:
+            return self._invoke_ollama(system_prompt, user_prompt, max_tokens, start)
         kwargs = {
             "modelId": self._model_id,
             "messages": [{"role": "user", "content": [{"text": user_prompt}]}],
@@ -203,8 +272,10 @@ class BedrockClient:
             }
 
         try:
-            response = self._client.converse(**kwargs)
-        except self._client.exceptions.ClientError as e:
+            # In ollama mode invoke() returned earlier, so _client is a real
+            # Bedrock client here; the ignores silence the Optional narrowing.
+            response = self._client.converse(**kwargs)  # type: ignore[union-attr]
+        except self._client.exceptions.ClientError as e:  # type: ignore[union-attr]
             logger.error("Bedrock API call failed: %s", e)
             raise
         except Exception as e:

@@ -18,3 +18,6 @@ convention = "google"
 # the line limit would change the bytes sent to the model and break run-to-run
 # comparability, so E501 is exempt here too.
 "benchmarks/**" = ["D", "E501"]
+# Local Docker-stack dev tooling (provisioner, workers, gateway adapter): dev
+# scripts in spirit, so the src/-only docstring rule does not apply.
+"docker/**" = ["D"]

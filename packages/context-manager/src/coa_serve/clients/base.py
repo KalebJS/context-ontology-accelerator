@@ -266,6 +266,9 @@ class LLMClient(Protocol):
     - Query embedding: vectorizes user queries for downstream k-NN search
     """
 
+    #: Configured embedding-model identifier (Bedrock model id or Ollama tag).
+    _embed_model_id: str
+
     async def converse(
         self,
         prompt: str,

@@ -1,0 +1,10 @@
+# Local OpenSearch — security disabled, knn enabled.
+# Matches AOSS behaviour used by the stack: single node, no auth.
+network.host: 0.0.0.0
+discovery.type: single-node
+plugins.security.disabled: true
+plugins.index.remote_migration_enabled: false
+# kNN vector search (replaces OpenSearch Serverless VECTORSEARCH collection)
+knn.memory.circuit_breaker.limit: 50%
+# Single-node cluster needs no heap sizing beyond defaults.
+opendistro.allow_default_init_securityindex: false

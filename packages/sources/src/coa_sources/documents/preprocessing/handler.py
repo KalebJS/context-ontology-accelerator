@@ -145,6 +145,10 @@ _BUCKET_NAME = _require_env("BUCKET_NAME")
 _DOC_SOURCES_TABLE = _require_env("DOC_SOURCES_TABLE")
 _ROLE_PREFIX = os.environ.get("CROSS_ACCOUNT_ROLE_PREFIX", "coa")
 
+# PDF OCR engine: "textract" (default, production) or "unstructured" (local
+# Docker stack — no Textract locally; scanned PDFs fall back to pdfminer text).
+_PDF_OCR_ENGINE = os.environ.get("PDF_OCR_ENGINE", "textract").lower()
+
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
@@ -353,18 +357,25 @@ def handler(event: dict, context: Any) -> dict:
 
             # 4. Process ---------------------------------------------------
             if ext == ".pdf":
-                if textract_client is None:
+                # PDF_OCR_ENGINE=unstructured (local Docker stack) skips Textract
+                # entirely — scanned pages yield whatever pdfminer text exists.
+                # Default keeps the production scanned-PDF Textract routing.
+                if _PDF_OCR_ENGINE != "unstructured" and textract_client is None:
                     textract_client = boto3.client("textract", config=async_boto_config())
                 processed_text, out_ext = process_pdf(
                     content_bytes,
                     filename,
-                    textract_client,
-                    enable_table_extraction=enable_table_extraction,
+                    textract_client if _PDF_OCR_ENGINE != "unstructured" else None,
+                    enable_table_extraction=enable_table_extraction if _PDF_OCR_ENGINE != "unstructured" else False,
                 )
-                if enable_table_extraction:
+                if enable_table_extraction and _PDF_OCR_ENGINE != "unstructured":
                     processing_method = "textract_analyze_document_tables"
                 else:
-                    processing_method = "textract" if out_ext == ".txt" else "unstructured_partition_pdf"
+                    processing_method = (
+                        "textract"
+                        if out_ext == ".txt" and _PDF_OCR_ENGINE != "unstructured"
+                        else "unstructured_partition_pdf"
+                    )
             elif ext in _PROCESSORS:
                 processed_text, out_ext = _PROCESSORS[ext](content_bytes, filename)
                 processing_method = (

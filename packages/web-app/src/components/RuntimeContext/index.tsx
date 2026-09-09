@@ -18,6 +18,11 @@ export interface RuntimeContext {
   readonly apiEndpoint?: string;
   /** AgentCore Runtime ARN. Frontend builds the invocations URL from this + region. */
   readonly serveRuntimeArn?: string;
+  /**
+   * Local Docker stack: full /invocations URL used directly instead of
+   * deriving one from serveRuntimeArn (see build-query-endpoint.ts).
+   */
+  readonly queryEndpointOverride?: string;
   /** Monorepo version (from VERSION), rendered as a badge in the UI. */
   readonly version?: string;
   readonly oidcConfig: OidcConfig;

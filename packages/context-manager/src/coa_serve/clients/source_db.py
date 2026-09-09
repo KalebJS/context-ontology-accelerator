@@ -365,6 +365,10 @@ class SourceDBQueryExecutor:
                 database=database,
                 schema=_resolve_search_path(item, config),
                 engine_type=engine_type,
+                # Connect options persisted with the source (e.g. {"ssl": false}
+                # for a database without TLS). Scalar whitelist mirrors the
+                # persistence-side filter; unknown keys are ignored here.
+                ssl_enabled=bool((config.get("options") or {}).get("ssl", True)),
             )
         except (json.JSONDecodeError, KeyError, ValueError):
             raise ValueError(f"Failed to parse credentials for {namespace}/{data_source_id}") from None

@@ -30,7 +30,7 @@ from coa_common.datazone_forms import (
     build_forms_input,
 )
 from coa_common.domain_models import DiscoveredMetadata
-from coa_common.metadata_store import SMUSClient
+from coa_common.metadata_store import MetadataStoreClient, build_metadata_store
 from coa_common.metadata_store.exceptions import MetadataStoreError
 
 from coa_sources.database.metrics import emit_metric
@@ -56,7 +56,7 @@ def _write_parallelism() -> int:
         return DEFAULT_WRITE_PARALLELISM
 
 
-def _build_existing_asset_map(client: SMUSClient, project_id: str, data_source_id: str) -> dict[str, str]:
+def _build_existing_asset_map(client: MetadataStoreClient, project_id: str, data_source_id: str) -> dict[str, str]:
     """Page through all existing assets for the data source.
 
     Returns a ``{asset_name: asset_id}`` map. Scoped by searching for the
@@ -104,7 +104,7 @@ def write_to_datazone(
     if not data_source_id:
         raise ValueError("data_source_id is required")
 
-    client = SMUSClient(
+    client = build_metadata_store(
         domain_id=domain_id,
         region_name=AWS_REGION,
         assume_role_arn=os.environ.get("PROJECT_ACCESS_ROLE_ARN"),
@@ -202,7 +202,7 @@ def write_to_datazone(
     return {"assets_created": assets_created, "assets_revised": assets_revised}
 
 
-def _find_existing_asset(client: SMUSClient, project_id: str, asset_name: str) -> str | None:
+def _find_existing_asset(client: MetadataStoreClient, project_id: str, asset_name: str) -> str | None:
     """Search for a single existing asset by exact name in the project.
 
     Retained as a targeted single-asset lookup (e.g. for callers outside the

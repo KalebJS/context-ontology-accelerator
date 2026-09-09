@@ -28,7 +28,7 @@ from urllib.parse import unquote
 
 import structlog
 from botocore.exceptions import ClientError
-from coa_common.metadata_store import SMUSClient
+from coa_common.metadata_store import MetadataStoreClient, build_metadata_store
 from coa_common.response import api_response, iso_to_epoch
 from coa_control_plane_server.models.custom_connector_configuration import CustomConnectorConfiguration
 from coa_control_plane_server.models.glue_configuration import GlueConfiguration
@@ -79,8 +79,8 @@ logger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _get_smus_client() -> SMUSClient:
-    return SMUSClient(
+def _get_smus_client() -> MetadataStoreClient:
+    return build_metadata_store(
         domain_id=_SMUS_DOMAIN_ID,
         region_name=_AWS_REGION,
         assume_role_arn=_PROJECT_ACCESS_ROLE_ARN or None,
@@ -105,6 +105,21 @@ def _resolve_project_id(namespace_id: str) -> str | None:
 
 # Athena's account-default Glue Data Catalog name.
 _DEFAULT_ATHENA_CATALOG = "AwsDataCatalog"
+
+
+def _sanitize_connect_options(raw: Any) -> dict[str, Any]:
+    """Shallow-copy caller-supplied engine connect options for persistence.
+
+    ``jdbcConfiguration.options`` carries engine-specific connect flags the
+    Smithy shape has no member for (e.g. PostgreSQL ``{"ssl": false}`` for a
+    server without TLS), and pydantic silently drops the key on parse. Only
+    scalar-valued entries are kept so the stored configuration blob stays
+    strictly JSON-typed; the scan pipeline re-filters the keys against the
+    connector fields before use.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): v for k, v in raw.items() if isinstance(v, (str, bool, int, float)) and v is not None}
 
 
 def _resolve_glue_athena_catalog(glue_config: Any) -> str:
@@ -407,7 +422,7 @@ def _strip_external_id(config_dict: dict[str, Any], existing_config: Any = None)
     return config_dict
 
 
-def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
+def _create_database_source(db_req: Any, namespace_id: str, raw_body: dict[str, Any] | None = None) -> dict[str, Any]:
     """Create a DATABASE source. db_req is a CreateDatabaseSourceInput model instance."""
     name: str = db_req.name.strip()
     if not name:
@@ -500,6 +515,18 @@ def _create_database_source(db_req: Any, namespace_id: str) -> dict[str, Any]:
     now = _now_iso()
 
     config_dict = _strip_external_id(supplied[0].to_dict())
+
+    # `options` is a pass-through of engine-specific connect flags the Smithy
+    # JdbcConfiguration shape has no member for, so the validated model drops
+    # it. Recover it from the raw request body (the update path persists the
+    # raw dict, so this keeps create and update symmetrical) and merge it into
+    # the persisted configuration blob, which is what the scan pipeline and
+    # serve read.
+    if raw_body and jdbc_config is not None:
+        raw_jdbc = raw_body.get("databaseSource", {}).get("jdbcConfiguration")
+        options = _sanitize_connect_options(raw_jdbc.get("options")) if isinstance(raw_jdbc, dict) else {}
+        if options:
+            config_dict["options"] = options
 
     # We derive the Athena data-catalog name rather than letting the caller name
     # it: catalog names are account+region-global, so a caller-chosen name would
@@ -1030,7 +1057,7 @@ def _handle_get_table(namespace_id: str, source_id: str, table_id: str) -> dict[
 #     Counter drift is logged but not raised — the DataZone asset is the canon.
 
 
-def _smus_or_500() -> tuple[SMUSClient | None, dict[str, Any] | None]:
+def _smus_or_500() -> tuple[MetadataStoreClient | None, dict[str, Any] | None]:
     """Build the SMUS client or return a 500 if domain not configured."""
     if not _SMUS_DOMAIN_ID:
         return None, api_response(500, {"error": "SMUS_DOMAIN_ID not configured"})
@@ -1046,7 +1073,7 @@ def _project_or_404(namespace_id: str) -> tuple[str | None, dict[str, Any] | Non
 
 
 def _load_single_asset(
-    client: SMUSClient,
+    client: MetadataStoreClient,
     project_id: str,
     source_id: str,
     table_id: str,

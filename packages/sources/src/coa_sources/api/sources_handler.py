@@ -559,7 +559,7 @@ def _handle_create(event: dict[str, Any], namespace_id: str) -> dict[str, Any]:
     if req.source_type == SourceType.DATABASE:
         if not req.database_source:
             return api_response(400, {"error": "databaseSource is required when sourceType=DATABASE"})
-        return _create_database_source(req.database_source, namespace_id)
+        return _create_database_source(req.database_source, namespace_id, raw)
     else:
         if not req.document_source:
             return api_response(400, {"error": "documentSource is required when sourceType=DOCUMENTS"})

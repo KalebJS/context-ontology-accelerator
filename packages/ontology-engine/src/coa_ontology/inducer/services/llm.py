@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 from coa_common import async_boto_config
@@ -63,7 +65,10 @@ class LLMClient:
         return self._client
 
     def generate(self, prompt: str, system: str = "", max_tokens: int = 4096) -> str:
-        """Generate text from Bedrock for the given prompt.
+        """Generate text from the configured LLM provider.
+
+        Provider switch: ``LLM_PROVIDER=ollama`` routes to the host's Ollama
+        (local Docker stack); default ``bedrock`` keeps the Converse path.
 
         Args:
             prompt: User prompt sent as the message content.
@@ -74,8 +79,48 @@ class LLMClient:
             The generated text from the model's response.
 
         Raises:
-            RuntimeError: If the Bedrock call fails or returns an unexpected shape.
+            RuntimeError: If the LLM call fails or returns an unexpected shape.
         """
+        if os.environ.get("LLM_PROVIDER", "bedrock").lower() == "ollama":
+            return self._generate_ollama(prompt, system=system, max_tokens=max_tokens)
+        return self._generate_bedrock(prompt, system=system, max_tokens=max_tokens)
+
+    def _generate_ollama(self, prompt: str, *, system: str, max_tokens: int) -> str:
+        """Generate via Ollama's OpenAI-compatible chat endpoint (synchronous)."""
+        import json
+
+        import httpx
+
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434").rstrip("/")
+        model = os.environ.get("OLLAMA_CHAT_MODEL", "gemma4:latest")
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=180, write=30, pool=180)) as client:
+                resp = client.post(
+                    f"{base_url}/v1/chat/completions",
+                    content=json.dumps(
+                        {"model": model, "messages": messages, "max_tokens": max_tokens, "stream": False}
+                    ),
+                    headers={"Content-Type": "application/json"},
+                )
+        except (httpx.HTTPError, OSError) as e:
+            raise RuntimeError(f"Ollama chat failed for model {model!r}: {e}") from e
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Ollama chat failed ({resp.status_code}): {resp.text[:300]}")
+        try:
+            choices = resp.json().get("choices") or []
+            text = choices[0].get("message", {}).get("content", "")
+            if not text:
+                raise ValueError("empty content")
+            return text
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            raise RuntimeError(f"Unexpected Ollama response shape: {resp.text[:200]!r}") from e
+
+    def _generate_bedrock(self, prompt: str, *, system: str, max_tokens: int) -> str:
+        """Generate via Bedrock Converse (unchanged production path)."""
         messages = [{"role": "user", "content": [{"text": prompt}]}]
         sys_list = [{"text": system}] if system else []
         try:

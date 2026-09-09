@@ -22,6 +22,7 @@ per-source catalog/schema lookup (athena.py ``_resolve_catalog_and_database``).
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -115,14 +116,22 @@ class VKGTranslator:
             → "http://vkg-{namespace}.coa-dev-services.local:8080"
 
         Clients are cached per namespace (bounded to 64) to reuse HTTP connections.
+
+        VKG_ROUTER_MODE=true (local Docker stack) skips the rewrite: the
+        endpoint is a single router that selects the per-namespace Ontop
+        process itself, keyed by the namespace query parameter each request
+        already carries.
         """
         if namespace not in self._clients:
-            url = self._vkg_endpoint.replace("://vkg.", f"://vkg-{namespace}.")
-            if url == self._vkg_endpoint:
-                raise ValueError(
-                    f"Cannot resolve per-namespace VKG: endpoint '{self._vkg_endpoint}' "
-                    f"does not contain '://vkg.' to rewrite"
-                )
+            if os.environ.get("VKG_ROUTER_MODE", "").lower() == "true":
+                url = self._vkg_endpoint
+            else:
+                url = self._vkg_endpoint.replace("://vkg.", f"://vkg-{namespace}.")
+                if url == self._vkg_endpoint:
+                    raise ValueError(
+                        f"Cannot resolve per-namespace VKG: endpoint '{self._vkg_endpoint}' "
+                        f"does not contain '://vkg.' to rewrite"
+                    )
             if len(self._clients) >= self._MAX_CACHED_CLIENTS:
                 oldest = next(iter(self._clients))
                 del self._clients[oldest]

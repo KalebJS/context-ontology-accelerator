@@ -101,6 +101,11 @@ def process_pdf(
 ) -> tuple[str, str]:
     """Process a PDF — text-native via unstructured, scanned via Textract.
 
+    A ``textract_client`` of ``None`` (local Docker stack: ``PDF_OCR_ENGINE=
+    unstructured``) disables both Textract paths entirely — every PDF routes
+    through ``unstructured.partition_pdf(strategy="fast")``, so scanned pages
+    yield whatever pdfminer text exists instead of OCR.
+
     When ``enable_table_extraction`` is True, ALL PDFs (text-native or
     scanned) route through Textract's ``AnalyzeDocument(TABLES)`` instead of
     ``unstructured.partition_pdf(strategy="fast")``. The ``fast`` strategy
@@ -108,7 +113,7 @@ def process_pdf(
     arrives at graphrag as flattened prose with rows severed from headers,
     losing the very structure that made it worth extracting.
     """
-    if enable_table_extraction:
+    if enable_table_extraction and textract_client is not None:
         logger.info(
             "PDF routed to Textract AnalyzeDocument(TABLES) — table structure preserved",
             extra={"doc_filename": filename},
@@ -116,7 +121,7 @@ def process_pdf(
         text = process_pdf_textract_tables(content_bytes, filename, textract_client)
         return text, ".md"
 
-    if is_scanned_pdf(content_bytes):
+    if textract_client is not None and is_scanned_pdf(content_bytes):
         logger.info(
             "PDF detected as scanned, routing to Textract",
             extra={"doc_filename": filename},

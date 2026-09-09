@@ -17,7 +17,7 @@ from typing import Any
 import structlog
 from coa_common.dao import DynamoDBDAO
 from coa_common.logging import setup_logging
-from coa_common.metadata_store import MetadataStoreError, SMUSClient
+from coa_common.metadata_store import MetadataStoreError, build_metadata_store
 from coa_common.response import api_response
 from coa_control_plane_server.models.create_namespace_request_content import CreateNamespaceRequestContent
 from pydantic import ValidationError
@@ -39,7 +39,7 @@ def _get_service() -> NamespaceService:
         namespaces_dao=DynamoDBDAO(os.environ["NAMESPACES_TABLE"], region=region),
         roles_dao=DynamoDBDAO(os.environ["ROLES_TABLE"], region=region),
         mappings_dao=DynamoDBDAO(os.environ["RESOURCE_ROLE_MAPPINGS_TABLE"], region=region),
-        metadata_store=SMUSClient(domain_id=os.environ["DATAZONE_DOMAIN_ID"], region_name=region),
+        metadata_store=build_metadata_store(domain_id=os.environ["DATAZONE_DOMAIN_ID"], region_name=region),
         project_profile_id=os.environ.get("DATAZONE_PROJECT_PROFILE_ID", ""),
     )
     return _service

@@ -1,0 +1,62 @@
+# Fuseki dataset config for the local COA stack.
+#
+# The ontology-engine's Neptune DB store (stores/neptune_db_graph.py) issues
+# SPARQL 1.1 queries AND updates against POST {NDB_ENDPOINT}/sparql — Neptune
+# serves both operations on one endpoint. Fuseki by default splits them across
+# separate service names (…/sparql vs …/update) and often ships read-only, so
+# accept/ingest fails with "405 Method Not Allowed". This config mounts the
+# dataset AT /sparql with query + update + read-write graph store all enabled,
+# matching the Neptune wire shape the code expects.
+#
+# Same TDB/Lucene layout as the upstream secoresearch/fuseki template so the
+# persisted volume data keeps working; unionDefaultGraph is preserved because
+# the graphrag/SPARQL readers expect it.
+@prefix fuseki:  <http://jena.apache.org/fuseki#> .
+@prefix rdf:     <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix tdb:     <http://jena.hpl.hp.com/2008/tdb#> .
+@prefix ja:      <http://jena.apache.org/2005/11/Assembler#> .
+@prefix text:    <http://jena.apache.org/text#> .
+@prefix skos:    <http://www.w3.org/2004/02/skos/core#> .
+@prefix :        <#> .
+
+<#service> rdf:type fuseki:Service ;
+    fuseki:name              "sparql" ;
+    fuseki:endpoint [ fuseki:operation fuseki:query   ; fuseki:name "" ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:update  ; fuseki:name "" ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-rw  ; fuseki:name "data" ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-rw  ; fuseki:name "gsp" ] ;
+    fuseki:endpoint [ fuseki:operation fuseki:gsp-r   ; fuseki:name "get" ] ;
+    fuseki:dataset           <#text> ;
+    .
+
+<#text> rdf:type text:TextDataset ;
+    text:dataset <#tdb> ;
+    text:index <#lucene> ;
+    .
+
+<#tdb> rdf:type tdb:DatasetTDB ;
+    tdb:location "/fuseki-base/databases/tdb" ;
+    # Make the default graph be the union of all named graphs.
+    tdb:unionDefaultGraph true ;
+    .
+
+<#lucene> a text:TextIndexLucene ;
+    text:directory <file:/fuseki-base/databases/lucene> ;
+    text:storeValues true ;
+    text:entityMap <#entity-map> ;
+    .
+
+<#entity-map> a text:EntityMap ;
+    text:entityField "uri" ;
+    text:graphField "graph" ;
+    text:defaultField "text" ;
+    text:uidField "uid" ;
+    text:langField "lang" ;
+    text:map (
+         [ text:field "text" ; text:predicate skos:prefLabel ]
+         [ text:field "text" ; text:predicate skos:altLabel ]
+         [ text:field "text" ; text:predicate skos:hiddenLabel ]
+         [ text:field "text" ; text:predicate rdfs:label ]
+         )
+    .

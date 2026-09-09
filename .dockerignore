@@ -24,12 +24,36 @@
 
 # Allow ontology-engine package
 !packages/ontology-engine/Dockerfile
+!packages/ontology-engine/pyproject.toml
 !packages/ontology-engine/src/
 !packages/ontology-engine/requirements.txt
 !packages/ontology-engine/tests/fixtures/data-catalog/sample_data/
 
+# Allow control-plane, metric-service, data-layer (local-gateway image)
+!packages/control-plane/pyproject.toml
+!packages/control-plane/src/
+!packages/metric-service/pyproject.toml
+!packages/metric-service/src/
+!packages/data-layer/pyproject.toml
+!packages/data-layer/src/
+
 # Allow smithy-generated models
 !smithy-generated/control-plane-python-server/
+!smithy-generated/data-layer-python-server/
+!smithy-generated/control-plane-typescript-client/
+!smithy-generated/data-layer-typescript-client/
+
+# Allow the local Docker stack build assets (gateway app, worker, router, DL wrapper)
+!docker/
+
+# Allow web-app workspace deps (ts-shared + mcp-proxy are web-app build inputs)
+!libs/ts-shared/
+!packages/mcp-proxy/
+!packages/web-app/
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!package.json
+!packages/web-app/
 
 # Exclude test artifacts and caches from allowed dirs
 **/__pycache__
@@ -38,3 +62,4 @@
 **/coverage.xml
 **/junit.xml
 **/*.pyc
+**/node_modules

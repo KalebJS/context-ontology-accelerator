@@ -1,20 +1,21 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reads discovered assets from DataZone for enrichment using SMUSClient."""
+"""Reads discovered assets from the metadata store for enrichment."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+from typing import Any
 
 from coa_common.datazone_forms import (
     FORM_TYPE_NAME,
     deserialize_form,
 )
 from coa_common.domain_models import Table
-from coa_common.metadata_store.smus import SMUSClient
+from coa_common.metadata_store.factory import build_metadata_store
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +23,14 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 
 def read_assets_for_datasource(domain_id: str, project_id: str, data_source_id: str) -> list[Table]:
-    """Search DataZone for assets belonging to a data source and parse into Table objects."""
+    """Search the metadata store for assets belonging to a data source and parse into Table objects."""
     if not data_source_id:
         raise ValueError("data_source_id is required for asset filtering")
 
     # Assets are stored with DS# prefix in their name
     ds_key = f"DS#{data_source_id}" if not data_source_id.startswith("DS#") else data_source_id
 
-    client = SMUSClient(
+    client = build_metadata_store(
         domain_id=domain_id,
         region_name=AWS_REGION,
         assume_role_arn=os.getenv("PROJECT_ACCESS_ROLE_ARN") or None,
@@ -38,7 +39,7 @@ def read_assets_for_datasource(domain_id: str, project_id: str, data_source_id: 
     tables: list[Table] = []
 
     logger.info(
-        "Searching DataZone for assets: domain=%s project=%s datasource=%s",
+        "Searching metadata store for assets: domain=%s project=%s datasource=%s",
         domain_id,
         project_id,
         ds_key,
@@ -78,9 +79,9 @@ def read_assets_for_datasource(domain_id: str, project_id: str, data_source_id: 
     return tables
 
 
-def _client(domain_id: str, session_name: str) -> SMUSClient:
-    """SMUSClient for a DataZone domain, with the project-access role when set."""
-    return SMUSClient(
+def _client(domain_id: str, session_name: str) -> Any:
+    """MetadataStore client with the project-access role when set."""
+    return build_metadata_store(
         domain_id=domain_id,
         region_name=AWS_REGION,
         assume_role_arn=os.getenv("PROJECT_ACCESS_ROLE_ARN") or None,
@@ -166,7 +167,7 @@ def read_table_for_asset(domain_id: str, asset_id: str, asset_name: str, data_so
     return _parse_asset(_client(domain_id, "catalog-asset-reader"), asset_id, asset_name, data_source_id)
 
 
-def _parse_asset(client: SMUSClient, asset_id: str, asset_name: str, data_source_id: str) -> Table | None:
+def _parse_asset(client: Any, asset_id: str, asset_name: str, data_source_id: str) -> Table | None:
     """Parse a DataZone asset into a Table object by reading its form."""
     try:
         detail = client.get_asset_forms(asset_id=asset_id)

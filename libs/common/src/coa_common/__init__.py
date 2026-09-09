@@ -78,7 +78,7 @@ from coa_common.domain_models import (
     TechnicalMetadata,
     to_dict,
 )
-from coa_common.embeddings import BedrockEmbedder, make_llama_index_embedding
+from coa_common.embeddings import BedrockEmbedder, OllamaEmbedder, make_llama_index_embedding
 from coa_common.exceptions import SCLError
 from coa_common.guardrail_screener import (
     GuardrailScreener,
@@ -122,6 +122,7 @@ __all__ = [
     "AssetResult",
     "BedrockClient",
     "BedrockEmbedder",
+    "OllamaEmbedder",
     "make_llama_index_embedding",
     "BedrockInvocationResult",
     "GuardrailBlockedError",

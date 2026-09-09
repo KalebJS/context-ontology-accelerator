@@ -94,13 +94,26 @@ _TEXT_FIELDS = (
 def build_index_mapping(dims: int) -> dict:
     """Canonical vector-index mapping — the single source of truth.
 
-    ``embedding`` is a **method-less** ``knn_vector`` (NEXTGEN auto-resolves to
-    Faiss/HNSW; an explicit ``method.engine`` is rejected). All filterable fields
-    are ``keyword`` so server-side ``term``/``exists`` filters match exactly.
+    ``embedding`` is a **method-less** ``knn_vector`` on AOSS: NEXTGEN
+    auto-resolves to Faiss/HNSW (an explicit ``method.engine`` is rejected
+    there). On a self-managed OpenSearch cluster (local Docker stack) the
+    method-less default resolves to **NMSLIB**, which does not support
+    filtered k-NN queries; set ``OSS_KNN_ENGINE=faiss`` to pin
+    ``method.engine`` explicitly and keep server-side ``knn.embedding.filter``
+    working.
+    All filterable fields are ``keyword`` so server-side ``term``/``exists``
+    filters match exactly.
     """
     props: dict[str, Any] = {f: {"type": "keyword"} for f in _KEYWORD_FIELDS}
     props.update({f: {"type": "text"} for f in _TEXT_FIELDS})
-    props["embedding"] = {"type": "knn_vector", "dimension": dims}
+    embedding: dict[str, Any] = {"type": "knn_vector", "dimension": dims}
+    engine = os.getenv("OSS_KNN_ENGINE", "").strip()
+    if engine:
+        # Explicit engine for self-managed clusters; AOSS forbids this key.
+        # Faiss only supports l2 (nmslib only cosinesimil) — pick a valid pair.
+        space = "l2" if engine == "faiss" else "cosinesimil"
+        embedding["method"] = {"name": "hnsw", "engine": engine, "space_type": space}
+    props["embedding"] = embedding
     return {"settings": {"index": {"knn": True}}, "mappings": {"properties": props}}
 
 
@@ -180,6 +193,34 @@ def _build_signed_client(endpoint: str, region: str, timeout: int) -> OpenSearch
     )
 
 
+def _build_unsigned_client(endpoint: str, timeout: int) -> OpenSearch:
+    """Plain-HTTP opensearch-py client for a local (Docker) OpenSearch node.
+
+    Selected when ``OPENSEARCH_AUTH=none``. The endpoint must carry its own
+    scheme (``http://opensearch:9200``); security is disabled on that node, so
+    no credentials are attached. Pool sizing matches the signed client so
+    inducer fan-out doesn't starve the pool.
+    """
+    host = endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+    use_ssl = endpoint.startswith("https://")
+    port = 443 if use_ssl else 9200
+    if ":" in host:
+        host, _, port_s = host.rpartition(":")
+        port = int(port_s)
+    return OpenSearch(
+        hosts=[{"host": host, "port": port}],
+        use_ssl=use_ssl,
+        verify_certs=False,
+        connection_class=RequestsHttpConnection,
+        timeout=timeout,
+        pool_maxsize=max(
+            int(os.getenv("INDUCER_COLUMN_MATCH_WORKERS", "16")),
+            int(os.getenv("INDUCER_GROUNDING_WORKERS", "24")),
+            10,
+        ),
+    )
+
+
 def _filter_clause(filters: list[dict] | None) -> dict | None:
     """Wrap a list of leaf filter clauses in a ``bool``/``filter``, or None."""
     return {"bool": {"filter": filters}} if filters else None
@@ -230,7 +271,13 @@ class AossVectorClient:
         if self._client is None:
             if not self.endpoint:
                 raise RuntimeError("AOSS endpoint not set — configure the collection endpoint")
-            self._client = _RetryingClient(_build_signed_client(self.endpoint, self.region, self.timeout))
+            # OPENSEARCH_AUTH=none selects the unsigned local client (Docker
+            # stack: vanilla OpenSearch with security disabled). Default keeps
+            # the production SigV4 AOSS path unchanged.
+            if os.getenv("OPENSEARCH_AUTH", "sigv4").lower() == "none":
+                self._client = _RetryingClient(_build_unsigned_client(self.endpoint, self.timeout))
+            else:
+                self._client = _RetryingClient(_build_signed_client(self.endpoint, self.region, self.timeout))
         return self._client
 
     def raw_client(self):

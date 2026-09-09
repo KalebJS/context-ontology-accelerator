@@ -60,7 +60,7 @@ class TestWriteToDatazone:
         mock_client_cls = MagicMock(return_value=mock_client)
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
         ):
             from coa_sources.database.metadata_writer import write_to_datazone
@@ -84,7 +84,7 @@ class TestWriteToDatazone:
         mock_client_cls = MagicMock(return_value=mock_client)
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
         ):
             from coa_sources.database.metadata_writer import write_to_datazone
@@ -113,7 +113,7 @@ class TestWriteToDatazone:
         tables = [_make_table("db.t0", "t0"), _make_table("db.t1", "t1")]
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
         ):
             from coa_sources.database.metadata_writer import write_to_datazone
@@ -136,7 +136,7 @@ class TestWriteToDatazone:
         mock_client_cls = MagicMock(return_value=mock_client)
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
         ):
             from coa_sources.database.metadata_writer import write_to_datazone
@@ -160,7 +160,7 @@ class TestWriteToDatazone:
         tables = [_make_table(f"db.table{i}", f"table{i}") for i in range(3)]
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
         ):
             from coa_sources.database.metadata_writer import write_to_datazone
@@ -185,7 +185,7 @@ class TestWriteToDatazone:
         tables = [_make_table(f"db.table{i}", f"table{i}") for i in range(50)]
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
             patch.dict(os.environ, {"DATAZONE_WRITE_PARALLELISM": "8"}),
         ):
@@ -219,7 +219,7 @@ class TestWriteToDatazone:
         mock_client_cls = MagicMock(return_value=mock_client)
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
         ):
             from coa_sources.database.metadata_writer import write_to_datazone
@@ -248,7 +248,7 @@ class TestWriteToDatazone:
         tables = [_make_table(f"db.table{i}", f"table{i}") for i in range(3)]
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
         ):
             from coa_sources.database.metadata_writer import write_to_datazone
@@ -267,7 +267,7 @@ class TestWriteToDatazone:
         mock_client_cls = MagicMock(return_value=mock_client)
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
         ):
             from coa_sources.database.metadata_writer import write_to_datazone
@@ -291,7 +291,7 @@ class TestWriteToDatazone:
         mock_client_cls = MagicMock(return_value=mock_client)
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
             patch.dict(os.environ, {"PROJECT_ACCESS_ROLE_ARN": "arn:aws:iam::123:role/test-role"}),
         ):
@@ -326,7 +326,7 @@ class TestSearchAccessDeniedSurfacing:
         mock_client_cls = MagicMock(return_value=mock_client)
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
             patch.dict(os.environ, {"PROJECT_ACCESS_ROLE_ARN": "arn:aws:iam::123:role/scan"}),
         ):
@@ -353,7 +353,7 @@ class TestSearchAccessDeniedSurfacing:
         mock_client_cls = MagicMock(return_value=mock_client)
 
         with (
-            patch("coa_sources.database.metadata_writer.SMUSClient", mock_client_cls),
+            patch("coa_sources.database.metadata_writer.build_metadata_store", mock_client_cls),
             patch("coa_sources.database.metadata_writer.build_forms_input", return_value=[]),
         ):
             from coa_sources.database.metadata_writer import write_to_datazone

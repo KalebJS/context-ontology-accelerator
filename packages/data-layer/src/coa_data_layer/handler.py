@@ -54,6 +54,12 @@ AGENTCORE_ENDPOINT = f"https://bedrock-agentcore.{REGION}.amazonaws.com"
 ENCODED_ARN = quote(RUNTIME_ARN, safe="")
 INVOKE_URL = f"{AGENTCORE_ENDPOINT}/runtimes/{ENCODED_ARN}/invocations?qualifier=DEFAULT"
 
+# Local Docker stack: AGENTCORE_DIRECT_URL points at the context-manager
+# container directly (plain HTTP, no AgentCore). Overrides INVOKE_URL when set.
+DIRECT_CM_URL = os.environ.get("AGENTCORE_DIRECT_URL", "").rstrip("/")
+if DIRECT_CM_URL:
+    INVOKE_URL = f"{DIRECT_CM_URL}/invocations"
+
 # Lambda client for the ontology-api-proxy invocation. Created lazily so that
 # the handler still loads in test environments that don't stub boto3.
 _lambda_client = None
@@ -106,7 +112,11 @@ def _invoke_context_manager(payload: dict, token: str) -> dict:
     )
     # Sync customer path behind API Gateway (30s cap): explicit 29s timeout and
     # no retry by design — fail fast and let the client decide when to retry.
-    with urllib_request.urlopen(req, timeout=29) as resp:
+    # Local Docker stack has no API Gateway deadline, so the deployment sets
+    # DATA_LAYER_CM_TIMEOUT_S higher (the first cold query pays Ollama +
+    # k-NN + SQL generation latency); default keeps the AWS contract.
+    timeout_s = float(os.environ.get("DATA_LAYER_CM_TIMEOUT_S", "29"))
+    with urllib_request.urlopen(req, timeout=timeout_s) as resp:
         raw = resp.read().decode("utf-8")
     return _parse_first_sse_event(raw)
 

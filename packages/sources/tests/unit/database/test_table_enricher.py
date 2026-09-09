@@ -750,10 +750,10 @@ class TestProtectedColumnMetadata:
 class TestWriteEnrichedAssets:
     """Verify _write_enriched_assets logic."""
 
-    @patch("coa_common.metadata_store.SMUSClient")
-    def test_writes_enriched_tables(self, mock_smus_cls: MagicMock) -> None:
+    @patch("coa_common.metadata_store.build_metadata_store")
+    def test_writes_enriched_tables(self, mock_store_cls: MagicMock) -> None:
         mock_client = MagicMock()
-        mock_smus_cls.return_value = mock_client
+        mock_store_cls.return_value = mock_client
         asset_mock = MagicMock()
         asset_mock.configure_mock(name="ds-123:sales.orders")
         asset_mock.asset_id = "asset-001"
@@ -766,10 +766,10 @@ class TestWriteEnrichedAssets:
 
         mock_client.create_asset_revision.assert_called_once()
 
-    @patch("coa_common.metadata_store.SMUSClient")
-    def test_skips_table_with_empty_data_source_id(self, mock_smus_cls: MagicMock) -> None:
+    @patch("coa_common.metadata_store.build_metadata_store")
+    def test_skips_table_with_empty_data_source_id(self, mock_store_cls: MagicMock) -> None:
         mock_client = MagicMock()
-        mock_smus_cls.return_value = mock_client
+        mock_store_cls.return_value = mock_client
 
         table = Table(name="orphan", database="db", columns=[], data_source_id="")
 
@@ -777,10 +777,10 @@ class TestWriteEnrichedAssets:
 
         mock_client.search_assets.assert_not_called()
 
-    @patch("coa_common.metadata_store.SMUSClient")
-    def test_skips_when_asset_not_found(self, mock_smus_cls: MagicMock) -> None:
+    @patch("coa_common.metadata_store.build_metadata_store")
+    def test_skips_when_asset_not_found(self, mock_store_cls: MagicMock) -> None:
         mock_client = MagicMock()
-        mock_smus_cls.return_value = mock_client
+        mock_store_cls.return_value = mock_client
         mock_client.search_assets.return_value = MagicMock(items=[])
 
         table = _make_table("orders")
@@ -789,10 +789,10 @@ class TestWriteEnrichedAssets:
 
         mock_client.create_asset_revision.assert_not_called()
 
-    @patch("coa_common.metadata_store.SMUSClient")
-    def test_handles_write_exception_gracefully(self, mock_smus_cls: MagicMock) -> None:
+    @patch("coa_common.metadata_store.build_metadata_store")
+    def test_handles_write_exception_gracefully(self, mock_store_cls: MagicMock) -> None:
         mock_client = MagicMock()
-        mock_smus_cls.return_value = mock_client
+        mock_store_cls.return_value = mock_client
         asset_mock = MagicMock()
         asset_mock.configure_mock(name="ds-123:sales.orders")
         asset_mock.asset_id = "asset-001"

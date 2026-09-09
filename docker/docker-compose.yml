@@ -1,0 +1,444 @@
+# COA — full local Docker stack.
+# Every AWS dependency replaced with a local equivalent; LLM/embeddings come
+# from the host's Ollama (see .env). Build from the repo root:
+#   docker compose -f docker/docker-compose.yml build
+#   docker compose -f docker/docker-compose.yml up -d
+
+name: coa-local
+
+x-aws-env: &aws-env
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-test}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+  LOCALSTACK_ENDPOINT: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  # boto3 honors per-service endpoint overrides (AWS_ENDPOINT_URL_<SERVICE_ID>);
+  # route every LocalStack-backed service through the emulated endpoint.
+  AWS_ENDPOINT_URL_DYNAMODB: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_S3: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_SQS: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_SSM: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_SECRETS_MANAGER: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_EVENTBRIDGE: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_STS: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_STEP_FUNCTIONS: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_ATHENA: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_GLUE: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  AWS_ENDPOINT_URL_TEXTRACT: ${LOCALSTACK_ENDPOINT:-http://localstack:4566}
+  SCL_PREFIX: ${SCL_PREFIX:-coa}
+  SCL_ENV: ${SCL_ENV:-local}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-ollama-env: &ollama-env
+  LLM_PROVIDER: ollama
+  EMBED_PROVIDER: ollama
+  OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+  OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-gemma4:latest}
+  OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-mxbai-embed-large:latest}
+  OLLAMA_TIMEOUT_S: ${OLLAMA_TIMEOUT_S:-120}
+
+x-oidc-env: &oidc-env
+  KC_ISSUER_INTERNAL: ${KC_ISSUER_INTERNAL:-http://keycloak:8080/realms/coa}
+  KC_WEB_CLIENT_ID: ${KC_WEB_CLIENT_ID:-coa-web}
+  KC_MCP_CLIENT_ID: ${KC_MCP_CLIENT_ID:-coa-mcp}
+  KC_ISSUER_PUBLIC: ${KC_ISSUER_PUBLIC:-http://localhost:8280/realms/coa}
+
+services:
+  # ── Infra ──────────────────────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3
+    ports: ["${LOCALSTACK_PORT:-8888}:4566"]
+    environment:
+      SERVICES: ${LOCALSTACK_SERVICES:-dynamodb,s3,ssm,secretsmanager,sqs,events,sts}
+      DEBUG: "0"
+      PERSIST_TO: "0"
+    volumes:
+      - localstack-data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  provisioner:
+    build:
+      context: ./localstack/provisioner
+    environment:
+      <<: *aws-env
+      KC_ISSUER_INTERNAL: ${KC_ISSUER_INTERNAL:-http://keycloak:8080/realms/coa}
+      KC_WEB_CLIENT_ID: ${KC_WEB_CLIENT_ID:-coa-web}
+      KC_MCP_CLIENT_ID: ${KC_MCP_CLIENT_ID:-coa-mcp}
+      KC_ADMIN_GROUP: platform-admins
+      E2E_USERNAME: ${E2E_USERNAME:-admin@coa.local}
+      OPENSEARCH_URL: ${OPENSEARCH_URL:-http://opensearch:9200}
+      SEED_DIR: /seeds
+      DEMO_DB_USER: ${DEMO_DB_USER:-coa}
+      DEMO_DB_PASSWORD: ${DEMO_DB_PASSWORD:-coa_demo_pw}
+    volumes:
+      - ../libs/common/src/coa_authorization/seed:/seeds:ro
+    depends_on:
+      localstack:
+        condition: service_healthy
+    restart: "no"
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: ${KC_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KC_ADMIN_PASSWORD:-Passw0rd!}
+    volumes:
+      - ./keycloak/realm-coa.json:/opt/keycloak/data/import/realm-coa.json:ro
+    ports:
+      - "${KEYCLOAK_PORT:-8280}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  fuseki:
+    image: secoresearch/fuseki:latest
+    environment:
+      ADMIN_PASSWORD: coa-admin
+      FUSEKI_DATASET_1: coa
+      JVM_ARGS: -Xmx2g
+    # Read-write dataset config: serves query AND update on /sparql so the
+    # ontology-engine's Neptune-style POST {NDB_ENDPOINT}/sparql updates work,
+    # plus a named gsp graph-store endpoint for load_turtle (the stock image
+    # ships a query-only service → 405 on ingest).
+    # Needs to land at /fuseki-base/configuration/ on first boot; the entrypoint
+    # only seeds config from templates when the volume is empty, so an existing
+    # volume must be reset (docker compose down -v) to pick this up.
+    volumes:
+      - ./fuseki/assembler.ttl:/fuseki-base/configuration/assembler.ttl:ro
+      - fuseki-data:/fuseki
+    ports: ["${FUSEKI_PORT:-3030}:3030"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3030/$$/ping || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+      bootstrap.system_call_filter: "false"
+    ports: ["${OPENSEARCH_PORT:-9200}:9200"]
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${DEMO_DB:-coa_demo}
+      POSTGRES_USER: ${DEMO_DB_USER:-coa}
+      POSTGRES_PASSWORD: ${DEMO_DB_PASSWORD:-coa_demo_pw}
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DEMO_DB_USER:-coa} -d ${DEMO_DB:-coa_demo}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  # ── Apps ───────────────────────────────────────────────────────────────
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/gateway/Dockerfile
+    image: coa-local-gateway:latest
+    ports: ["${GATEWAY_PORT:-9090}:9090"]
+    environment:
+      <<: [*aws-env, *oidc-env]
+      ALLOWED_ORIGIN: "*"
+      OE_ENDPOINT: http://ontology-engine:8001
+      CM_ENDPOINT: http://context-manager:8080
+      METADATA_STORE_PROVIDER: local
+      LOCAL_METADATA_TABLE: ${SCL_PREFIX:-coa}-local-metadata
+      # The gateway imports the data-layer handler in-process for /query, so
+      # the CM call timeout applies here too (not just the data-layer container).
+      DATA_LAYER_CM_TIMEOUT_S: ${DATA_LAYER_CM_TIMEOUT_S:-29}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      localstack:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      ontology-engine:
+        condition: service_healthy
+      context-manager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  context-manager:
+    build:
+      context: ..
+      dockerfile: packages/context-manager/Dockerfile
+    image: coa-context-manager:latest
+    ports: ["${CM_PORT:-8081}:8080"]
+    environment:
+      <<: [*aws-env, *ollama-env, *oidc-env]
+      NEPTUNE_ENDPOINT: fuseki
+      NEPTUNE_PORT: "3030"
+      GRAPH_AUTH: none
+      GRAPH_ENDPOINT_SCHEME: http
+      OPENSEARCH_ENDPOINT: ${OPENSEARCH_URL:-http://opensearch:9200}
+      OPENSEARCH_AUTH: none
+      VKG_ENDPOINT: ${VKG_ENDPOINT:-http://vkg-router:8180}
+      VKG_ROUTER_MODE: "true"
+      DATA_SOURCES_TABLE: ${SCL_PREFIX:-coa}-local-sources
+      METRIC_DEFINITIONS_TABLE: ${SCL_PREFIX:-coa}-local-ontology-engine
+      SESSION_METADATA_TABLE: ""
+      MEMORY_ID: ""
+      ROLES_TABLE_NAME: ${SCL_PREFIX:-coa}-local-roles
+      RRM_TABLE_NAME: ${SCL_PREFIX:-coa}-local-resource-role-mappings
+      RESOURCE_ROLE_MAPPINGS_TABLE_NAME: ${SCL_PREFIX:-coa}-local-resource-role-mappings
+      NAMESPACES_TABLE: ${SCL_PREFIX:-coa}-local-namespaces
+      METADATA_STORE_PROVIDER: local
+      OSS_ONTOLOGY_INDEX: ${SCL_PREFIX:-coa}-local-ontologies
+      # Self-managed OpenSearch defaults to NMSLIB, which rejects filtered
+      # k-NN queries; pin the Faiss engine the AOSS mapping implies.
+      OSS_KNN_ENGINE: faiss
+      BEDROCK_GUARDRAIL_ID: ""
+      SERVE_GUARDRAILS_DISABLED: "true"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      fuseki:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  mcp-server:
+    build:
+      context: ..
+      dockerfile: packages/context-manager/Dockerfile
+    image: coa-context-manager:latest
+    command: ["python", "-m", "coa_mcp"]
+    ports: ["${MCP_PORT:-8002}:8000"]
+    environment:
+      <<: [*aws-env, *ollama-env, *oidc-env]
+      SCL_MCP_MODE: "true"
+      CM_DIRECT_URL: http://context-manager:8080
+      GATEWAY_ENDPOINT: http://gateway:9090
+      AGENTCORE_RUNTIME_ARN: local/cm-runtime
+      RRM_TABLE_NAME: ${SCL_PREFIX:-coa}-local-resource-role-mappings
+      ROLES_TABLE_NAME: ${SCL_PREFIX:-coa}-local-roles
+      METADATA_STORE_PROVIDER: local
+      SCL_AUTH_ENABLED: "false"
+      JWT_ISSUER_URL: ${KC_ISSUER_PUBLIC:-http://localhost:8280/realms/coa}
+      JWT_JWKS_URI: ${KC_ISSUER_INTERNAL:-http://keycloak:8080/realms/coa}/protocol/openid-connect/certs
+      JWT_CLIENT_ID: ${KC_MCP_CLIENT_ID:-coa-mcp}
+      NEPTUNE_ENDPOINT: fuseki
+      NEPTUNE_PORT: "3030"
+      GRAPH_AUTH: none
+      OPENSEARCH_ENDPOINT: ${OPENSEARCH_URL:-http://opensearch:9200}
+      OPENSEARCH_AUTH: none
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      gateway:
+        condition: service_healthy
+      context-manager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:8000/mcp', data=b'{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"hc\",\"version\":\"0\"}}}', headers={'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream'}))"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  ontology-engine:
+    build:
+      context: ..
+      dockerfile: packages/ontology-engine/Dockerfile
+    image: coa-ontology-engine:latest
+    ports: ["${OE_PORT:-8001}:8001"]
+    environment:
+      <<: [*aws-env, *ollama-env]
+      LLM_MODEL_ID: ${OLLAMA_CHAT_MODEL:-gemma4:latest}
+      DESCRIPTION_LLM_MODEL_ID: ${OLLAMA_CHAT_MODEL:-gemma4:latest}
+      BEDROCK_EMBED_MODEL_ID: ${OLLAMA_EMBED_MODEL:-mxbai-embed-large:latest}
+      EMBED_PROVIDER: ollama
+      OPENSEARCH_ENDPOINT: ${OPENSEARCH_URL:-http://opensearch:9200}
+      OPENSEARCH_AUTH: none
+      NDB_IAM_AUTH: "false"
+      NDB_ENDPOINT_SCHEME: http
+      NEPTUNE_ENDPOINT: fuseki
+      NDB_ENDPOINT: http://fuseki:3030
+      # Fuseki mounts GSP at /sparql/gsp (no trailing slash); Neptune uses /sparql/gsp/.
+      NDB_GSP_PATH: /sparql/gsp
+      OSS_ENDPOINT: ${OPENSEARCH_URL:-http://opensearch:9200}
+      OSS_INDEX: ${SCL_PREFIX:-coa}-local-ontologies
+      # Self-managed OpenSearch defaults to NMSLIB, which rejects filtered
+      # k-NN queries; pin the Faiss engine the AOSS mapping implies.
+      OSS_KNN_ENGINE: faiss
+      DYNAMODB_TABLE: ${SCL_PREFIX:-coa}-local-ontology-engine
+      ONTOLOGY_ARTIFACTS_BUCKET: ${SCL_PREFIX:-coa}-local-ontology-artifacts
+      CATALOG_SOURCE: smus
+      SMUS_DOMAIN_ID: local-domain
+      NAMESPACES_TABLE: ${SCL_PREFIX:-coa}-local-namespaces
+      WORKBENCH_BACKEND: opensearch_neptune
+      SOURCES_TABLE: ${SCL_PREFIX:-coa}-local-sources
+      METADATA_STORE_PROVIDER: local
+      LOCAL_METADATA_TABLE: ${SCL_PREFIX:-coa}-local-metadata
+      ONTOLOGY_BUCKET: ${SCL_PREFIX:-coa}-local-ontology-artifacts
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      fuseki:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  data-layer:
+    build:
+      context: ..
+      dockerfile: docker/data-layer/Dockerfile
+    image: coa-data-layer:latest
+    ports: ["${DL_PORT:-8083}:8080"]
+    environment:
+      <<: *aws-env
+      AGENTCORE_RUNTIME_ARN: local/cm-runtime
+      AGENTCORE_DIRECT_URL: http://context-manager:8080
+      # No API Gateway 30s cap locally; NL→SQL queries can exceed 29s on a
+      # cold Ollama path (first query after accept embeds + generates SQL).
+      DATA_LAYER_CM_TIMEOUT_S: "120"
+      ONTOLOGY_PROXY_ENDPOINT: http://ontology-engine:8001
+      METRIC_SERVICE_ENDPOINT: http://gateway:9090
+      ALLOWED_ORIGIN: "*"
+    depends_on:
+      context-manager:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  vkg-router:
+    build:
+      context: ..
+      dockerfile: docker/vkg-router/Dockerfile
+    image: coa-vkg-router:latest
+    ports: ["${VKG_PORT:-8180}:8180"]
+    environment:
+      <<: *aws-env
+      ONTOLOGY_BUCKET: ${SCL_PREFIX:-coa}-local-ontology-artifacts
+      ONTOLOGY_PREFIX: ontologies/
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  scan-workers:
+    build:
+      context: ..
+      dockerfile: docker/scan-workers/Dockerfile
+    image: coa-scan-workers:latest
+    environment:
+      <<: [*aws-env, *ollama-env]
+      WORKER_QUEUES: db-scan,bulk-review,doc-ingestion,doc-deletion
+      PDF_OCR_ENGINE: unstructured
+      METADATA_STORE_PROVIDER: local
+      LOCAL_METADATA_TABLE: ${SCL_PREFIX:-coa}-local-metadata
+      SMUS_DOMAIN_ID: local-domain
+      PROJECT_ACCESS_ROLE_ARN: arn:local:iam::000000000000:role/project-access
+      FEDERATION_PROVISIONER_ROLE_ARN: arn:local:iam::000000000000:role/federation-provisioner
+      PROJECT_ACCESS_ROLE_ARN_SSM: /${SCL_PREFIX:-coa}/smus/dz-project-access-role-arn
+      NEPTUNE_ENDPOINT: fuseki
+      NDB_IAM_AUTH: "false"
+      NDB_ENDPOINT_SCHEME: http
+      OPENSEARCH_ENDPOINT: ${OPENSEARCH_URL:-http://opensearch:9200}
+      OPENSEARCH_AUTH: none
+      ONTOLOGY_BUCKET: ${SCL_PREFIX:-coa}-local-ontology-artifacts
+      SOURCES_TABLE: ${SCL_PREFIX:-coa}-local-sources
+      SOURCE_SCAN_JOBS_TABLE: ${SCL_PREFIX:-coa}-local-source-scan-jobs
+      NAMESPACES_TABLE: ${SCL_PREFIX:-coa}-local-namespaces
+      # No Athena/Glue/Lake Formation locally: the federation step only marks the
+      # source queryable (serve's direct-JDBC path needs no provisioned catalog).
+      FEDERATION_MODE: local
+      RESOURCE_PREFIX: ${SCL_PREFIX:-coa}-
+      REVIEW_QUEUE_URL: http://localstack:4566/000000000000/${SCL_PREFIX:-coa}-local-sources-bulk-review-queue
+      DATAZONE_DOMAIN_ID: local-domain
+      BUCKET_NAME: ${SCL_PREFIX:-coa}-local-sources-data
+      DOC_SOURCES_TABLE: ${SCL_PREFIX:-coa}-local-sources
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      localstack:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      fuseki:
+        condition: service_healthy
+
+  web-app:
+    build:
+      context: ..
+      dockerfile: docker/web-app/Dockerfile
+    image: coa-web-app:latest
+    ports: ["${WEB_PORT:-3000}:80"]
+    environment:
+      WEB_API_ENDPOINT: ${WEB_API_ENDPOINT:-http://localhost:9090}
+      KC_ISSUER_PUBLIC: ${KC_ISSUER_PUBLIC:-http://localhost:8280/realms/coa}
+      KC_WEB_CLIENT_ID: ${KC_WEB_CLIENT_ID:-coa-web}
+      VERSION: ${SCL_VERSION:-0.2.3}
+    depends_on:
+      gateway:
+        condition: service_healthy
+      context-manager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  localstack-data:
+  fuseki-data:
+  opensearch-data:
+  postgres-data:

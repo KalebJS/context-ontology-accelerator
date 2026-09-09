@@ -121,7 +121,16 @@ async def _ensure_initialized():
         # Build client layer
         neptune_client = NeptuneGraphClient(endpoint=config.neptune_endpoint)
         opensearch_client = OpenSearchVectorClient(endpoint=config.opensearch_endpoint)
-        bedrock_client = BedrockLLMClient(model_id=config.bedrock_model_id, region=config.bedrock_region)
+        # LLM provider switch: "bedrock" (default, unchanged) or "ollama"
+        # (local Docker stack — see clients/ollama.py). Unknown values fall
+        # back to Bedrock so a typo can never silently change the backend.
+        if os.environ.get("LLM_PROVIDER", "bedrock").lower() == "ollama":
+            from .clients.ollama import OllamaLLMClient
+
+            bedrock_client = OllamaLLMClient()
+            logger.info("llm_provider_ollama", model=bedrock_client.model_id)
+        else:
+            bedrock_client = BedrockLLMClient(model_id=config.bedrock_model_id, region=config.bedrock_region)
         # VKG endpoint used as template: "://vkg." is replaced with "://vkg-{ns}." per request
 
         from .clients.sources_registry import SourcesRegistry
@@ -395,6 +404,7 @@ def _error(status_code: int, message: str, request_id: str) -> dict:
 
 async def _handle_translate(payload: dict, request_id: str) -> dict:
     """NL-to-SPARQL translation only (no VKG execution)."""
+    assert _nl_to_sparql is not None, "invoke() guarantees initialization before dispatching actions"
     namespace = payload.get("namespace", "")
     try:
         query = validate_query_text(payload.get("query"))
@@ -434,6 +444,7 @@ async def _handle_translate(payload: dict, request_id: str) -> dict:
 
 async def _handle_kb_search(payload: dict, request_id: str) -> dict:
     """Vector search in OpenSearch — returns matching document chunks."""
+    assert _orchestrator is not None, "invoke() guarantees initialization before dispatching actions"
     namespace = payload.get("namespace", "")
     options = payload.get("options", {})
     try:
@@ -502,6 +513,7 @@ async def _handle_kb_search(payload: dict, request_id: str) -> dict:
 
 async def _handle_graph_traverse(payload: dict, request_id: str) -> dict:
     """Graph traversal in Neptune — returns entities and relationships."""
+    assert _orchestrator is not None, "invoke() guarantees initialization before dispatching actions"
     namespace = payload.get("namespace", "")
     options = payload.get("options", {})
     start_uri = options.get("startUri", "")
@@ -620,6 +632,7 @@ async def _persist_turn(
     request_id: str,
 ) -> None:
     """Best-effort persistence of a completed query turn to session history."""
+    assert _session_manager is not None, "only called from the streaming path when session history is configured"
     try:
         answer = response.result.synthesized_answer or ""
         turn_metadata: dict | None = None
@@ -647,6 +660,7 @@ async def _persist_turn(
 
 async def _handle_blocking_query(request, request_id: str):
     """Non-streaming query resolution. Yields a single result dict."""
+    assert _orchestrator is not None, "invoke() guarantees initialization before dispatching queries"
     resolve_start = time.perf_counter()
     try:
         response = await asyncio.wait_for(
@@ -835,6 +849,7 @@ async def _authorize_namespace_access(
         (grant lookup failed) is a retryable 502, so a transient DynamoDB fault
         is not reported to every caller as a permissions change.
     """
+    assert _orchestrator is not None, "invoke() guarantees initialization before authorization"
     upstream_user_id, upstream_groups = resolve_principal(payload_profile, jwt_user_id, jwt_email, jwt_groups)
 
     try:

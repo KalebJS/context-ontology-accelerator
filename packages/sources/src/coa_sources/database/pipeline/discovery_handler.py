@@ -329,6 +329,20 @@ def _discover(
     """
     item = source_item or {}
     connector_config = {
+        # Engine-specific connect options persisted from the request (e.g.
+        # PostgreSQL ``{"ssl": false}`` for a server without TLS). Flattened
+        # onto the connector config — ``test_connection``/``discover_metadata``
+        # pass this whole dict to the dialect as its ``options`` argument, so a
+        # top-level ``options`` key here would never be seen by the driver.
+        # Spread FIRST so the explicit fields below always win: options must
+        # never re-point host/port/engine/credentialSecretArn, which the
+        # control plane treats as immutable after creation.
+        # Only scalar JSON values survive persistence, so this stays typed.
+        **{
+            key: value
+            for key, value in (config.get("options") or {}).items()
+            if isinstance(value, (str, bool, int, float))
+        },
         "database_name": config["databaseName"],
         # Custom-connector (CUSTOM_CONNECTOR) sources only. Read from the source
         # record, not from `config`: the name is derived by the control plane and

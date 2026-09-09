@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import time
+from typing import Any
 
 from coa_control_plane_server.models.source_status import SourceStatus
 
@@ -35,14 +36,23 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), stream=sys.stdout)
 
 
-def handler() -> None:
-    """ECS task main entry point for metadata enrichment."""
-    datasource_id = os.environ["DATASOURCE_ID"]  # "DS#<uuid>"
-    scan_job_id = os.environ["SCAN_JOB_ID"]
-    namespace_id = os.environ["NAMESPACE_ID"]
-    scan_type = os.environ.get("SCAN_TYPE", "full")
-    scan_job_sk = os.environ.get("SCAN_JOB_SK", scan_job_id)  # ISO timestamp SK
-    domain_id = os.environ["SMUS_DOMAIN_ID"]
+def handler(event: dict[str, Any] | None = None, context: Any = None) -> None:
+    """Metadata enrichment entry point.
+
+    Two invocation styles:
+    - ECS task (production): called with no arguments; every parameter comes
+      from the environment (Step Functions container overrides).
+    - Lambda-style (local Docker stack): the scan worker calls
+      ``handler(event, None)``; values in the event win, env is the fallback,
+      so the same handler serves both without an env-var handoff.
+    """
+    event = event or {}
+    datasource_id = event.get("datasourceId") or os.environ["DATASOURCE_ID"]  # "DS#<uuid>"
+    scan_job_id = event.get("scanJobId") or os.environ["SCAN_JOB_ID"]
+    namespace_id = event.get("namespaceId") or os.environ["NAMESPACE_ID"]
+    scan_type = event.get("scanType") or os.environ.get("SCAN_TYPE", "full")
+    scan_job_sk = event.get("scanJobSK") or os.environ.get("SCAN_JOB_SK", scan_job_id)  # ISO timestamp SK
+    domain_id = event.get("smusDomainId") or os.environ["SMUS_DOMAIN_ID"]
 
     # Strip "DS#" prefix to get the bare source UUID
     source_id = datasource_id.removeprefix("DS#")

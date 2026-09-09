@@ -62,6 +62,14 @@ class DBCredentials:
     # Source engine ("POSTGRESQL"/"REDSHIFT"/"MYSQL"/"SQLSERVER"/...). Selects the
     # adapter and therefore the driver/dialect/session behavior.
     engine_type: str = "POSTGRESQL"
+    # Whether the source connection should use TLS. Defaults to True (production
+    # posture: Redshift requires TLS, managed PostgreSQL/MySQL expect it). The
+    # credential resolver flips it False only when the source's stored
+    # configuration carries connect options ``{"ssl": false}`` — the same opt-out
+    # the discovery connector honors for servers without TLS (e.g. the local
+    # demo database). Only the PostgreSQL adapter consumes it; Redshift ignores
+    # it (require_ssl is non-negotiable server-side).
+    ssl_enabled: bool = True
 
 
 def build_ssl_context() -> ssl.SSLContext:

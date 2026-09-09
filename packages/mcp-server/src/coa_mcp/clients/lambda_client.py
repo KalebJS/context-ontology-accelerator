@@ -111,6 +111,10 @@ class LambdaClient:
             Payload=payload,
         )
 
+    # Local Docker stack: GATEWAY_ENDPOINT routes "Lambda invocations" to the
+    # local gateway over HTTP instead of boto3→Lambda (see invoke_api).
+    _GATEWAY_ENDPOINT = os.environ.get("GATEWAY_ENDPOINT", "").rstrip("/")
+
     async def invoke_api(
         self,
         function_name: str,
@@ -144,6 +148,35 @@ class LambdaClient:
         """
         event = self._build_event(method, resource, path_params, query_params, body, bearer_token, authorizer_context)
         payload = json.dumps(event).encode()
+
+        # ── Local Docker stack: route through the local gateway over HTTP ──
+        if self._GATEWAY_ENDPOINT:
+            import httpx
+
+            # Map the synthetic event back to a real HTTP request against the
+            # gateway. The gateway re-derives authorizer context from the JWT,
+            # so the bearer token is all that needs forwarding.
+            resolved_path = resource
+            for key, value in (path_params or {}).items():
+                resolved_path = resolved_path.replace(f"{{{key}}}", value)
+            url = f"{self._GATEWAY_ENDPOINT}{resolved_path}"
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(connect=5.0, read=_LAMBDA_INVOKE_TIMEOUT_S)
+                ) as client:
+                    resp = await client.request(
+                        method,
+                        url,
+                        params=query_params or None,
+                        json=body if body else None,
+                        headers={"Authorization": f"Bearer {bearer_token}"},
+                    )
+            except httpx.HTTPError as exc:
+                logger.error("gateway_http_error", url=url, error=str(exc))
+                raise LambdaInvokeError(f"Gateway invoke failed: {exc}") from exc
+            if resp.status_code >= 400:
+                raise LambdaApiError(status_code=resp.status_code, body=resp.text)
+            return resp.json() if resp.text else {}
 
         try:
             response = await asyncio.to_thread(self._invoke_sync, function_name, payload)

@@ -1,0 +1,25 @@
+[project]
+name = "coa-local-gateway"
+version = "0.1.0"
+description = "Local API Gateway / Lambda emulation for the COA Docker stack"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "boto3>=1.35",
+    "pydantic>=2.0",
+    "coa-common",
+    "coa-control-plane",
+    "coa-sources",
+    "coa-metrics",
+    "coa-data-layer",
+    "coa-control-plane-server",
+    "coa-data-layer-server",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_gateway"]

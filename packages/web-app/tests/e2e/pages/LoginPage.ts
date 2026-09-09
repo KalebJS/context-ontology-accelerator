@@ -28,8 +28,11 @@ export class LoginPage {
   }
 
   /**
-   * Fill and submit the Cognito Hosted UI form. The classic Hosted UI renders
+   * Fill and submit the IdP login form. The classic Cognito Hosted UI renders
    * duplicate hidden forms, so selectors are scoped to the *visible* fields.
+   * Keycloak (local Docker stack) uses the same name/type-based inputs, so the
+   * shared selectors work for both — E2E_IDP=keycloak only changes the
+   * submit-button selector (Keycloak has no `signInSubmitButton` name).
    */
   async completeCognitoHostedUi(
     username: string,
@@ -48,11 +51,14 @@ export class LoginPage {
       .first();
     await passwordField.fill(password);
 
-    const submit = this.page
-      .locator(
-        'input[name="signInSubmitButton"]:visible, button[type="submit"]:visible, input[type="submit"]:visible',
-      )
-      .first();
+    const isKeycloak = process.env.E2E_IDP === "keycloak";
+    const submit = isKeycloak
+      ? this.page.locator('button[type="submit"]:visible, input[type="submit"]:visible, #kc-login').first()
+      : this.page
+          .locator(
+            'input[name="signInSubmitButton"]:visible, button[type="submit"]:visible, input[type="submit"]:visible',
+          )
+          .first();
     await submit.click();
   }
 

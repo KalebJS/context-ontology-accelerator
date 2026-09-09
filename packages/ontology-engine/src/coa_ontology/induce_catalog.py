@@ -189,16 +189,18 @@ class WorkbenchInductionRequest(BaseModel):
 
     # Accept BOTH snake_case (this hand-written schema's names) and the Smithy
     # contract's camelCase wire names, so a request built from the generated
-    # client (groundingMode / groundingOntologyIds) binds correctly instead of
-    # silently falling back to defaults. populate_by_name keeps the snake_case
-    # callers working.
+    # client (datasourceIds / ontologyUriPrefix / groundingMode / …) binds
+    # correctly instead of failing validation with "Field required".
+    # populate_by_name keeps the snake_case callers working.
     model_config = ConfigDict(populate_by_name=True)
 
-    datasource_ids: list[str] = []
-    ontology_uri_prefix: str
-    label: str | None = None
+    datasource_ids: list[str] = Field(default=[], validation_alias=AliasChoices("datasource_ids", "datasourceIds"))
+    ontology_uri_prefix: str = Field(validation_alias=AliasChoices("ontology_uri_prefix", "ontologyUriPrefix"))
+    label: str | None = Field(default=None, validation_alias=AliasChoices("label"))
     embedding_backend: str | None = None
-    confidence_threshold: float = 0.80
+    confidence_threshold: float = Field(
+        default=0.80, validation_alias=AliasChoices("confidence_threshold", "confidenceThreshold")
+    )
     # Output-token cap for the ENHANCED-mode LLM grounding rerank. Default 1000
     # (well above the short JSON answer, giving reasoning models headroom so
     # their thinking doesn't truncate the JSON → fail-loud). Per-request so it's
@@ -212,11 +214,14 @@ class WorkbenchInductionRequest(BaseModel):
     )
     scoring_strategy: str = "lexical"
     structural_weight: float = 0.05
-    strategy: str = "table_to_ontology"  # "table_to_ontology" | "rigor_ontology" | "unstructured_lexical_graph"
+    strategy: str = Field(
+        default="table_to_ontology",
+        validation_alias=AliasChoices("strategy"),
+    )  # "table_to_ontology" | "rigor_ontology" | "unstructured_lexical_graph"
     grounding_mode: str = Field(
         default="ENHANCED", validation_alias=AliasChoices("grounding_mode", "groundingMode")
     )  # "NONE" | "STANDARD" | "ENHANCED"
-    graph_arn: str | None = None
+    graph_arn: str | None = Field(default=None, validation_alias=AliasChoices("graph_arn", "graphArn"))
 
     @field_validator("ontology_uri_prefix")
     @classmethod

@@ -36,7 +36,7 @@ class TestReadAssetsForDatasource:
         with pytest.raises(ValueError, match="data_source_id is required"):
             read_assets_for_datasource("dom-1", "proj-1", "")
 
-    @patch("coa_common.metadata_store.reader.SMUSClient")
+    @patch("coa_common.metadata_store.reader.build_metadata_store")
     def test_filters_assets_by_datasource_prefix_and_parses(self, mock_client_cls):
         client = MagicMock()
         # One matching asset, one non-matching (wrong prefix)
@@ -60,7 +60,7 @@ class TestReadAssetsForDatasource:
         # Only the matching asset's forms are fetched
         client.get_asset_forms.assert_called_once_with(asset_id="a1")
 
-    @patch("coa_common.metadata_store.reader.SMUSClient")
+    @patch("coa_common.metadata_store.reader.build_metadata_store")
     def test_paginates_across_next_token(self, mock_client_cls):
         client = MagicMock()
         client.search_assets.side_effect = [
@@ -78,7 +78,7 @@ class TestReadAssetsForDatasource:
         assert {t.name for t in tables} == {"t1", "t2"}
         assert client.search_assets.call_count == 2
 
-    @patch("coa_common.metadata_store.reader.SMUSClient")
+    @patch("coa_common.metadata_store.reader.build_metadata_store")
     def test_skips_assets_that_fail_to_parse(self, mock_client_cls):
         client = MagicMock()
         client.search_assets.return_value = SearchResult(
@@ -93,7 +93,7 @@ class TestReadAssetsForDatasource:
 
         assert tables == []
 
-    @patch("coa_common.metadata_store.reader.SMUSClient")
+    @patch("coa_common.metadata_store.reader.build_metadata_store")
     def test_search_failure_propagates(self, mock_client_cls):
         client = MagicMock()
         client.search_assets.side_effect = RuntimeError("boom")
@@ -102,7 +102,7 @@ class TestReadAssetsForDatasource:
         with pytest.raises(RuntimeError, match="boom"):
             read_assets_for_datasource("dom-1", "proj-1", "ds-1")
 
-    @patch("coa_common.metadata_store.reader.SMUSClient")
+    @patch("coa_common.metadata_store.reader.build_metadata_store")
     def test_accepts_data_source_id_already_prefixed(self, mock_client_cls):
         client = MagicMock()
         client.search_assets.return_value = SearchResult(items=[], next_token=None)
@@ -167,7 +167,7 @@ class TestReadAssetNamesForDatasource:
         with pytest.raises(ValueError, match="data_source_id is required"):
             read_asset_names_for_datasource("dom-1", "proj-1", "")
 
-    @patch("coa_common.metadata_store.reader.SMUSClient")
+    @patch("coa_common.metadata_store.reader.build_metadata_store")
     def test_indexes_names_without_fetching_any_form(self, mock_client_cls):
         client = MagicMock()
         client.search_assets.return_value = SearchResult(
@@ -186,7 +186,7 @@ class TestReadAssetNamesForDatasource:
         client.get_asset_forms.assert_not_called()
         assert client.search_assets.call_count == 1
 
-    @patch("coa_common.metadata_store.reader.SMUSClient")
+    @patch("coa_common.metadata_store.reader.build_metadata_store")
     def test_paginates_and_still_fetches_no_forms(self, mock_client_cls):
         client = MagicMock()
         client.search_assets.side_effect = [
@@ -208,7 +208,7 @@ class TestReadAssetNamesForDatasource:
         assert client.search_assets.call_count == 2
         client.get_asset_forms.assert_not_called()
 
-    @patch("coa_common.metadata_store.reader.SMUSClient")
+    @patch("coa_common.metadata_store.reader.build_metadata_store")
     def test_search_failure_propagates(self, mock_client_cls):
         """Callers must be able to tell "no tables" from "could not look" — an
         empty mapping on failure would make absence look provable."""
@@ -220,7 +220,7 @@ class TestReadAssetNamesForDatasource:
             read_asset_names_for_datasource("dom-1", "proj-1", "ds-1")
 
     def test_accepts_an_already_prefixed_data_source_id(self):
-        with patch("coa_common.metadata_store.reader.SMUSClient") as cls:
+        with patch("coa_common.metadata_store.reader.build_metadata_store") as cls:
             client = MagicMock()
             client.search_assets.return_value = SearchResult(
                 items=[AssetResult(asset_id="a1", name="DS#ds-1:public.orders", project_id="p")],

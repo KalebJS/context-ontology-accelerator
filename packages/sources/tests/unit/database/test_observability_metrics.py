@@ -25,6 +25,11 @@ from botocore.exceptions import ClientError
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
 os.environ.setdefault("AWS_REGION", "us-east-1")
+# discovery_handler hard-reads these at import time; the metrics tests only
+# exercise emit_metric around _discover, not the DDB access.
+os.environ.setdefault("SOURCES_TABLE", "test-sources")
+os.environ.setdefault("SOURCE_SCAN_JOBS_TABLE", "test-scan-jobs")
+os.environ.setdefault("SMUS_DOMAIN_ID", "test-domain-id")
 
 
 def _emitted(mock_emit, name: str) -> list[dict]:
@@ -116,7 +121,7 @@ class TestCatalogAssetWritesMetric:
 
         with (
             patch(f"{_WRITER}.emit_metric") as mock_emit,
-            patch(f"{_WRITER}.SMUSClient", MagicMock(return_value=mock_client)),
+            patch(f"{_WRITER}.build_metadata_store", MagicMock(return_value=mock_client)),
             patch(f"{_WRITER}.build_forms_input", return_value=[]),
         ):
             result = write_to_datazone(
@@ -141,7 +146,7 @@ class TestCatalogAssetWritesMetric:
 
         with (
             patch(f"{_WRITER}.emit_metric") as mock_emit,
-            patch(f"{_WRITER}.SMUSClient", MagicMock(return_value=mock_client)),
+            patch(f"{_WRITER}.build_metadata_store", MagicMock(return_value=mock_client)),
             patch(f"{_WRITER}.build_forms_input", return_value=[]),
         ):
             write_to_datazone(

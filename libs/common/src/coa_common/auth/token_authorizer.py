@@ -245,7 +245,10 @@ class TokenAuthorizer(ABC):
             claims = jwt.decode(token, public_key, **kwargs)
 
             if self._audience:
-                aud = claims.get("aud") or claims.get("client_id")
+                # Keycloak access tokens carry azp (authorized party) rather
+                # than aud when no audience mapper is configured; Cognito
+                # access tokens carry client_id. Accept any of the three.
+                aud = claims.get("aud") or claims.get("azp") or claims.get("client_id")
                 aud_list = [aud] if isinstance(aud, str) else (aud or [])
                 if self._audience not in aud_list:
                     raise ValueError(f"Token audience mismatch: expected {self._audience}, got {aud}")

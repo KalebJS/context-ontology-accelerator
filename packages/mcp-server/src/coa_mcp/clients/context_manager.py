@@ -47,6 +47,22 @@ class ContextManagerClient:
         """
         self._region = region
         self._runtime_arn = runtime_arn
+        # Local Docker stack: CM_DIRECT_URL points at the context-manager
+        # container directly (plain HTTP, no AgentCore). When unset, the
+        # production AgentCore invocation URL is constructed as before.
+        direct = os.environ.get("CM_DIRECT_URL", "").rstrip("/")
+        if direct:
+            self._url = f"{direct}/invocations"
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=2.0,
+                    read=_INVOKE_TIMEOUT_S,
+                    write=_INVOKE_TIMEOUT_S,
+                    pool=_INVOKE_TIMEOUT_S,
+                )
+            )
+            logger.info("cm_client_initialized_direct", url=self._url)
+            return
         encoded_arn = quote(runtime_arn, safe="")
         self._url = (
             f"https://bedrock-agentcore.{region}.amazonaws.com/runtimes/{encoded_arn}/invocations?qualifier=DEFAULT"
