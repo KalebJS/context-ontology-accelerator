@@ -19,6 +19,7 @@ Usage (phase 1 is a pure library — no callers wired yet):
 
 from __future__ import annotations
 
+import os
 import resource
 import threading
 
@@ -30,6 +31,20 @@ from coa_common.config import resolve_region
 logger = structlog.get_logger(__name__)
 
 METRICS_NAMESPACE = "COA/Ontology"
+
+# Local-mode gate for CloudWatch emission (same convention as GRAPH_STORE_URI
+# and the other local-only switches in docker/.env.example). When METRICS_EMIT
+# is set to 0/false/no/off, put_metric_data is skipped silently (debug log)
+# instead of running against a dummy endpoint — locally that surfaces as
+# InvalidClientTokenId noise from botocore (no valid creds against LocalStack).
+# Unset (default) = unchanged behavior: emission proceeds and the best-effort
+# failure warning still applies. Read per call so tests can monkeypatch env.
+_METRICS_EMIT_OFF = frozenset({"0", "false", "no", "off"})
+
+
+def _metrics_emit_disabled() -> bool:
+    """Return True when CloudWatch emission is disabled via ``METRICS_EMIT``."""
+    return os.environ.get("METRICS_EMIT", "1").strip().lower() in _METRICS_EMIT_OFF
 
 _STAGE_GENERATE = "generate"
 _STAGE_RERANK = "rerank"
@@ -298,6 +313,14 @@ def emit_induction_job_metrics(
     ns_dim = [{"Name": "NamespaceId", "Value": namespace_id}]
     metric_data: list[dict] = []
 
+    if _metrics_emit_disabled():
+        logger.debug(
+            "emit_induction_job_metrics_skipped",
+            namespace_id=namespace_id,
+            reason="METRICS_EMIT disabled",
+        )
+        return
+
     rerank_invocations = tracker.rerank_invocations
     if rerank_invocations:
         metric_data.append(
@@ -429,6 +452,13 @@ def emit_induction_heartbeat_metrics(
     error in a tick must never kill the heartbeat.
     """
     ns_dim = [{"Name": "NamespaceId", "Value": namespace_id}]
+    if _metrics_emit_disabled():
+        logger.debug(
+            "emit_induction_heartbeat_metrics_skipped",
+            namespace_id=namespace_id,
+            reason="METRICS_EMIT disabled",
+        )
+        return
     metric_data = [
         {"MetricName": "InductionHeartbeat", "Unit": "Count", "Dimensions": ns_dim, "Value": 1.0},
         {

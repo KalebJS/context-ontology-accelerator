@@ -36,6 +36,11 @@ dependencies = [
     "cedarpy>=4.8.0",
     # graphrag-lexical-graph — required for the lexical-baseline Tier 3 strategy.
     "graphrag-lexical-graph==3.18.7",
+    # Neo4j Bolt driver — graphrag treats the Neo4j graph store as an optional extra
+    # (lazy import inside execute_query), so it is NOT pulled in transitively. Needed
+    # only when GRAPH_STORE_URI is a bolt:// endpoint (local Docker stack); the
+    # production neptune-db:// path is unchanged.
+    "neo4j>=5.28.2",
     # Required by graphrag's lexical-baseline retriever (traversal / topic-beam-chunk_only
     # strategies) to build its OpenSearch vector store via LlamaIndex. graphrag treats the
     # OpenSearch backend as an optional extra, so it is NOT pulled in transitively; without

@@ -13,6 +13,7 @@ from coa_common.bedrock_metrics import (
     METRICS_NAMESPACE,
     CostTracker,
     cost_for,
+    emit_induction_heartbeat_metrics,
     emit_induction_job_metrics,
 )
 
@@ -615,3 +616,81 @@ class TestCloudwatchClientRegion:
         monkeypatch.setattr(bedrock_metrics, "resolve_region", lambda: "eu-central-1")
         bedrock_metrics._cloudwatch_client(None)
         assert captured["region"] == "eu-central-1"
+
+
+# ── METRICS_EMIT local-mode gate ──────────────────────────────────────────────
+
+
+class TestMetricsEmitGate:
+    def test_unset_emits_as_before(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Default (unset) is byte-identical behavior: the put goes through.
+        monkeypatch.delenv("METRICS_EMIT", raising=False)
+        tracker = CostTracker()
+        tracker.record("generate", HAIKU, 100, 50)
+        cw = FakeCloudWatch()
+
+        emit_induction_job_metrics(tracker, namespace_id="ns-1", cloudwatch_client=cw)
+
+        assert len(cw.calls) == 1
+        assert _metric_by_name(cw.calls[0], "InductionJobCostUsd")[0]["Value"] == pytest.approx(tracker.total_cost_usd)
+
+    def test_emit_0_skips_put_silently(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # METRICS_EMIT=0 → no client built, no put, no warning.
+        monkeypatch.setenv("METRICS_EMIT", "0")
+        tracker = CostTracker()
+        tracker.record("generate", HAIKU, 100, 50)
+        cw = FakeCloudWatch()
+
+        emit_induction_job_metrics(tracker, namespace_id="ns-1", cloudwatch_client=cw)
+
+        assert cw.calls == []
+
+    def test_heartbeat_emit_0_skips_put_silently(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from coa_common.bedrock_metrics import emit_induction_heartbeat_metrics
+
+        monkeypatch.setenv("METRICS_EMIT", "0")
+        cw = FakeCloudWatch()
+
+        emit_induction_heartbeat_metrics(namespace_id="ns-1", cloudwatch_client=cw)
+
+        assert cw.calls == []
+
+    @pytest.mark.parametrize("value", ["false", "no", "off", "FALSE", "Off"])
+    def test_other_falsy_values_disable(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv("METRICS_EMIT", value)
+        tracker = CostTracker()
+        cw = FakeCloudWatch()
+
+        emit_induction_job_metrics(tracker, namespace_id="ns-1", cloudwatch_client=cw)
+
+        assert cw.calls == []
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+    def test_truthy_values_emit(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+        monkeypatch.setenv("METRICS_EMIT", value)
+        tracker = CostTracker()
+        cw = FakeCloudWatch()
+
+        emit_induction_job_metrics(tracker, namespace_id="ns-1", cloudwatch_client=cw)
+
+        assert len(cw.calls) == 1
+
+    def test_disabled_gate_precedes_client_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # With emission disabled, even a raising client must not be touched —
+        # the skip happens before any CloudWatch interaction (no warning noise).
+        monkeypatch.setenv("METRICS_EMIT", "0")
+        tracker = CostTracker()
+
+        # Must not raise even though the client would raise.
+        emit_induction_job_metrics(tracker, namespace_id="ns-1", cloudwatch_client=RaisingCloudWatch())
+        emit_induction_heartbeat_metrics(namespace_id="ns-1", cloudwatch_client=RaisingCloudWatch())
+
+    def test_gate_helper_reads_env_each_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from coa_common.bedrock_metrics import _metrics_emit_disabled
+
+        monkeypatch.delenv("METRICS_EMIT", raising=False)
+        assert _metrics_emit_disabled() is False
+        monkeypatch.setenv("METRICS_EMIT", "0")
+        assert _metrics_emit_disabled() is True
+        monkeypatch.setenv("METRICS_EMIT", "1")
+        assert _metrics_emit_disabled() is False

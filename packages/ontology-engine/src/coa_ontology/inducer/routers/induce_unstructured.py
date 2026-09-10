@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 from threading import Event, Thread
@@ -240,6 +241,18 @@ def _build_lexical_store(graph_arn: str, region: str, app_config: dict, namespac
     from coa_common import to_graphrag_tenant_id
 
     tenant_id = to_graphrag_tenant_id(namespace) if namespace else ""
+
+    # Local Docker stack escape hatch — mirrors coa_sources.documents.kg_build
+    # (graph_store_uri) and coa_serve.clients.factory (_graph_store_uri): when
+    # GRAPH_STORE_URI is set, the lexical graph lives in the local Neo4j
+    # container (bolt://), which no neptunedata client can reach. Read at call
+    # time (not import time) so the production path below is byte-identical
+    # when the env var is unset.
+    from coa_ontology.inducer.unstructured.stores.neo4j_lexical import Neo4jLexicalStore
+
+    graph_store_uri = os.environ.get("GRAPH_STORE_URI", "").strip()
+    if graph_store_uri:
+        return Neo4jLexicalStore(uri=graph_store_uri, tenant_id=tenant_id)
 
     # Strict ARN validation — only accept canonical Neptune Analytics ARN format
     _VALID_ARN_PREFIX = "arn:aws:neptune-graph:"

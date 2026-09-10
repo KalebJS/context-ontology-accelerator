@@ -75,9 +75,17 @@ def _is_neptune_analytics(endpoint: str) -> bool:
 def _graph_store_uri(neptune_endpoint: str) -> str:
     """Derive the graphrag-toolkit graph-store URI from the deployment endpoint.
 
+    Local Docker stack: ``GRAPH_STORE_URI`` (set alongside ``GRAPH_AUTH=none``)
+    wins outright — the local document graph lives in a Neo4j container
+    (``bolt://``), which no URI can be derived from ``NEPTUNE_ENDPOINT`` (the
+    local Fuseki host serves SPARQL, not openCypher).
+
     Neptune Analytics → ``neptune-graph://g-…``
     Neptune DB (default) → ``neptune-db://host:8182``
     """
+    override = os.environ.get("GRAPH_STORE_URI", "").strip()
+    if override:
+        return override
     if _is_neptune_analytics(neptune_endpoint):
         graph_id = _extract_graph_id(neptune_endpoint)
         if graph_id:
