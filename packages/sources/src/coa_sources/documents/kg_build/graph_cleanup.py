@@ -50,6 +50,8 @@ from .graph_build import (
     _patch_graphrag_bulk_ingest_retry,
     _patch_graphrag_paginated_search_retry,
     _patch_graphrag_toolkit_for_aoss_nextgen,
+    graph_store_uri,
+    vector_store_uri,
 )
 
 setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
@@ -153,10 +155,8 @@ def main() -> None:
     from graphrag_toolkit.lexical_graph.indexing.build.delete_sources import DeleteSources
     from graphrag_toolkit.lexical_graph.storage import GraphStoreFactory, VectorStoreFactory
 
-    neptune_host = NEPTUNE_ENDPOINT.replace("wss://", "").replace("https://", "").rstrip("/")
-    opensearch_host = OPENSEARCH_ENDPOINT.replace("https://", "").replace("http://", "").rstrip("/")
-    graph_store_uri = f"neptune-db://{neptune_host}:8182"
-    vector_store_uri = f"aoss://{opensearch_host}:443"
+    graph_uri = graph_store_uri()
+    vector_uri = vector_store_uri()
 
     logger.info(
         "graph_cleanup_started",
@@ -178,8 +178,8 @@ def main() -> None:
         )
 
     with (
-        GraphStoreFactory.for_graph_store(graph_store_uri) as graph_store,
-        VectorStoreFactory.for_vector_store(vector_store_uri, index_names=existing_indexes) as vector_store,
+        GraphStoreFactory.for_graph_store(graph_uri) as graph_store,
+        VectorStoreFactory.for_vector_store(vector_uri, index_names=existing_indexes) as vector_store,
     ):
         graph_index = LexicalGraphIndex(graph_store, vector_store, tenant_id=TENANT_ID)
 

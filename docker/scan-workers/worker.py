@@ -125,7 +125,10 @@ def run_db_scan(msg: dict) -> None:
         from coa_sources.database.pipeline.enrichment_handler import handler as enrichment
         from coa_sources.database.pipeline.federation_handler import handler as federation
 
-        _update_source_status(source_id, namespace_id, "DISCOVERING")
+        # SourceStatus contract: DISCOVERING is a SourceScanJobStatus value (the
+        # production state machine writes it to the SCAN-JOBS table only). The
+        # source's own lifecycle status for "pipeline running" is SCANNING.
+        _update_source_status(source_id, namespace_id, "SCANNING")
 
         event = {
             "datasourceId": msg.get("datasourceId"),
@@ -172,9 +175,12 @@ def run_doc_ingestion(msg: dict) -> None:
     namespace_id = msg.get("namespace_id", "")
     logger.info("doc_ingestion_start source=%s", doc_source_id)
     try:
-        from coa_sources.documents.preprocessing.handler import handler as preprocess
-
-        _update_source_status(doc_source_id, namespace_id, "INGESTING")
+        # SourceStatus contract: INGESTING does not exist in the Smithy enum
+        # (models/src/main/smithy/unified-sources.smithy) — writing it made
+        # GET /namespaces/{ns}/sources/{id} 500 for the whole run (pydantic
+        # enum validation in GetSourceOutput). SCANNING is the enum's
+        # "pipeline is running (schema discovery or document ingestion)" value.
+        _update_source_status(doc_source_id, namespace_id, "SCANNING")
 
         result = preprocess(msg)
 
@@ -183,6 +189,10 @@ def run_doc_ingestion(msg: dict) -> None:
             logger.error("doc_ingestion_all_failed source=%s", doc_source_id)
             return
 
+        # SCANNING_KG_BUILD — valid SourceStatus ("knowledge graph build in
+        # progress, document sources only"); mirrors graph_build's own
+        # _run_separated stage write so the detail page reflects the phase.
+        _update_source_status(doc_source_id, namespace_id, "SCANNING_KG_BUILD")
         run_kg_build(msg, result)
 
         _update_source_status(doc_source_id, namespace_id, "COMPLETED")
@@ -219,7 +229,7 @@ def run_kg_build(msg: dict, preprocess_result: dict) -> None:
         env=env,
         capture_output=True,
         text=True,
-        timeout=60 * 60,
+        timeout=int(os.environ.get("KG_BUILD_TIMEOUT_S", "3600")),
     )
     if result.returncode != 0:
         raise RuntimeError(f"kg_build failed rc={result.returncode}: {result.stdout[-2000:]} {result.stderr[-2000:]}")

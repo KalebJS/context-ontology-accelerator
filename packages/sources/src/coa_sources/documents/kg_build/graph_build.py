@@ -354,6 +354,48 @@ def _load_staged_documents(bucket: str, staging_prefix: str) -> tuple[list, int]
 # ---------------------------------------------------------------------------
 
 
+_graphrag_local_transport_patched = False
+
+
+def _patch_graphrag_toolkit_for_local_opensearch() -> None:
+    """Point graphrag's OpenSearch clients at a plain-HTTP local node.
+
+    The toolkit hardcodes SigV4 + TLS in create_os_client/create_os_async_client
+    (correct for AOSS); the local Docker stack runs vanilla OpenSearch over plain
+    HTTP, so every vector read/write dies with ``SSL: WRONG_VERSION_NUMBER``.
+    Selected only by ``OPENSEARCH_AUTH=none`` — production defaults keep the
+    signed/TLS clients untouched. Same switch and reasoning as the serve-side
+    patch_local_opensearch_transport (coa_serve.lexical.graphrag_patches).
+    Idempotent and failure-tolerant.
+    """
+    global _graphrag_local_transport_patched
+    if _graphrag_local_transport_patched:
+        return
+    if os.environ.get("OPENSEARCH_AUTH", "sigv4").lower() != "none":
+        return
+    try:
+        import graphrag_toolkit.lexical_graph.storage.vector.opensearch_vector_indexes as _ovi
+        from opensearchpy import AsyncOpenSearch, OpenSearch
+    except (ImportError, AttributeError):
+        logger.debug("graphrag local OpenSearch transport patch skipped (module not available)")
+        return
+
+    endpoint = os.environ.get("OPENSEARCH_ENDPOINT", "")
+    if not endpoint:
+        logger.warning("graphrag_local_opensearch_transport_patch_skipped", reason="OPENSEARCH_ENDPOINT unset")
+        return
+
+    def _local_client(sync: bool):
+        if sync:
+            return OpenSearch(hosts=[endpoint], use_ssl=endpoint.startswith("https://"), verify_certs=False)
+        return AsyncOpenSearch(hosts=[endpoint], use_ssl=endpoint.startswith("https://"), verify_certs=False)
+
+    _ovi.create_os_client = lambda *_, **__: _local_client(sync=True)
+    _ovi.create_os_async_client = lambda *_, **__: _local_client(sync=False)
+    _graphrag_local_transport_patched = True
+    logger.info("graphrag_local_opensearch_transport_patch_applied", endpoint=endpoint)
+
+
 _graphrag_aoss_patched = False
 
 
@@ -653,11 +695,57 @@ def _patch_graphrag_bulk_ingest_retry() -> None:
     _graphrag_bulk_ingest_patched = True
 
 
+def graph_store_uri() -> str:
+    """Derive the graphrag-toolkit graph-store URI for this deployment.
+
+    Production (default): ``neptune-db://<host>:8182`` built from
+    ``NEPTUNE_ENDPOINT`` — the toolkit's openCypher client over TLS.
+
+    Local Docker stack: ``GRAPH_STORE_URI`` must be set explicitly. The local
+    graph DB is a Neo4j container (bolt://); Fuseki — the local
+    ontology/metadata SPARQL store this stack's other services target via
+    ``NEPTUNE_ENDPOINT`` — does not speak openCypher, so no URI can be derived
+    from ``NEPTUNE_ENDPOINT`` alone.
+    """
+    override = os.environ.get("GRAPH_STORE_URI", "")
+    if override:
+        return override
+    neptune_endpoint = _require_env("NEPTUNE_ENDPOINT")
+    neptune_host = neptune_endpoint.replace("wss://", "").replace("https://", "").rstrip("/")
+    neptune_host = neptune_host.split(":")[0]
+    return f"neptune-db://{neptune_host}:8182"
+
+
+def vector_store_uri() -> str:
+    """Derive the graphrag-toolkit vector-store URI for this deployment.
+
+    Production (default): ``aoss://<host>:443`` (OpenSearch Serverless, SigV4).
+
+    Local Docker stack: ``OPENSEARCH_AUTH=none`` selects a plain-HTTP vanilla
+    OpenSearch endpoint; the ``http://`` prefix is preserved by the OpenSearch
+    index factory, and the transport/auth patch (``OPENSEARCH_AUTH=none``)
+    replaces the SigV4 client.
+    """
+    if os.environ.get("OPENSEARCH_AUTH", "sigv4").lower() == "none":
+        # Local Docker stack: vanilla OpenSearch over plain HTTP. The OpenSearch
+        # index factory only recognizes ``aoss://``-prefixed or
+        # ``https://...aoss.amazonaws.com`` URIs, so keep the production
+        # ``aoss://<host>`` wrapper; the local transport (``OPENSEARCH_AUTH=none``)
+        # patches the SigV4/TLS client it would otherwise build.
+        opensearch_endpoint = _require_env("OPENSEARCH_ENDPOINT")
+        host = opensearch_endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+        return f"aoss://{host}"
+    opensearch_endpoint = _require_env("OPENSEARCH_ENDPOINT")
+    host = opensearch_endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+    return f"aoss://{host}:443"
+
+
 def _setup_graphrag(tenant_id: str):
     """Configure GraphRAG and return (graph_store_uri, vector_store_uri)."""
     # Patch BEFORE importing graphrag — the monkey-patch must replace index_exists
     # in the module namespace before LexicalGraphIndex/VectorStoreFactory load and
     # bind their own references to it. Importing GraphRAGConfig triggers those loads.
+    _patch_graphrag_toolkit_for_local_opensearch()
     _patch_graphrag_toolkit_for_aoss_nextgen()
     _patch_graphrag_paginated_search_retry()
 
@@ -680,7 +768,14 @@ def _setup_graphrag(tenant_id: str):
         model_id=BEDROCK_EMBED_MODEL_ID, dimensions=BEDROCK_EMBED_DIMENSIONS, region=AWS_REGION
     )
     GraphRAGConfig.embed_dimensions = BEDROCK_EMBED_DIMENSIONS
-    if BEDROCK_MODEL_ARN:
+    if os.environ.get("LLM_PROVIDER", "bedrock").lower() == "ollama":
+        # Local Docker stack: extraction LLM must be a llama-index INSTANCE — the
+        # toolkit's string path always builds BedrockConverse (no provider switch).
+        from coa_common.ollama_llm import make_ollama_llama_index_llm
+
+        GraphRAGConfig.extraction_llm = make_ollama_llama_index_llm(max_tokens=EXTRACTION_MAX_TOKENS)
+        logger.info("GraphRAG extraction LLM routed to Ollama", model=os.environ.get("OLLAMA_CHAT_MODEL", ""))
+    elif BEDROCK_MODEL_ARN:
         # Pass the extraction LLM as a JSON config, not a bare model string. The
         # toolkit's GraphRAGConfig.to_llm() builds BedrockConverse with a hardcoded
         # max_tokens=4096 for a bare string, and only reads max_tokens from the JSON
@@ -694,15 +789,8 @@ def _setup_graphrag(tenant_id: str):
     if USE_BATCH_INFERENCE:
         GraphRAGConfig.extraction_batch_size = EXTRACTION_BATCH_SIZE
 
-    neptune_endpoint = _require_env("NEPTUNE_ENDPOINT")
-    opensearch_endpoint = _require_env("OPENSEARCH_ENDPOINT")
-
-    neptune_host = neptune_endpoint.replace("wss://", "").replace("https://", "").rstrip("/")
-    opensearch_host = opensearch_endpoint.replace("https://", "").replace("http://", "").rstrip("/")
-    graph_store_uri = f"neptune-db://{neptune_host}:8182"
-    vector_store_uri = f"aoss://{opensearch_host}:443"
-
-    # NOTE: chunking is intentionally NOT overridden here. With no SentenceSplitter
+    graph_uri = graph_store_uri()
+    vector_uri = vector_store_uri()
     # in the IndexingConfig, the toolkit falls back to its default
     # SentenceSplitter(chunk_size=256, chunk_overlap=25) (graphrag
     # lexical_graph_index.py). The graphrag-toolkit benchmark harness pins this
@@ -722,7 +810,7 @@ def _setup_graphrag(tenant_id: str):
         extraction_max_tokens=EXTRACTION_MAX_TOKENS,
         chunk_size="256 (toolkit default)",
     )
-    return graph_store_uri, vector_store_uri
+    return graph_uri, vector_uri
 
 
 def _build_indexing_config(bucket_name: str, namespace_id: str, doc_source_id: str):
@@ -944,14 +1032,25 @@ def _check_backend_health(
         )
         return False
 
-    # --- Vector store (AOSS) health check ---
+    # --- Vector store (AOSS / local OpenSearch) health check ---
     try:
-        from graphrag_toolkit.lexical_graph.storage.vector.opensearch_vector_indexes import (
-            create_os_client,
-        )
+        vector_endpoint = vector_store_uri.removeprefix("aoss://").removeprefix("https://").removeprefix("http://")
+        if os.environ.get("OPENSEARCH_AUTH", "sigv4").lower() == "none":
+            # Local Docker stack: vanilla OpenSearch over plain HTTP with no auth.
+            # create_os_client hardcodes SigV4+TLS (correct for AOSS), so probe with
+            # a plain client instead — same switch and reasoning as the serve-side
+            # patch_local_opensearch_transport (coa_serve.lexical.graphrag_patches).
+            from opensearchpy import OpenSearch as _OSClient
 
-        vector_endpoint = vector_store_uri.replace("aoss://", "")
-        client = create_os_client(vector_endpoint, pool_maxsize=1)
+            client = _OSClient(
+                hosts=[f"http://{vector_endpoint}"], use_ssl=False, verify_certs=False
+            )
+        else:
+            from graphrag_toolkit.lexical_graph.storage.vector.opensearch_vector_indexes import (
+                create_os_client,
+            )
+
+            client = create_os_client(vector_endpoint, pool_maxsize=1)
         try:
             client.cat.indices(format="json")
         finally:

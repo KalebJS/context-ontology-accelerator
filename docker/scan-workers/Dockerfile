@@ -25,10 +25,17 @@ COPY packages/sources/src/ /tmp/sources/src/
 # oracledb, snowflake) — declared in the package's Lambda requirements.txt,
 # not in pyproject dependencies.
 COPY packages/sources/requirements.txt /tmp/sources/requirements.txt
+# kg-build runtime deps (graphrag-lexical-graph + llama-index OpenSearch
+# vector-store stack) — the same pins the standalone kg-build image uses
+# (packages/sources/documents/kg-build/requirements.txt). In production these
+# live in the dedicated doc-kg-build Fargate image; the local worker runs
+# kg_build in-process via subprocess, so they must be present here too.
+COPY packages/sources/documents/kg-build/requirements.txt /tmp/kg-build-requirements.txt
 RUN pip install --no-cache-dir uv && \
     cd /tmp/sources && sed -i '/\[tool.uv.sources\]/,$ d' pyproject.toml && \
     uv pip install --system --no-cache . && \
-    uv pip install --system --no-cache -r requirements.txt && rm -rf /tmp/sources
+    uv pip install --system --no-cache -r requirements.txt && \
+    uv pip install --system --no-cache -r /tmp/kg-build-requirements.txt && rm -rf /tmp/sources
 
 # Worker app
 COPY docker/scan-workers/worker.py /app/worker.py
