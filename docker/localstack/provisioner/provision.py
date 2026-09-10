@@ -87,10 +87,18 @@ def create_table(name: str, *, partition: str, sort: str | None = None, gs: list
         "BillingMode": "PAY_PER_REQUEST",
     }
     if gs:
+        # DynamoDB rejects duplicate AttributeDefinitions ("Cannot have two
+        # attributes with the same name"), and GSI key schemas commonly share
+        # keys (e.g. two GSIs partitioned on namespaceId) — dedupe per table.
+        seen_attrs = {partition}
+        if sort:
+            seen_attrs.add(sort)
         for idx in gs:
-            kwargs["AttributeDefinitions"].append({"AttributeName": idx["pk"], "AttributeType": "S"})
-            if idx.get("sk"):
-                kwargs["AttributeDefinitions"].append({"AttributeName": idx["sk"], "AttributeType": "S"})
+            for key in (idx["pk"], idx.get("sk")):
+                if not key or key in seen_attrs:
+                    continue
+                seen_attrs.add(key)
+                kwargs["AttributeDefinitions"].append({"AttributeName": key, "AttributeType": "S"})
             gks = [{"AttributeName": idx["pk"], "KeyType": "HASH"}]
             if idx.get("sk"):
                 gks.append({"AttributeName": idx["sk"], "KeyType": "RANGE"})
@@ -107,13 +115,45 @@ def create_table(name: str, *, partition: str, sort: str | None = None, gs: list
     log(f"table created: {name}")
 
 
-def create_bucket(name: str, **_ignored) -> None:
+def _apply_browser_bucket_cors(s3_client, bucket: str) -> None:
+    """Allow browser presigned S3 access (mirrors SourcesStack bucket CORS).
+
+    The web app hits the bucket directly from a different origin (web app on
+    localhost:3000, LocalStack on localhost:<LOCALSTACK_PORT>), so the browser
+    enforces CORS:
+
+    * sources-data — presigned PUTs from the Connect Source wizard ("Upload
+      failed: Failed to fetch" without this).
+    * ontology-artifacts — presigned GETs the proposal detail page fetches
+      (ontology/r2rml/matches artifacts are served out-of-band to stay under
+      the 6 MB response cap; the page shows "Could not load proposal" when
+      the browser blocks the cross-origin response).
+    """
+    s3_client.put_bucket_cors(
+        Bucket=bucket,
+        CORSConfiguration={
+            "CORSRules": [
+                {
+                    "AllowedOrigins": ["*"],
+                    "AllowedMethods": ["PUT", "GET", "HEAD"],
+                    "AllowedHeaders": ["*"],
+                    "MaxAgeSeconds": 3000,
+                }
+            ]
+        },
+    )
+
+
+def create_bucket(name: str, with_cors: bool = False, **_ignored) -> None:
     try:
         s3.head_bucket(Bucket=name)
         log(f"bucket exists: {name}")
     except Exception:  # noqa: BLE001
         s3.create_bucket(Bucket=name)
         log(f"bucket created: {name}")
+    if with_cors:
+        _apply_browser_bucket_cors(s3, name)
+        log(f"bucket cors applied: {name}")
 
 
 def put_ssm(name: str, value: str) -> None:
@@ -255,7 +295,8 @@ def main() -> None:
     )
     create_table(t_cache, partition="PK", sort="SK")
     # GSI set mirrors infra/lib/stacks/services/sources-stack.ts — list-sources
-    # and namespace-deletion preconditions query these indexes.
+    # and namespace-deletion preconditions query ByNamespace/BySourceType, and
+    # document-source creation queries ByName for name-uniqueness.
     create_table(
         t_sources,
         partition="PK",
@@ -263,6 +304,7 @@ def main() -> None:
         gs=[
             {"name": "ByNamespace", "pk": "namespaceId", "sk": "createdAt"},
             {"name": "BySourceType", "pk": "namespaceId", "sk": "sourceTypeCreatedAt"},
+            {"name": "ByName", "pk": "namespaceId", "sk": "name"},
         ],
     )
     create_table(t_scan_jobs, partition="PK", sort="SK", gs=[{"name": "ByNamespace", "pk": "namespaceId"}])
@@ -282,8 +324,12 @@ def main() -> None:
     b_ontology = f"{PREFIX}-{ENV}-ontology-artifacts"
     b_athena_results = f"{PREFIX}-{ENV}-athena-results"
     b_athena_spill = f"{PREFIX}-{ENV}-athena-spill"
+    # Browser-direct buckets need CORS: sources-data (presigned PUTs from the
+    # Connect Source wizard) and ontology-artifacts (presigned GETs the
+    # proposal detail page fetches, same cross-origin enforcement). Athena
+    # buckets are only touched server-side, so they stay CORS-free.
     for b in (b_sources, b_ontology, b_athena_results, b_athena_spill):
-        create_bucket(b)
+        create_bucket(b, with_cors=(b in (b_sources, b_ontology)))
 
     # Demo Postgres credential secret (source creation verifies the secret
     # exists and carries a 'coa:namespace' tag). Value = the demo DB creds

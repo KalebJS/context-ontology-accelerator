@@ -61,6 +61,7 @@ production defaults apply.
 | `NDB_GSP_PATH` | ontology-engine | `/sparql/gsp` | Fuseki serves named-graph GSP without a trailing slash; Neptune default is `/sparql/gsp/`. |
 | `OSS_KNN_ENGINE` | ontology-engine, context-manager | `faiss` | Vanilla OpenSearch (unlike AOSS) defaults to NMSLIB, which rejects filtered k-NN. Also switches `space_type` to `l2` (faiss doesn't support `cosinesimil`). |
 | `DATA_LAYER_CM_TIMEOUT_S` | data-layer, gateway | `120` | Raises the internal context-manager call timeout past the local stack's slower query path (AWS default 29s matches the API Gateway cap). The gateway needs it too: it imports the data-layer handler in-process for `/query`. |
+| `METRICS_EMIT` | ontology-engine | `0` | Skips CloudWatch `PutMetricData` emission (induction cost/heartbeat metrics) — LocalStack has no valid CloudWatch creds, so every emit logs `InvalidClientTokenId` noise. Unset (or `1`) on AWS emits as before. |
 
 Fuseki uses a custom read-write dataset (`docker/fuseki/assembler.ttl`, mounted
 read-only into the container) because the stock `secoresearch/fuseki` image

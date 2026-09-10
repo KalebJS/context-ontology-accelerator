@@ -13,6 +13,7 @@ Route table mirrors ApiStack.ssmPathHandlers in infra/bin/app.ts.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
@@ -94,6 +95,9 @@ def _seed_handler_env() -> None:
     os.environ.setdefault("AGENTCORE_RUNTIME_ARN", "local/cm-runtime")
     # Bucket names the handlers reference
     os.environ.setdefault("SOURCES_BUCKET", f"{PREFIX}-{ENV}-sources-data")
+    # The sources handler reads BUCKET_NAME (what sources-stack.ts sets in the
+    # real Lambda env) for presigned upload URLs; SOURCES_BUCKET alone 500s it.
+    os.environ.setdefault("BUCKET_NAME", f"{PREFIX}-{ENV}-sources-data")
     os.environ.setdefault("ONTOLOGY_BUCKET", f"{PREFIX}-{ENV}-ontology-artifacts")
     os.environ.setdefault("SCAN_QUEUE_URL", f"http://localstack:4566/000000000000/{PREFIX}-{ENV}-sources-db-scan-queue")
     os.environ.setdefault(
@@ -107,6 +111,34 @@ def _seed_handler_env() -> None:
 
 
 _seed_handler_env()
+
+# ── Presigned-URL host rewrite ──────────────────────────────────────────────
+# generate_presigned_url emits the container-internal LocalStack host
+# (localstack:4566), which the user's browser cannot resolve. Rewrite the
+# endpoint host:port to the host-mapped LocalStack port (LOCALSTACK_PORT, set
+# in docker/.env) so PUTs from the web app work. Safe in local mode only:
+# LocalStack does not validate SigV4 signatures, so rewriting the host in the
+# URL cannot invalidate anything. This never applies to a real AWS deployment
+# — the rewrite exists only inside the local gateway process.
+_LOCALSTACK_INTERNAL = os.environ.get("LOCALSTACK_ENDPOINT", "http://localstack:4566")
+_external_s3_host: str | None = os.environ.get("LOCALSTACK_EXTERNAL_ENDPOINT")
+if not _external_s3_host:
+    # Derive from LOCALSTACK_PORT (docker/.env) when available; leave the
+    # internal URL untouched otherwise (e.g. container-side E2E runs).
+    _port = os.environ.get("LOCALSTACK_PORT")
+    if _port:
+        _external_s3_host = f"http://localhost:{_port}"
+
+if _external_s3_host:
+    from urllib.parse import urlsplit
+
+    _ext, _int = urlsplit(_external_s3_host), urlsplit(_LOCALSTACK_INTERNAL)
+    _S3_HOST_REWRITE: tuple[tuple[str, int], tuple[str, int]] | None = (
+        (_int.hostname or "localstack", _int.port or 4566),
+        (_ext.hostname or "localhost", _ext.port or 8888),
+    )
+else:
+    _S3_HOST_REWRITE = None
 
 import boto3.session  # noqa: E402  (after env seeding)
 
@@ -375,6 +407,79 @@ def _lambda_response_to_http(resp: dict) -> Response:
     return Response(content=body, status_code=status, headers=headers)
 
 
+# Routes whose responses can carry presigned S3 URLs: the sources document
+# upload-urls route, and every .../proposals/... route — the OE embeds
+# presigned GET URLs in GET /proposals/{id} (ontology_url/r2rml_url from
+# presign_proposal_artifact, matches_url from presign_proposal_matches) and
+# presigned PUT URLs in POST /proposals/{id}/upload-url (ontology_put_url/
+# r2rml_put_url from presign_proposal_artifact_put). The remaining proposal
+# routes carry no presigned URLs today but are covered so a future presigned
+# field can't regress; bodies without an internal URL pass through untouched.
+_UPLOAD_URLS_RESOURCE = "/namespaces/{namespaceId}/sources/upload-urls"
+_PROPOSAL_RESOURCE_RE = re.compile(re.escape("/namespaces/{namespaceId}/proposals") + r"(/.*)?$")
+
+
+def _rewrite_presigned_hosts(resp: dict) -> dict:
+    """Rewrite container-internal LocalStack hosts in a presigned-URL response
+    to the browser-reachable host (see the _S3_HOST_REWRITE block above).
+
+    Walks the whole JSON body and rewrites every string value that is an
+    internal-LocalStack URL (scheme+host+port match against the internal
+    half), preserving path/query/fragment — covers uploadUrls[].uploadUrl as
+    well as directly embedded presigned fields (ontology_url, r2rml_url,
+    matches_url, ontology_put_url, r2rml_put_url). Non-JSON bodies, malformed
+    JSON, and bodies without an internal-URL string pass through untouched.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    (int_host, int_port), (ext_host, ext_port) = _S3_HOST_REWRITE  # type: ignore[misc]
+    int_scheme = urlsplit(_LOCALSTACK_INTERNAL).scheme or "http"
+
+    def _swap(url: str) -> str:
+        parts = urlsplit(url)
+        if (
+            parts.scheme == int_scheme
+            and (parts.hostname or "") == int_host
+            and (parts.port or 4566) == int_port
+        ):
+            netloc = f"{ext_host}:{ext_port}" if ext_port else ext_host
+            return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+        return url
+
+    changed = False
+
+    def _walk(node: object) -> None:
+        nonlocal changed
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, str) and "://" in value:
+                    swapped = _swap(value)
+                    if swapped is not value:
+                        node[key] = swapped
+                        changed = True
+                else:
+                    _walk(value)
+        elif isinstance(node, list):
+            for i, value in enumerate(node):
+                if isinstance(value, str) and "://" in value:
+                    swapped = _swap(value)
+                    if swapped is not value:
+                        node[i] = swapped
+                        changed = True
+                else:
+                    _walk(value)
+
+    try:
+        body = json.loads(resp.get("body") or "{}")
+    except (json.JSONDecodeError, ValueError):
+        return resp
+    _walk(body)
+    if not changed:
+        return resp
+    resp["body"] = json.dumps(body)
+    return resp
+
+
 # ── Routes ──────────────────────────────────────────────────────────────────
 
 
@@ -425,6 +530,9 @@ async def catch_all(request: Request, path: str) -> Response:
     except Exception:
         logger.exception("handler_error route=%s", resource)
         return JSONResponse({"message": "Internal server error"}, status_code=500)
+
+    if _S3_HOST_REWRITE and (resource == _UPLOAD_URLS_RESOURCE or _PROPOSAL_RESOURCE_RE.match(resource)):
+        resp = _rewrite_presigned_hosts(resp)
 
     return _lambda_response_to_http(resp)
 

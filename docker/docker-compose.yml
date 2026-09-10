@@ -123,6 +123,32 @@ services:
       retries: 20
       start_period: 30s
 
+  # Local document knowledge-graph store. Production kg-build writes the
+  # document graph to Neptune (openCypher over TLS); Fuseki — the local
+  # ontology/metadata SPARQL store — does not speak openCypher, and graphrag's
+  # built-in graph stores only implement Neptune (neptune-db://) and Neo4j
+  # (bolt://). Neo4j Community gives the local stack a native Cypher backend
+  # the toolkit's Neo4jGraphStoreFactory talks to directly, no shim needed.
+  # kg-build / graph-cleanup / serve select it via GRAPH_STORE_URI=bolt://...
+  # (see coa_sources.documents.kg_build.graph_build.graph_store_uri and
+  # coa_serve.clients.factory._graph_store_uri).
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-coa-graph-pw}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+      NEO4J_server_memory_pagecache_size: 512m
+    volumes:
+      - neo4j-data:/data
+    ports: ["${NEO4J_PORT:-7687}:7687"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
   opensearch:
     image: opensearchproject/opensearch:2.17.1
     environment:
@@ -171,6 +197,15 @@ services:
       CM_ENDPOINT: http://context-manager:8080
       METADATA_STORE_PROVIDER: local
       LOCAL_METADATA_TABLE: ${SCL_PREFIX:-coa}-local-metadata
+      # The metric-service handler (coa_metrics.neptune_client) runs in-process
+      # here and derives its SPARQL URL directly from NEPTUNE_ENDPOINT (full
+      # URL, unlike the bare-host + NEPTUNE_PORT convention other services use).
+      NEPTUNE_ENDPOINT: http://fuseki:3030
+      NDB_GRAPH_URI_BASE: https://ontology-workbench.local
+      # Host-mapped LocalStack port — lets presigned upload URLs be rewritten
+      # from the container-internal host (localstack:4566) to one the browser
+      # can reach (localhost:<LOCALSTACK_PORT>).
+      LOCALSTACK_PORT: ${LOCALSTACK_PORT:-8888}
       # The gateway imports the data-layer handler in-process for /query, so
       # the CM call timeout applies here too (not just the data-layer container).
       DATA_LAYER_CM_TIMEOUT_S: ${DATA_LAYER_CM_TIMEOUT_S:-29}
@@ -204,6 +239,9 @@ services:
       NEPTUNE_PORT: "3030"
       GRAPH_AUTH: none
       GRAPH_ENDPOINT_SCHEME: http
+      # Local document graph: Neo4j (bolt) — must match the GRAPH_STORE_URI the
+      # scan-worker kg-build ingests into. See the neo4j service comment above.
+      GRAPH_STORE_URI: bolt://neo4j:${NEO4J_PASSWORD:-coa-graph-pw}@neo4j:7687
       OPENSEARCH_ENDPOINT: ${OPENSEARCH_URL:-http://opensearch:9200}
       OPENSEARCH_AUTH: none
       VKG_ENDPOINT: ${VKG_ENDPOINT:-http://vkg-router:8180}
@@ -233,6 +271,8 @@ services:
       postgres:
         condition: service_healthy
       localstack:
+        condition: service_healthy
+      neo4j:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')"]
@@ -300,12 +340,20 @@ services:
       NDB_ENDPOINT: http://fuseki:3030
       # Fuseki mounts GSP at /sparql/gsp (no trailing slash); Neptune uses /sparql/gsp/.
       NDB_GSP_PATH: /sparql/gsp
+      # Local document graph: Neo4j (bolt) — unstructured induction lexical store
+      # (see coa_ontology.inducer.unstructured.stores.neo4j_lexical). GRAPH_STORE_URI
+      # is honored by kg_build, coa_serve URI derivation, and the induction lexical store.
+      GRAPH_STORE_URI: bolt://neo4j:${NEO4J_PASSWORD:-coa-graph-pw}@neo4j:7687
+      GRAPH_AUTH: none
       OSS_ENDPOINT: ${OPENSEARCH_URL:-http://opensearch:9200}
       OSS_INDEX: ${SCL_PREFIX:-coa}-local-ontologies
       # Self-managed OpenSearch defaults to NMSLIB, which rejects filtered
       # k-NN queries; pin the Faiss engine the AOSS mapping implies.
       OSS_KNN_ENGINE: faiss
       DYNAMODB_TABLE: ${SCL_PREFIX:-coa}-local-ontology-engine
+      # CloudWatch PutMetricData is meaningless against LocalStack (dummy creds
+      # → InvalidClientTokenId log noise); see docker/.env.example METRICS_EMIT.
+      METRICS_EMIT: ${METRICS_EMIT:-0}
       ONTOLOGY_ARTIFACTS_BUCKET: ${SCL_PREFIX:-coa}-local-ontology-artifacts
       CATALOG_SOURCE: smus
       SMUS_DOMAIN_ID: local-domain
@@ -381,6 +429,9 @@ services:
     environment:
       <<: [*aws-env, *ollama-env]
       WORKER_QUEUES: db-scan,bulk-review,doc-ingestion,doc-deletion
+      # Wall-clock cap for the kg_build.graph_build subprocess (doc ingestion).
+      # Heavy corpora (300K+ tokens) can exceed the previous hardcoded 3600s.
+      KG_BUILD_TIMEOUT_S: ${KG_BUILD_TIMEOUT_S:-3600}
       PDF_OCR_ENGINE: unstructured
       METADATA_STORE_PROVIDER: local
       LOCAL_METADATA_TABLE: ${SCL_PREFIX:-coa}-local-metadata
@@ -389,6 +440,13 @@ services:
       FEDERATION_PROVISIONER_ROLE_ARN: arn:local:iam::000000000000:role/federation-provisioner
       PROJECT_ACCESS_ROLE_ARN_SSM: /${SCL_PREFIX:-coa}/smus/dz-project-access-role-arn
       NEPTUNE_ENDPOINT: fuseki
+      NEPTUNE_PORT: "3030"
+      GRAPH_AUTH: none
+      GRAPH_ENDPOINT_SCHEME: http
+      # Local document graph: Neo4j (bolt). GRAPH_STORE_URI is honored by
+      # kg_build.graph_build/graph_cleanup and coa_serve URI derivation;
+      # production derives neptune-db://<host>:8182 from NEPTUNE_ENDPOINT instead.
+      GRAPH_STORE_URI: bolt://neo4j:${NEO4J_PASSWORD:-coa-graph-pw}@neo4j:7687
       NDB_IAM_AUTH: "false"
       NDB_ENDPOINT_SCHEME: http
       OPENSEARCH_ENDPOINT: ${OPENSEARCH_URL:-http://opensearch:9200}
@@ -413,6 +471,8 @@ services:
       opensearch:
         condition: service_healthy
       fuseki:
+        condition: service_healthy
+      neo4j:
         condition: service_healthy
 
   web-app:
@@ -441,4 +501,5 @@ volumes:
   localstack-data:
   fuseki-data:
   opensearch-data:
+  neo4j-data:
   postgres-data:
